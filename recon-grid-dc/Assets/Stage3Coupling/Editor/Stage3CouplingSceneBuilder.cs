@@ -32,6 +32,9 @@ namespace ReconGridDC.Stage3Coupling.Editor
             bridge.cudaLiver = liver;
             bridge.synchronizationEnabled = true;
             bridge.forceSynchronousTetReadback = true;
+            bridge.showPhysicsProxy = false;
+            bridge.enableLocalTetDeformation = true;
+            bridge.minimumMappingCoverageForLocalDeformation = 95f;
             EditorSceneManager.SaveScene(scene, ScenePath);
             Debug.Log("[Stage3Coupling] Test scene created: " + ScenePath);
         }

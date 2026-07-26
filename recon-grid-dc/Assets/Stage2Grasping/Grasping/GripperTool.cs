@@ -171,7 +171,10 @@ namespace ReconGridDC.Stage2Grasping.Grasping
         [Header("Keyboard Control")]
         public float moveSpeed = 0.3f;
         public float rotateSpeed = 60f;
+        [Tooltip("Multiplier applied while either Shift key is held.")]
         public float boostMultiplier = 3f;
+        [Tooltip("Maximum keyboard translation per frame, expressed in capsule radii. The limit also scales while Shift boost is held so the boost remains effective without removing collision safety.")]
+        [Min(0.01f)] public float maxMovementPerFrameRadiusFactor = 0.5f;
 
         [Header("Appearance")]
         public Color toolColor = new Color(0.7f, 0.7f, 0.78f, 1f);
@@ -385,7 +388,8 @@ namespace ReconGridDC.Stage2Grasping.Grasping
             {
                 Vector3 desiredMove = move.normalized * speed * Time.deltaTime;
                 // 闁?闂侇偆鍠庣€规娊鏌﹂幒鎴濈厬: 婵絽绻愰幎姘跺嫉閳ь剚寰勮浜涢柛?capsuleRadius * 0.5闁挎稑鐭傚Σ璇差潰閵忋倖鐦堢紒?                // 闁告瑥鍊介埀?SOFA alarmDistance 婵帒鍊告惔?
-                float maxMove = capsuleRadius * 0.5f;
+                float maxMove = capsuleRadius * maxMovementPerFrameRadiusFactor *
+                                (boost ? Mathf.Max(1f, boostMultiplier) : 1f);
                 if (desiredMove.magnitude > maxMove)
                     desiredMove = desiredMove.normalized * maxMove;
                 _toolPos += desiredMove;

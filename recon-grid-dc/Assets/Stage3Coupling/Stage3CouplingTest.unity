@@ -273,6 +273,7 @@ MonoBehaviour:
   moveSpeed: 0.3
   rotateSpeed: 60
   boostMultiplier: 3
+  maxMovementPerFrameRadiusFactor: 0.5
   toolColor: {r: 0.7, g: 0.7, b: 0.78, a: 1}
   upperJawObject: {fileID: 1636256943}
   lowerJawObject: {fileID: 816341338}
@@ -413,7 +414,10 @@ MonoBehaviour:
   fitRestBoundsAutomatically: 1
   hostSearchCellSize: 0
   insideTolerance: 0.001
-  unmappedPointStrategy: Keep CUDA grid rest position
+  unmappedPointStrategy: Project active corners to nearest tetrahedron surface
+  enableLocalTetDeformation: 1
+  minimumMappingCoverageForLocalDeformation: 95
+  showPhysicsProxy: 0
   forceSynchronousTetReadback: 1
   logDiagnostics: 1
   totalGridCorners: 0
@@ -507,7 +511,7 @@ MonoBehaviour:
   referenceGroundColor: {r: 0.22, g: 0.72, b: 0.22, a: 1}
   useSmoothVisualRenderer: 1
   hideRawCudaSurfaceWhenVisualActive: 1
-  showSurfaceMembrane: 1
+  showSurfaceMembrane: 0
   surfaceMembraneShader: {fileID: 0}
   surfaceMembraneColor: {r: 1, g: 0.97, b: 0.72, a: 0.05}
   surfaceMembraneOpacity: 0.05
@@ -559,10 +563,10 @@ MonoBehaviour:
   cuttingRodTarget: {fileID: 0}
   autoCreateCuttingRodTarget: 1
   driveCuttingRodShape: 1
-  rodLength: 12
+  rodLength: 6
   autoSizeRod: 0
   rodAxis: {x: 0, y: 0, z: 1}
-  rodThicknessDOverL: 0.16
+  rodThicknessDOverL: 0.06
   cutWithRodThicknessVolume: 1
   thicknessCutPlaneSamples: 5
   cutFPInterp: 1
