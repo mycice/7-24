@@ -286,7 +286,7 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 236000617}
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0.15, y: 0.5, z: 0.7}
+  m_LocalPosition: {x: 0.15, y: 0.5, z: 2}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children:
@@ -417,16 +417,22 @@ MonoBehaviour:
   unmappedPointStrategy: Project active corners to nearest tetrahedron surface
   enableLocalTetDeformation: 1
   minimumMappingCoverageForLocalDeformation: 95
+  organPresentation: 0
   showPhysicsProxy: 0
   forceSynchronousTetReadback: 1
   logDiagnostics: 1
   totalGridCorners: 0
   activeGridCorners: 0
   mappedActiveCorners: 0
+  projectedActiveCorners: 0
   fallbackActiveCorners: 0
   inactiveRestCorners: 0
+  globalFallbackCorners: 0
   activeMappingSuccessPercent: 0
   effectiveHostSearchCellSize: 0
+  maxGridDisplacement: 0
+  maxMappedLocalDisplacement: 0
+  localTetDeformationApplied: 0
   lastUploadFrame: -1
   lastStatus: Waiting for Stage 1 tetra body and CUDA liver.
 --- !u!4 &1078170379
@@ -823,6 +829,7 @@ MonoBehaviour:
   toolContactTangentialDamping: 0.5
   useToolContactCandidateCulling: 1
   toolContactCandidatePadding: 0.06
+  keepContactActiveWhenIdle: 1
   graspingModule: {fileID: 1731962799}
 --- !u!114 &1731962799
 MonoBehaviour:

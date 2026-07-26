@@ -54,6 +54,7 @@ namespace ReconGridDC.Cuda
         readonly List<Vector3> _cutVerts = new List<Vector3>(8192);
         readonly List<Vector3> _cutNormals = new List<Vector3>(8192);
         readonly List<int> _cutIndices = new List<int>(8192);
+        bool _presentationVisible = true;
 
         public bool IsInitialized => _outerMesh != null && _cutMesh != null;
         public bool HasVisibleGeometry { get; private set; }
@@ -71,7 +72,16 @@ namespace ReconGridDC.Cuda
         {
             EnsureObjects();
             _membraneRenderer.sharedMaterial = membraneMaterial;
-            _membraneRenderer.enabled = membraneMaterial != null && _outerIndices.Count > 0;
+            _membraneRenderer.enabled = _presentationVisible && membraneMaterial != null && _outerIndices.Count > 0;
+        }
+
+        public void SetVisible(bool visible)
+        {
+            _presentationVisible = visible;
+            if (_outerRenderer != null) _outerRenderer.enabled = visible && _outerIndices.Count > 0;
+            if (_cutRenderer != null) _cutRenderer.enabled = visible && _cutIndices.Count > 0;
+            if (_membraneRenderer != null)
+                _membraneRenderer.enabled = visible && _membraneRenderer.sharedMaterial != null && _outerIndices.Count > 0;
         }
 
         public void ClearVisuals()
@@ -249,8 +259,8 @@ namespace ReconGridDC.Cuda
             _outerMesh.SetTangents(_outerTangents);
             _outerMesh.SetTriangles(_outerIndices, 0);
             _outerMesh.bounds = liveBounds;
-            _outerRenderer.enabled = true;
-            _membraneRenderer.enabled = _membraneRenderer.sharedMaterial != null;
+            _outerRenderer.enabled = _presentationVisible;
+            _membraneRenderer.enabled = _presentationVisible && _membraneRenderer.sharedMaterial != null;
         }
 
         void CommitCutMesh(Bounds liveBounds)
@@ -267,7 +277,7 @@ namespace ReconGridDC.Cuda
             _cutMesh.SetNormals(_cutNormals);
             _cutMesh.SetTriangles(_cutIndices, 0);
             _cutMesh.bounds = liveBounds;
-            _cutRenderer.enabled = true;
+            _cutRenderer.enabled = _presentationVisible;
         }
 
         void EnsureUsableOuterUvs(Bounds liveBounds)

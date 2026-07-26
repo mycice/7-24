@@ -10,12 +10,14 @@ namespace ReconGridDC.Stage2Grasping.Modules
         [Header("GPU Tool Contact")]
         [Range(0.001f, 0.08f)] public float toolContactDistance = 0.008f;
         [Range(0f, 0.0001f)] public float toolContactCompliance = 0.0000002f;
-        [Range(1, 16)] public int toolContactIterations = 4;
-        [Range(1, 6)] public int toolContactCouplingPasses = 1;
+        [Range(1, 16)] public int toolContactIterations = 8;
+        [Range(1, 6)] public int toolContactCouplingPasses = 3;
         [Range(0f, 1f)] public float toolContactTangentialFriction = 0.65f;
         [Range(0f, 1f)] public float toolContactTangentialDamping = 0.5f;
         public bool useToolContactCandidateCulling = true;
         [Range(0f, 0.25f)] public float toolContactCandidatePadding = 0.06f;
+        [Tooltip("Keep solving already-overlapping candidates after keyboard motion stops. This prevents the gripper from remaining inside the physical organ until elasticity slowly pulls it back out.")]
+        public bool keepContactActiveWhenIdle = true;
 
         [Header("Module Reference")]
         public SoftBodyGraspingModule graspingModule;
@@ -84,10 +86,15 @@ namespace ReconGridDC.Stage2Grasping.Modules
             LastToolUploadMs = (float)uploadWatch.Elapsed.TotalMilliseconds;
 
             ActiveCandidateTriangles = _solver.ActiveToolContactCandidateCount;
-            // Candidate culling is the broad phase. With no overlapping surface
-            // triangles, contact iterations and coupling passes have no effect.
-            IsSolvingToolContact = !useToolContactCandidateCulling ||
-                                  _solver.HasToolContactCandidates;
+            // A completed grasp pins selected particles directly to the jaw. Running the
+            // surface contact solver at the same time would push that same region back out
+            // of the jaws, fighting the grasp constraint and injecting large corrections.
+            bool hasHardGrasp = graspingModule.gripperTool.IsGrasping;
+            IsSolvingToolContact = !hasHardGrasp &&
+                                  (keepContactActiveWhenIdle ||
+                                   graspingModule.gripperTool.WantsToolContact);
+            IsSolvingToolContact &= !useToolContactCandidateCulling ||
+                                    _solver.HasToolContactCandidates;
             _solver.ToolContactEnabled = IsSolvingToolContact;
         }
 

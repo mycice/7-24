@@ -16,6 +16,12 @@ namespace ReconGridDC.Stage3Coupling
     [DisallowMultipleComponent]
     public sealed class Stage3TetToGridEmbeddingBridge : MonoBehaviour
     {
+        public enum OrganPresentationMode
+        {
+            DetailedCudaCuttableOrgan,
+            CoarseTetPhysicsOrgan
+        }
+
         [Header("Stage 3 Switch")]
         [Tooltip("When enabled, tetrahedral XPBD positions drive the CUDA regular grid. Disabling restores the original CUDA grid physics on the next frame.")]
         public bool synchronizationEnabled = true;
@@ -36,6 +42,8 @@ namespace ReconGridDC.Stage3Coupling
         [Range(0f, 100f)] public float minimumMappingCoverageForLocalDeformation = 95f;
 
         [Header("Presentation")]
+        [Tooltip("Detailed CUDA mode preserves cutting and the existing Dual Contouring surface. Coarse tetrahedral mode shows the direct collision mesh for faster, clearer grasp/contact evaluation, but does not display CUDA cutting.")]
+        public OrganPresentationMode organPresentation = OrganPresentationMode.DetailedCudaCuttableOrgan;
         [Tooltip("Shows the coarse tetrahedral mesh used for collision and grasping. Disable this to present the aligned CUDA organ as the single visible organ.")]
         public bool showPhysicsProxy = false;
 
@@ -122,11 +130,11 @@ namespace ReconGridDC.Stage3Coupling
             minimumMappingCoverageForLocalDeformation = Mathf.Clamp(minimumMappingCoverageForLocalDeformation, 0f, 100f);
             if (!Application.isPlaying)
             {
-                ApplyPhysicsProxyVisibility();
+                ApplyPresentation();
                 return;
             }
             _embeddingReady = false;
-            ApplyPhysicsProxyVisibility();
+            ApplyPresentation();
         }
 
         void TrySubscribe()
@@ -151,7 +159,15 @@ namespace ReconGridDC.Stage3Coupling
             if (!synchronizationEnabled || !_embeddingReady || cudaLiver == null || data == null)
                 return;
 
-            ApplyPhysicsProxyVisibility();
+            ApplyPresentation();
+            if (organPresentation == OrganPresentationMode.CoarseTetPhysicsOrgan)
+            {
+                RestoreReadbackMode();
+                cudaLiver.SetExternalGridDeformationActive(false);
+                lastStatus = "Showing the direct coarse tetrahedral physics organ; CUDA cutting display is paused.";
+                return;
+            }
+            ApplyReadbackMode();
             UpdateGridPositions(data);
             if (cudaLiver.UploadExternalCornerPositions(_uploadPositions))
             {
@@ -190,9 +206,12 @@ namespace ReconGridDC.Stage3Coupling
                 return;
             }
 
-            ApplyReadbackMode();
+            if (organPresentation == OrganPresentationMode.DetailedCudaCuttableOrgan)
+                ApplyReadbackMode();
+            else
+                RestoreReadbackMode();
             ConfigureRestAlignment(data);
-            ApplyPhysicsProxyVisibility();
+            ApplyPresentation();
             BuildSpatialHash(data);
             BuildCornerMappings(data);
             _embeddingReady = true;
@@ -251,10 +270,13 @@ namespace ReconGridDC.Stage3Coupling
                 _alignedGridRestCorners[c] = GridToTetRest(_gridRestCorners[c]);
         }
 
-        void ApplyPhysicsProxyVisibility()
+        void ApplyPresentation()
         {
             if (tetSoftBody != null && tetSoftBody.Visualizer != null)
-                tetSoftBody.Visualizer.SetMainSurfaceVisible(showPhysicsProxy);
+                tetSoftBody.Visualizer.SetMainSurfaceVisible(
+                    organPresentation == OrganPresentationMode.CoarseTetPhysicsOrgan || showPhysicsProxy);
+            if (cudaLiver != null)
+                cudaLiver.SetPresentationVisible(organPresentation == OrganPresentationMode.DetailedCudaCuttableOrgan);
         }
 
         void BuildSpatialHash(TetMeshData data)

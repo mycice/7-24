@@ -194,6 +194,7 @@ namespace ReconGridDC.Cuda
         GameObject referenceGround;
         bool      referenceGroundCreated;
         bool      initialized, cutReady;
+        bool      presentationVisible = true;
         bool      _liverMatActive;   // LiverSurface material in use -> read the aux channel
         bool      _auxUnsupported;   // stale DLL without LCS_GetSurfaceAux -> degrade gracefully
         int       maxIdx;            // = 3 * triCapacity (the non-indexed soup upper bound)
@@ -231,6 +232,20 @@ namespace ReconGridDC.Cuda
             if (active && _externalUploadUnsupported)
                 return;
             _externalGridDeformationActive = active;
+        }
+
+        /// <summary>
+        /// Shows or hides only the CUDA/Dual-Contouring presentation. The CUDA simulation,
+        /// cutter, and buffers remain initialized so Stage 3 can switch presentation modes
+        /// without recreating them.
+        /// </summary>
+        public void SetPresentationVisible(bool visible)
+        {
+            presentationVisible = visible;
+            if (rawMeshRenderer != null)
+                rawMeshRenderer.enabled = visible;
+            if (visualRenderer != null)
+                visualRenderer.SetVisible(visible);
         }
 
         public bool UploadExternalCornerPositions(float[] positions)
@@ -853,8 +868,9 @@ namespace ReconGridDC.Cuda
         void UpdateRawRendererVisibility()
         {
             if (rawMeshRenderer == null) return;
-            bool showVisual = useSmoothVisualRenderer && hideRawCudaSurfaceWhenVisualActive &&
-                              visualRenderer != null && visualRenderer.HasVisibleGeometry;
+            bool showVisual = !presentationVisible ||
+                              (useSmoothVisualRenderer && hideRawCudaSurfaceWhenVisualActive &&
+                               visualRenderer != null && visualRenderer.HasVisibleGeometry);
             rawMeshRenderer.enabled = !showVisual;
         }
 
