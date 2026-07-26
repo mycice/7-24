@@ -1,0 +1,434 @@
+// Recon.compute — GPU kernels for DC Stage 1A outer-surface reconstruction.
+// Kernels:  DC_FeaturePoints, DC_Stitch, DC_ClearNormals, DC_NormalsScatter, DC_NormalsNormalize, DC_WriteIndirectArgs
+// Deviations: D1 (QEF gradient at current x_k), D5 (stop when boxSDF(x_next)>=0, write last accepted interior x).
+// See design spec §4.2/§4.3 and deviation ledger §2.
+
+#pragma kernel RebuildIsectWorld
+#pragma kernel DC_FeaturePoints
+#pragma kernel DC_Stitch
+#pragma kernel DC_ClearNormals
+#pragma kernel DC_NormalsScatter
+#pragma kernel DC_NormalsNormalize
+#pragma kernel DC_WriteIndirectArgs
+
+#include "ReconCommon.hlsl"
+// 2C-fix (plan §7 B3): CuttingCommon AFTER ReconCommon — gives Conn4096Gpu, LocalCornerOf,
+// Conn4096Comp (the per-component keying DC_Stitch now uses). NORMAL_SCALE is guarded so the
+// double-include does not redefine it. POS_SCALE is unused here but harmless.
+#include "CuttingCommon.hlsl"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared uniforms (set by DualContouring.cs / test)
+// ─────────────────────────────────────────────────────────────────────────────
+int   _VoxelCount;
+float _L;
+int   _QefIters;
+int3  _Dims;           // (Nx, Ny, Nz) voxel counts per axis
+int   _SurfaceEdgeCount;
+int   _TriCapacity;    // number of triangles (Tri buffer has 3*_TriCapacity ints)
+int   _IsectCount;     // number of Hermite isect entries (= Isect.count); set by DualContouring.Build
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared buffers (bound by DualContouring.cs / test; not all kernels use all)
+// ─────────────────────────────────────────────────────────────────────────────
+StructuredBuffer<float3>   _CornerPos;          // world pos of every grid corner (deformed per frame)
+StructuredBuffer<int>      _VoxelCorner;        // 8*voxelCount: [8*v+c] = global cornerId
+StructuredBuffer<int>      _VoxelIsectOffset;   // per-voxel flat-list start index
+StructuredBuffer<int>      _VoxelIsectCount;    // per-voxel number of intersections
+StructuredBuffer<IsectGpu> _Isect;              // flat Hermite intersection list (rest data: globalRest, normal, cornerA, cornerB, t)
+// Deformed isect world positions: _IsectWorld[e] = lerp(_CornerPos[it.cornerA], _CornerPos[it.cornerB], it.t)
+// Written each frame by RebuildIsectWorld (RW); read by DC_FeaturePoints (read-only use of RW buffer — fine in HLSL SM5).
+// PAPER-SILENT: normal stays frozen at rest (_Isect[].normal); only position is rebuilt.
+RWStructuredBuffer<float3> _IsectWorld;         // float3[IsectCount] — deformed isect positions
+
+RWStructuredBuffer<float4> _VoxelExternalFP;    // xyz = feature point, w = valid (1 or 0)
+RWStructuredBuffer<int>    _Tri;                // 3*TriCapacity int vertex-indices (vertex = voxelId, high bit clear for Stage 1A external)
+RWStructuredBuffer<uint>   _TriCounter;         // [0] = total index count written so far (InterlockedAdd)
+RWStructuredBuffer<int>    _ExtNormalFixed;     // 3*voxelCount fixed-point int normal accumulator
+RWStructuredBuffer<float3> _ExtNormalF;         // voxelCount float3 normalized output normals
+RWStructuredBuffer<uint>   _IndirectArgs;       // 4 uints: vertexCount, instanceCount, startVertex, startInstance
+
+// ── Stage 2C: tag-aware normal scatter (plan §3.7) ───────────────────────────────────────
+// _CutFP holds internal cut-FP positions (slot = 8*voxelId+comp); _CutFPNormal is the cut-FP
+// normal accumulator (mirrors _ExtNormalFixed). Bound by DualContouring; in the ZERO-CUT path all
+// tri tags are external (bit31 clear) so these buffers are never written/read → byte-identical 1A.
+RWStructuredBuffer<float4> _CutFP;              // float4[8*VoxelCount] internal cut feature points
+RWStructuredBuffer<int>    _CutFPNormal;        // int[3*8*VoxelCount] cut-FP fixed-point normal accumulator
+
+// ── 2C-fix (plan §7 RC1): per-component surface split in DC_Stitch ───────────────────────────
+// For a CUT, OCCUPIED voxel, DC_Stitch selects the per-component cut FP (by the surface edge's
+// INSIDE-endpoint corner) instead of the single external FP → the outer skin opens. Zero-cut path:
+// _VoxelCutMask all-zero → DC_Stitch takes the else branch → byte-identical Stage-1 output.
+StructuredBuffer<Conn4096Gpu> _Conn4096;        // Conn4096Gpu[4096] connectivity LUT (vertToComp)
+StructuredBuffer<uint>        _VoxelCutMask;     // uint[VoxelCount] 12-bit cut config (0 ⇒ uncut)
+StructuredBuffer<uint>        _VoxelOccupied;    // uint[VoxelCount] RC2 gate (1 ⇒ touches tissue)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: voxelId encoding — must match C# GridConventions.VoxelId exactly:
+//   id = i + Nx*(j + Ny*k)
+// ─────────────────────────────────────────────────────────────────────────────
+int VoxId(int3 c)
+{
+    return c.x + _Dims.x * (c.y + _Dims.y * c.z);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RebuildIsectWorld  (Stage 1B-ii Task 1)
+// One thread per isect entry. Re-projects each intersection point along the
+// now-deformed edge: _IsectWorld[e] = lerp(_CornerPos[it.cornerA], _CornerPos[it.cornerB], it.t).
+// Must be dispatched BEFORE DC_FeaturePoints each frame.
+// PAPER-SILENT: rest-space t is reused as the affine carry along the deformed edge.
+// PAPER-SILENT: normal stays frozen at _Isect[e].normal (rest gradient); not updated here.
+// Static 1A path: at rest CornerPos == rest corners => IsectWorld[e] == globalRest (identical).
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void RebuildIsectWorld(uint3 id : SV_DispatchThreadID)
+{
+    uint e = id.x;
+    if (e >= (uint)_IsectCount) return;
+    IsectGpu it = _Isect[e];
+    _IsectWorld[e] = lerp(_CornerPos[it.cornerA], _CornerPos[it.cornerB], it.t);  // PAPER-SILENT: normal stays rest
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DC_FeaturePoints  (Task 6 Step 4)
+// One thread per voxel. Runs QEF gradient ascent to find the feature point.
+// DEVIATION D1: gradient F = Σ n_i · (n_i · (p_i − x_k))  evaluated at current x_k.
+// DEVIATION D5: stop when boxSDF(x_next, voxelCenter, L) >= 0; write last accepted interior x.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void DC_FeaturePoints(uint3 id : SV_DispatchThreadID)
+{
+    uint v = id.x;
+    if (v >= (uint)_VoxelCount) return;
+
+    int off = _VoxelIsectOffset[v];
+    int cnt = _VoxelIsectCount[v];
+
+    if (cnt == 0)
+    {
+        _VoxelExternalFP[v] = float4(0, 0, 0, 0); // no surface crossing in this voxel
+        return;
+    }
+
+    // Eq2: initial x = mean of intersection points (p_i) — read from deformed IsectWorld
+    float3 x = (float3)0;
+    for (int s = 0; s < cnt; s++)
+        x += _IsectWorld[off + s];   // p_i from deformed edge (was _Isect[off+s].globalRest)
+    x /= (float)cnt;
+
+    // Voxel center = mean of 8 deformed corners (used for Eq5 boxSDF box center)
+    float3 c = (float3)0;
+    for (int cc = 0; cc < 8; cc++)
+        c += _CornerPos[_VoxelCorner[8 * v + cc]];
+    c /= 8.0;
+
+    for (int it = 0; it < _QefIters; it++)
+    {
+        // DEVIATION D1: QEF negative gradient at current x_k
+        // F = Σ_i  n_i * dot(n_i, p_i - x)
+        // p_i from _IsectWorld (deformed); n_i from _Isect.normal (rest normal — PAPER-SILENT frozen).
+        float3 F = (float3)0;
+        for (int s2 = 0; s2 < cnt; s2++)
+        {
+            float3 p_i = _IsectWorld[off + s2];           // deformed isect position
+            float3 n_i = _Isect[off + s2].normal;         // rest normal (PAPER-SILENT: frozen)
+            F += n_i * dot(n_i, p_i - x);                 // DEVIATION D1
+        }
+
+        // Eq4: decaying step size
+        float a = 0.1 * (1.0 - (float)it / (float)_QefIters);
+        float3 xn = x + a * F;
+
+        // DEVIATION D5: stop before leaving voxel
+        if (BoxSdf(xn, c, _L) >= 0.0)  // DEVIATION D5
+            break;
+
+        x = xn;                                                // x = last accepted interior iterate
+    }
+
+    _VoxelExternalFP[v] = float4(x, 1.0);                    // D5: write last interior point
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DC_Stitch  (Task 7 Step 5)
+// One thread per surface edge. Each surface edge has 4 incident voxels whose
+// external feature points form a quad → split into 2 triangles and append.
+//
+// STENCIL_OFF mirrors GridConventions.EdgeStencil exactly (verified below):
+//   axis 0 (x): E(0,0,0,0), E(0,-1,0,2), E(0,-1,-1,6), E(0,0,-1,4)
+//     → voxel offsets (CCW about +x): (0,0,0),(0,-1,0),(0,-1,-1),(0,0,-1)
+//   axis 1 (y): E(0,0,0,3), E(0,0,-1,7), E(-1,0,-1,5), E(-1,0,0,1)
+//     → voxel offsets (CCW about +y): (0,0,0),(0,0,-1),(-1,0,-1),(-1,0,0)
+//   axis 2 (z): E(0,0,0,8), E(-1,0,0,9), E(-1,-1,0,10), E(0,-1,0,11)
+//     → voxel offsets (CCW about +z): (0,0,0),(-1,0,0),(-1,-1,0),(0,-1,0)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GridEdgeGpu: mirrors C# ReconBuffers.GridEdgeGpu exactly.
+// C# layout: axis(4) + bcX(4)+bcY(4)+bcZ(4) + insideA(4) + _pad(4) + _pad2(4) + _pad3(4) = 32 bytes.
+// HLSL equivalent: store int3 as 3 separate ints + 3 padding ints so the total is 8 ints = 32 bytes.
+struct GridEdgeGpu
+{
+    int  axis;         //  4 bytes  offset  0
+    int  bcX;          //  4 bytes  offset  4
+    int  bcY;          //  4 bytes  offset  8
+    int  bcZ;          //  4 bytes  offset 12
+    int  insideA;      //  4 bytes  offset 16
+    int  _pad;         //  4 bytes  offset 20
+    int  _pad2;        //  4 bytes  offset 24
+    int  _pad3;        //  4 bytes  offset 28 → total = 32 bytes
+};
+
+StructuredBuffer<GridEdgeGpu> _SurfaceEdges;
+
+// 4-voxel stencil: STENCIL_OFF[axis*4 + slot] = voxel offset from baseCorner (CCW about +axis).
+// Verified to match GridConventions.EdgeStencil[axis][slot].voxelOffset exactly.
+static const int3 STENCIL_OFF[12] =
+{
+    // axis 0 = x  (CCW about +x from GridConventions.EdgeStencil[0])
+    int3( 0, 0, 0),  // slot 0: E(0, 0, 0, localEdge=0)
+    int3( 0,-1, 0),  // slot 1: E(0,-1, 0, localEdge=2)
+    int3( 0,-1,-1),  // slot 2: E(0,-1,-1, localEdge=6)
+    int3( 0, 0,-1),  // slot 3: E(0, 0,-1, localEdge=4)
+
+    // axis 1 = y  (CCW about +y from GridConventions.EdgeStencil[1])
+    int3( 0, 0, 0),  // slot 0: E(0, 0, 0, localEdge=3)
+    int3( 0, 0,-1),  // slot 1: E(0, 0,-1, localEdge=7)
+    int3(-1, 0,-1),  // slot 2: E(-1,0,-1, localEdge=5)
+    int3(-1, 0, 0),  // slot 3: E(-1,0, 0, localEdge=1)
+
+    // axis 2 = z  (CCW about +z from GridConventions.EdgeStencil[2])
+    int3( 0, 0, 0),  // slot 0: E(0, 0, 0, localEdge=8)
+    int3(-1, 0, 0),  // slot 1: E(-1,0, 0, localEdge=9)
+    int3(-1,-1, 0),  // slot 2: E(-1,-1,0, localEdge=10)
+    int3( 0,-1, 0),  // slot 3: E(0,-1, 0, localEdge=11)
+};
+
+// ── 2C-fix (plan §7 RC1 / IMPORTANT-1): per-voxel vertex-tag resolution for DC_Stitch ──
+// TWO-WAY tag scheme (the bit30 External-cut route was removed with _CutFPExternal):
+// For sharing voxel `voxelId` (integer coord `voxelCoord`), select the vertex tag for this surface
+// edge's INSIDE-endpoint corner (`insideCornerCoord`):
+//   • CUT + OCCUPIED voxel with a VALID per-component cut FP → cut-FP tag (bit31 0x80000000 | (8*v+comp))
+//     → resolves to _CutFP[slot], the per-component cut-point centroid (the SAME vertex the cut WALL uses).
+//   • otherwise (uncut, empty, or degenerate-FP fallback) → external tag = voxelId (no high bit),
+//     i.e. the existing single _VoxelExternalFP[voxelId] (no hole; local re-weld OK — plan §3.4 R3).
+// When the 4 voxels disagree on component (a cut runs between them) the quad's 4 vertices resolve to
+// DIFFERENT per-component cut FPs → the outer quad SPLITS → the skin opens. The cut-voxel OUTER SKIN and
+// the cut WALL (BuildCutTriangles) thus SHARE one watertight vertex per (voxel,component) → no rim hole.
+int StitchVertId(int voxelId, int3 voxelCoord, int3 insideCornerCoord)
+{
+    uint mask = _VoxelCutMask[voxelId] & 0xFFFu;
+    if (mask == 0u || _VoxelOccupied[voxelId] == 0u)
+        return voxelId;                                   // external tag (uncut / empty) — Stage-1 path
+
+    int lc = LocalCornerOf(insideCornerCoord, voxelCoord);
+    if (lc < 0) return voxelId;                           // inside corner not a corner of this voxel (defensive)
+    int comp = Conn4096Comp(_Conn4096[mask], lc);
+    int slot = 8 * voxelId + comp;
+    // STRICT PAPER (cut-surface-connection fix 2026-06-29, workflow w18dv69wq): the cut-voxel OUTER-SKIN
+    // vertex resolves to the SAME per-component cut-point centroid _CutFP[slot] (bit31) that
+    // BuildCutTriangles uses for the cut WALL → skin and wall SHARE one vertex per (voxel,component) →
+    // structurally watertight, NO rim hole. Matches the paper (clean:342-354): ONE feature point per
+    // connected component = the centroid of its cut points, referenced by EVERY triangle (skin OR wall)
+    // that touches it. (A previous bit30 External-FP split — _CutFPExternal, now REMOVED — made the skin a
+    // SEPARATE unshared vertex on the isosurface → the red↔green gap.) Degenerate/empty comp → per-voxel external FP.
+    return (_CutFP[slot].w > 0.5) ? (int)(0x80000000u | (uint)slot) : voxelId;
+}
+
+[numthreads(64, 1, 1)]
+void DC_Stitch(uint3 id : SV_DispatchThreadID)
+{
+    uint e = id.x;
+    if (e >= (uint)_SurfaceEdgeCount) return;
+
+    GridEdgeGpu ge = _SurfaceEdges[e];
+    int3 baseCorner = int3(ge.bcX, ge.bcY, ge.bcZ);
+
+    // 2C-fix (plan §7 IMPORTANT-1): the surface edge's INSIDE-endpoint corner keys the per-component
+    // FP. insideA==1 ⇒ baseCorner is inside; else baseCorner+axisDir is inside. The inside endpoint is
+    // a corner of ALL 4 sharing voxels (an edge's endpoints are corners of its 4 voxels) → LocalCornerOf
+    // succeeds, and this is the SAME numbering chain BuildCutTriangles uses (re-weld-proof).
+    int3 axisDir = int3(ge.axis == 0 ? 1 : 0, ge.axis == 1 ? 1 : 0, ge.axis == 2 ? 1 : 0);
+    int3 insideCornerCoord = (ge.insideA != 0) ? baseCorner : baseCorner + axisDir;
+
+    // Gather the 4 incident voxels, resolving each to its vertex tag (per-component cut FP for a cut
+    // occupied voxel, else the external FP = voxelId with bit31 clear). Zero-cut → all external.
+    int base4 = ge.axis * 4;
+    int v0i = VoxId(baseCorner + STENCIL_OFF[base4 + 0]);
+    int v1i = VoxId(baseCorner + STENCIL_OFF[base4 + 1]);
+    int v2i = VoxId(baseCorner + STENCIL_OFF[base4 + 2]);
+    int v3i = VoxId(baseCorner + STENCIL_OFF[base4 + 3]);
+    int3 c0 = baseCorner + STENCIL_OFF[base4 + 0];
+    int3 c1 = baseCorner + STENCIL_OFF[base4 + 1];
+    int3 c2 = baseCorner + STENCIL_OFF[base4 + 2];
+    int3 c3 = baseCorner + STENCIL_OFF[base4 + 3];
+    int v0 = StitchVertId(v0i, c0, insideCornerCoord);
+    int v1 = StitchVertId(v1i, c1, insideCornerCoord);
+    int v2 = StitchVertId(v2i, c2, insideCornerCoord);
+    int v3 = StitchVertId(v3i, c3, insideCornerCoord);
+
+    // Winding: STENCIL_OFF is in CCW order about +axis.
+    // When insideA==1 (baseCorner is inside, edge goes inside→outside),
+    //   the outward normal faces toward the outside end → CCW order v0,v1,v2,v3 is correct.
+    // When insideA==0 (baseCorner is outside, edge goes outside→inside),
+    //   the quad normal points inward → swap to keep normals outward.
+    int a = v0, b = v1, cc = v2, d = v3;
+    if (ge.insideA == 0)
+    {
+        // Reverse by swapping b<->d (mirrors the quad, keeps v0/v2 diagonal, flips winding)
+        int tmp = b; b = d; d = tmp;
+    }
+
+    // Append 2 triangles (6 indices) via InterlockedAdd on TriCounter.
+    uint baseIdx;
+    InterlockedAdd(_TriCounter[0], 6u, baseIdx);
+
+    // Overflow guard
+    if (baseIdx + 6u > (uint)(_TriCapacity * 3)) return;
+
+    // Triangle 1: a, b, cc
+    _Tri[baseIdx + 0] = a;
+    _Tri[baseIdx + 1] = b;
+    _Tri[baseIdx + 2] = cc;
+
+    // Triangle 2: a, cc, d  (shares diagonal a-cc)
+    _Tri[baseIdx + 3] = a;
+    _Tri[baseIdx + 4] = cc;
+    _Tri[baseIdx + 5] = d;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DC_ClearNormals  (Task 8 Step 4)
+// Zero out the fixed-point normal accumulator before scatter.
+// One thread per voxel.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void DC_ClearNormals(uint3 id : SV_DispatchThreadID)
+{
+    uint v = id.x;
+    if (v >= (uint)_VoxelCount) return;
+    _ExtNormalFixed[3 * v + 0] = 0;
+    _ExtNormalFixed[3 * v + 1] = 0;
+    _ExtNormalFixed[3 * v + 2] = 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fixed-point atomic normal accumulation helper.
+// Converts float3 to fixed-point int (scale NORMAL_SCALE = 1<<20) and
+// InterlockedAdd into _ExtNormalFixed[3*v + 0/1/2].
+// ─────────────────────────────────────────────────────────────────────────────
+void AtomicAddNormal(int v, float3 n)
+{
+    int xi = (int)(n.x * NORMAL_SCALE);
+    int yi = (int)(n.y * NORMAL_SCALE);
+    int zi = (int)(n.z * NORMAL_SCALE);
+    InterlockedAdd(_ExtNormalFixed[3 * v + 0], xi);
+    InterlockedAdd(_ExtNormalFixed[3 * v + 1], yi);
+    InterlockedAdd(_ExtNormalFixed[3 * v + 2], zi);
+}
+
+// ── Stage 2C (plan §3.7): tag-aware FetchPos + cut-FP normal accumulator ──────────────────────────
+// FetchPos: decode a tri vertex tag → its world position. TWO-WAY (the bit30 External-cut route was
+// removed with _CutFPExternal): bit31 (0x80000000) ⇒ cut FP (_CutFP, idx=8*v+comp — the shared
+// skin+wall per-component centroid); no high bit ⇒ per-voxel external (_VoxelExternalFP, idx=voxelId).
+// The 0x3FFFFFFF mask strips bit31 (harmless that it also clears the now-unused bit30). This makes MIXED
+// triangles (some external, some cut vertices) compute the CORRECT face normal (A2-F4a).
+float3 FetchPos(int raw)
+{
+    uint u   = (uint)raw;
+    bool cutFP = (u & 0x80000000u) != 0u;         // cut FP vertex (skin+wall shared) → _CutFP (centroid)
+    int  idx = (int)(u & 0x3FFFFFFFu);            // strip bit31 → slot (8v+comp) or voxelId
+    if (cutFP) return _CutFP[idx].xyz;
+    return _VoxelExternalFP[idx].xyz;             // normal surface vertex
+}
+
+// Scatter the face normal into the cut-FP normal accumulator (mirrors AtomicAddNormal). slot = idx.
+void AtomicAddCutNormal(int slot, float3 n)
+{
+    int xi = (int)(n.x * NORMAL_SCALE);
+    int yi = (int)(n.y * NORMAL_SCALE);
+    int zi = (int)(n.z * NORMAL_SCALE);
+    InterlockedAdd(_CutFPNormal[3 * slot + 0], xi);
+    InterlockedAdd(_CutFPNormal[3 * slot + 1], yi);
+    InterlockedAdd(_CutFPNormal[3 * slot + 2], zi);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DC_NormalsScatter  (Task 8 Step 4; Stage 2C tag-aware — plan §3.7)
+// One thread per triangle. Computes face normal (via tag-aware FetchPos so mixed
+// external/internal tris are correct) and scatters (area-weighted) to each of the
+// triangle's 3 vertices: external vertices → _ExtNormalFixed, internal cut-FP
+// vertices → _CutFPNormal (branch per vertex on bit31).
+// Guard: tri >= _TriCounter[0]/3 → no-op (dispatched with upper-bound group count).
+// ZERO-CUT: all tags external → identical to the Stage-1 path (A2-F4b).
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void DC_NormalsScatter(uint3 id : SV_DispatchThreadID)
+{
+    uint tri = id.x;
+    uint triCount = _TriCounter[0] / 3u;
+    if (tri >= triCount) return;
+
+    int raw0 = _Tri[3 * tri + 0];
+    int raw1 = _Tri[3 * tri + 1];
+    int raw2 = _Tri[3 * tri + 2];
+
+    // Tag-aware positions (external OR internal cut FP) — correct for MIXED triangles.
+    float3 p0 = FetchPos(raw0);
+    float3 p1 = FetchPos(raw1);
+    float3 p2 = FetchPos(raw2);
+
+    // Area-weighted face normal (un-normalized cross product)
+    float3 fn = cross(p1 - p0, p2 - p0);
+
+    // Scatter to each vertex accumulator, routed by tag (TWO-WAY, mask 0x3FFFFFFF strips bit31; the bit30
+    // External-cut route was removed with _CutFPExternal):
+    //   bit31 cut FP (skin+wall shared) → _CutFPNormal[slot] (AtomicAddCutNormal).
+    //   no high bit (per-voxel external) → _ExtNormal[voxel] (AtomicAddNormal).
+    uint u0 = (uint)raw0; int i0 = (int)(u0 & 0x3FFFFFFFu);
+    uint u1 = (uint)raw1; int i1 = (int)(u1 & 0x3FFFFFFFu);
+    uint u2 = (uint)raw2; int i2 = (int)(u2 & 0x3FFFFFFFu);
+    if (u0 & 0x80000000u) AtomicAddCutNormal(i0, fn);            // cut FP → _CutFPNormal[slot]
+    else                  AtomicAddNormal(i0, fn);               // normal surface → _ExtNormal[voxel]
+    if (u1 & 0x80000000u) AtomicAddCutNormal(i1, fn);
+    else                  AtomicAddNormal(i1, fn);
+    if (u2 & 0x80000000u) AtomicAddCutNormal(i2, fn);
+    else                  AtomicAddNormal(i2, fn);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DC_NormalsNormalize  (Task 8 Step 4)
+// One thread per voxel. Reads fixed-point accumulator, converts to float,
+// normalizes and writes to _ExtNormalF.
+// Must be dispatched AFTER DC_NormalsScatter (separate Dispatch = implicit barrier).
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void DC_NormalsNormalize(uint3 id : SV_DispatchThreadID)
+{
+    uint v = id.x;
+    if (v >= (uint)_VoxelCount) return;
+
+    float3 n = float3(
+        (float)_ExtNormalFixed[3 * v + 0],
+        (float)_ExtNormalFixed[3 * v + 1],
+        (float)_ExtNormalFixed[3 * v + 2]
+    ) / NORMAL_SCALE;
+
+    float len = length(n);
+    _ExtNormalF[v] = (len > 1e-6) ? (n / len) : float3(0, 0, 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DC_WriteIndirectArgs  (Task 9 — deferred to C3 cluster, included here for completeness)
+// Writes the indirect draw args for Graphics.DrawProceduralIndirect.
+// Args layout: { vertexCount, instanceCount, startVertex, startInstance }
+// _TriCounter[0] = total index count (= 3 * triangle count) after stitch pass.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(1, 1, 1)]
+void DC_WriteIndirectArgs(uint3 id : SV_DispatchThreadID)
+{
+    _IndirectArgs[0] = min(_TriCounter[0], (uint)(_TriCapacity * 3)); // vertexCount = index count, clamped
+    _IndirectArgs[1] = 1;              // instanceCount
+    _IndirectArgs[2] = 0;              // startVertex
+    _IndirectArgs[3] = 0;              // startInstance
+}

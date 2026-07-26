@@ -1,0 +1,850 @@
+// Cutting.compute — Stage 2B: DetectCut (Möller-Trumbore ray = voxel edge, tri = swept plane)
+// + MT_Test (oracle kernel for unit testing M-T only).
+//
+// Kernels:
+//   DetectCut — per GridEdge: M-T vs 2 swept triangles; mark voxelCutMask (4 voxels via EdgeStencil);
+//               emit 2 cut points per hit (±D/2 along n_cut from P_hit).
+//   MT_Test   — tiny oracle: given one known O/Dvec/V0/V1/V2, write t/u/v + hitFlag to results.
+//
+// Traceability: paper §2.1.3 / Eq6-8 / Fig 2.8; design §5.2 / §5.3 / §10.
+
+#pragma kernel DetectCut
+#pragma kernel MT_Test
+
+// ── Stage 2C: cut-surface kernels (plan §2 / §3) ─────────────────────────────────────────
+#pragma kernel ClearCutFP
+#pragma kernel LookupConnectivity
+#pragma kernel AccumulateCutFP
+// 2C-fix (plan §7): ComputeComponentFP replaces FinalizeCutFP — unified per-component QEF.
+#pragma kernel ComputeComponentFP
+// Stage 2D-2b (paper Discussion, clean:1271-1276): temporal interpolation of the post-cut feature point.
+#pragma kernel InterpCutFP
+#pragma kernel BuildCutTriangles
+#pragma kernel DC_NormalizeCutFP
+
+// ── Stage 2D-1: physical severing (paper §2.1.2 line 367) ────────────────────────────────
+#pragma kernel SeverLinks
+
+// 2C-fix (plan §7 B3): ReconCommon BEFORE CuttingCommon — gives IsectGpu and the canonical NORMAL_SCALE
+// (CuttingCommon's #ifndef NORMAL_SCALE guard then no-ops). ComputeComponentFP reads the isect gather for
+// its centroid isectMean fallback. (The External-FP QEF + D5 BoxSdf stop were removed with _CutFPExternal.)
+#include "ReconCommon.hlsl"
+#include "CuttingCommon.hlsl"
+
+// ── Uniforms ────────────────────────────────────────────────────────────────────────────────
+int3  _Dims;            // (Nx, Ny, Nz) voxel dimensions — matches Recon.compute _Dims
+int   _GridEdgeCount;   // total interior grid edges to test
+int   _CutPointCapacity;// CutPoint buffer length (= 2*GridEdgeCount) — append OOB guard (review R2 #2)
+
+// Swept-plane geometry (set per-frame by CutDetector from CuttingTool)
+// T1 = (Sprev, Eprev, E_cur), T2 = (Sprev, E_cur, S_cur) — paper Fig 2.8; gap C22
+float3 _T1V0;  // = Sprev
+float3 _T1V1;  // = Eprev
+float3 _T1V2;  // = E     (current)
+float3 _T2V0;  // = Sprev
+float3 _T2V1;  // = E     (current)
+float3 _T2V2;  // = S     (current)
+
+float3 _NCut;  // cut-plane unit normal — PAPER-SILENT; computed as normalize(cross(Eprev-Sprev, E-Sprev))
+float  _D;     // blade thickness (world units); cut points offset ±D/2 along _NCut — paper §3.4 (p12: "two cutting points ... gap gradually widens"; only the n_cut DIRECTION is paper-silent)
+int    _ToolValid; // 0 = skip this frame (degenerate/no sweep); 1 = proceed — design §10
+// REST-LATTICE uniforms (workflow w87ghv7f6): rest corner world pos = _GridOrigin + coord*_VoxelL (the
+// uniform background lattice, BackgroundGrid.cs:107). DetectCut M-T-tests the swept blade against the
+// UNDEFORMED edge so the cut targets a fixed MATERIAL plane — immune to the gravity-vs-sweep deformation
+// race that left residual HINGES (a zero-thickness world plane lets sagged edges escape detection).
+// DECLARED DEVIATION (detection FRAME): the paper M-T-tests the DEFORMED mesh (§2.1.3, "no longer a
+// uniform hexahedron" clean:357-358) and records the cut point in the undeformed frame (§2.1.2 /
+// clean:363-366). The paper's deformed-mesh detection works in its surgeon-driven setup, but under our
+// SCRIPTED fixed-world-Y blade + soft tissue it suffers a detection-vs-deformation race — sagged edges
+// escape the zero-thickness plane = the 24 residual HINGES. Detecting on the REST lattice instead cuts a
+// FIXED MATERIAL plane → reproduces the paper's claimed Fig 3.9 FULL-disconnection RESULT (clean:1157-
+// 1164) without the race. It deviates only in the detection FRAME; the cut POINT is still emitted on the
+// DEFORMED edge so the surface tracks the tissue (§2.1.2 reconstruct). 2D-2 (M6 scope correction) ships
+// the cut-SURFACE rotation ONLY: EmitCutPoint records the cut point in the owner's MATERIAL frame
+// (R_owner^T·offset) and AccumulateCutFP reconstructs it via mul(R_owner, offset), so the cut WALLS
+// follow tissue rotation. The blade→material-frame DETECTION generalization (transform the world blade
+// into each particle's [22] rotated axes so deformed-mesh detection works directly under rotation)
+// remains a FOLLOW-UP — see plan 2026-06-28-dc-2d2-berndt-rframe.md §E (deferred; the demo is pure
+// translation so current rest-frame detection is exact). (Demo X/Z motion ≡ 0 by load symmetry about x=3,z=3.)
+float  _VoxelL;       // voxel side length L (rest lattice spacing)
+float3 _GridOrigin;   // rest lattice origin
+
+// Swept quad AABB for broadphase cull (PAPER-SILENT robustness — design §10)
+// Pre-computed by CutDetector from the 4 corners {Sprev, Eprev, S, E}.
+float3 _SweptAABBMin;
+float3 _SweptAABBMax;
+
+// ── Buffers ──────────────────────────────────────────────────────────────────────────────────
+StructuredBuffer<float3>      _CornerPos;     // deformed world positions [cornerCount]
+StructuredBuffer<GridEdgeGpu2> _GridEdges;    // all interior grid edges  [gridEdgeCount]
+
+RWStructuredBuffer<uint>      _VoxelCutMask; // 12-bit cut state per voxel [voxelCount]
+RWStructuredBuffer<CutPointGpu> _CutPoint;   // emitted cut points [cutPointCapacity]
+RWStructuredBuffer<uint>      _CutPointCounter; // [0] = write index (InterlockedAdd)
+
+// ── Stage 2D-2 (paper §2.1.2 / Berndt [22]): per-particle rotated frame R (read-only here) ──────
+// RotGpu mirrors C# ReconBuffers.RotGpu / Physics.compute (36 bytes = 3 rows of R). GUARDED LOCAL decl
+// (NOT #include "PhysicsCommon.hlsl" — that would drag SpringGpu/AtomicAddForce/DOPRI into the cut
+// shader; BendPairGpu precedent below at the SeverLinks block). ComputeParticleRot (Physics.compute) is
+// the SOLE writer; Cutting reads it as StructuredBuffer (cross-shader, single-writer = race-free).
+// float3x3 R = float3x3(rg.r0,rg.r1,rg.r2); mul(R,v) rotates (row-major); transpose(R)=R^-1.
+#ifndef ROTGPU_DEFINED
+#define ROTGPU_DEFINED
+struct RotGpu { float3 r0, r1, r2; };       // 36 bytes (rows of R)
+#endif
+StructuredBuffer<RotGpu> _ParticleRot;       // RotGpu[cornerCount]; written by Physics.ComputeParticleRot
+
+// MT_Test only: write results for oracle
+RWStructuredBuffer<float> _MTResults; // [0]=t_ray [1]=u_bary [2]=v_bary [3]=hitFlag (0 or 1)
+
+// ── Stage 2C uniforms (plan §4) ──────────────────────────────────────────────────────────
+int _VoxelCount;    // number of voxels (Nx*Ny*Nz) — slot space = 8*_VoxelCount
+int _CornerCount;   // number of grid corners (= particle count) — BuildCutTriangles domain
+int _TriCapacity;   // Tri buffer holds 3*_TriCapacity ints (shared with DC_Stitch); overflow guard
+int _CutSlotCount;  // = 8*_VoxelCount (slot count); optional uniform for slot-domain kernels
+// Stage 2D-2b (paper Discussion, clean:1271-1276): temporal interpolation factor α for InterpCutFP.
+// α ∈ (0,1]: 1 = OFF (byte-identical to pre-2D-2b), lower = more smoothing of the per-frame cut-FP DRIFT.
+float _CutFPInterp; // α — set by DualContouring.Build from ReconGridManager.cutFPInterp (default 1.0)
+
+// PURE-CENTROID (2026-06-28): ComputeComponentFP writes the paper §2.1.1 cut-point centroid directly to
+// _CutFP (the INTERNAL/cut-wall FP — no per-component QEF), so _CutPull is gone for good. _CutFPExternal
+// (the per-component External isosurface-QEF skin vertex) was REMOVED 2026-06-29: StitchVertId emits the
+// bit31 _CutFP centroid for the cut-voxel skin too (skin+wall share one watertight vertex per the paper,
+// Table 3 labels External/Internal as LOCATIONS of the ONE per-component FP — not a separate computation),
+// so the External-FP QEF was paper-silent dead code. With it gone NO Cutting kernel reads _QefIters; it is
+// still harmlessly SetInt-bound by DualContouring (a no-op here, as before the 2D-rim attempt).
+int _QefIters; // QEF iteration count (mirrors DC_FeaturePoints) — no-op on the cut shader (External-FP QEF removed)
+
+// ── Stage 2C buffers (plan §1.1 / §3) ────────────────────────────────────────────────────
+// Connectivity LUT (read-only, shared with Recon path): vertToComp + compCount per 12-bit mask.
+StructuredBuffer<Conn4096Gpu> _Conn4096;          // Conn4096Gpu[4096]
+
+// 2C-fix (plan §7): isosurface intersection data — shared with the Recon path. ComputeComponentFP
+// reads these to fuse each component's isect planes (pull-to-plane QEF) with its cut centroid.
+// IsectGpu comes from ReconCommon.hlsl (included above). _IsectWorld is the DEFORMED isect position
+// (rebuilt every frame by RebuildIsectWorld in Recon.compute BEFORE this kernel runs — plan §3.6).
+StructuredBuffer<IsectGpu> _Isect;                // flat Hermite isect list (rest data: normal, cornerA/B, insideA)
+StructuredBuffer<float3>   _IsectWorld;           // float3[IsectCount] deformed isect world positions
+StructuredBuffer<int>      _VoxelIsectOffset;     // per-voxel flat-list start index into _Isect/_IsectWorld
+StructuredBuffer<int>      _VoxelIsectCount;      // per-voxel isect count
+StructuredBuffer<uint>     _VoxelOccupied;        // RC2 gate: uint[VoxelCount] (1 ⇒ touches tissue)
+
+// Shared triangle output (SAME buffers as DC_Stitch in Recon.compute — unified triBuf).
+RWStructuredBuffer<int>    _Tri;                   // 3*_TriCapacity int vertex tags
+RWStructuredBuffer<uint>   _TriCounter;            // [0] = running index count (InterlockedAdd)
+
+// Cut feature-point buffers (plan §1.1). ALL atomic accumulators are FLAT int (A2-F1).
+RWStructuredBuffer<float4> _CutFP;                 // float4[8*VC] (xyz=FP world, w=valid), slot=8*v+comp
+// Stage 2D-2b (paper Discussion, clean:1271-1276): previous-frame DISPLAYED cut FP (EMA history). Same
+// shape/stride as _CutFP; persists across frames (NOT cleared by ClearCutFP). Written by InterpCutFP only.
+RWStructuredBuffer<float4> _PrevCutFP;             // float4[8*VC] (xyz=displayed FP, w=valid), slot=8*v+comp
+RWStructuredBuffer<int>    _CutFPAccumPos;         // int[3*8*VC] fixed-point centroid sum (3*slot+k)
+RWStructuredBuffer<int>    _CutFPAccumCnt;         // int[8*VC]   centroid count (slot)
+RWStructuredBuffer<uint>   _VoxelFPCount;          // uint[VC]    per-voxel compCount (0 if uncut)
+RWStructuredBuffer<int>    _CutFPNormal;           // int[3*8*VC] cut-FP normal accumulator (3*slot+k)
+RWStructuredBuffer<float3> _CutFPNormalF;          // float3[8*VC] normalized cut-FP normal
+
+// ── Helpers ──────────────────────────────────────────────────────────────────────────────────
+
+// VoxelId from integer corner coords — mirrors C# GridConventions.VoxelId
+int VoxId(int3 c) { return c.x + _Dims.x * (c.y + _Dims.y * c.z); }
+
+// VoxelId bounds check
+bool VoxInBounds(int3 c)
+{
+    return (c.x >= 0 && c.y >= 0 && c.z >= 0
+         && c.x < _Dims.x && c.y < _Dims.y && c.z < _Dims.z);
+}
+
+// CornerId from integer corner coords — mirrors C# GridConventions.CornerId
+int CorId(int3 c) { return c.x + (_Dims.x + 1) * (c.y + (_Dims.y + 1) * c.z); }
+
+// ── EdgeStencil (mirrors C# GridConventions.EdgeStencil exactly — design §10 / §3.3) ───────
+// For each axis, 4 slots of (voxelOffset, localEdge).
+// DO NOT introduce a second table: reuse the same canonical numbering. design §10.
+// Encoded as flat functions (HLSL multidim static arrays are unreliable in SM5).
+
+// Returns the voxelOffset for (axis, slot): matches C# EdgeStencil[axis][slot].voxelOffset
+int3 ES_VoxelOffset(int axis, int slot)
+{
+    // axis 0 (x): edge C→C+(1,0,0)
+    if (axis == 0) {
+        if (slot == 0) return int3( 0, 0, 0);
+        if (slot == 1) return int3( 0,-1, 0);
+        if (slot == 2) return int3( 0,-1,-1);
+        if (slot == 3) return int3( 0, 0,-1);
+    }
+    // axis 1 (y): edge C→C+(0,1,0)
+    if (axis == 1) {
+        if (slot == 0) return int3( 0, 0, 0);
+        if (slot == 1) return int3( 0, 0,-1);
+        if (slot == 2) return int3(-1, 0,-1);
+        if (slot == 3) return int3(-1, 0, 0);
+    }
+    // axis 2 (z): edge C→C+(0,0,1)
+    // slot 0: offset=(0,0,0)   localEdge=8
+    // slot 1: offset=(-1,0,0)  localEdge=9
+    // slot 2: offset=(-1,-1,0) localEdge=10
+    // slot 3: offset=(0,-1,0)  localEdge=11
+    if (slot == 0) return int3( 0, 0, 0);
+    if (slot == 1) return int3(-1, 0, 0);
+    if (slot == 2) return int3(-1,-1, 0);
+    return              int3( 0,-1, 0);
+}
+
+// Returns the localEdge for (axis, slot): matches C# EdgeStencil[axis][slot].localEdge
+int ES_LocalEdge(int axis, int slot)
+{
+    if (axis == 0) {
+        int vals[4] = {0, 2, 6, 4};
+        return vals[slot];
+    }
+    if (axis == 1) {
+        int vals[4] = {3, 7, 5, 1};
+        return vals[slot];
+    }
+    // axis 2 (z)
+    int vals[4] = {8, 9, 10, 11};
+    return vals[slot];
+}
+
+// ── Stage 2C uniform/helper-dependent grid helpers (plan §3.1 / §3.2) ────────────────────
+// Placed HERE (not CuttingCommon.hlsl) because they reference _Dims / _VoxelCutMask / the ES_/Vox
+// helpers, all of which are declared above in this file (HLSL requires declare-before-use).
+
+// CornerCoordHLSL: inverse of CorId — integer corner coords from a global corner index.
+// Mirrors C# GridConventions: id = i + (Nx+1)*(j + (Ny+1)*k). paper §2.1.1 / Fig 2.4.
+int3 CornerCoordHLSL(int idx)
+{
+    int nx = _Dims.x + 1, ny = _Dims.y + 1;
+    return int3(idx % nx, (idx / nx) % ny, idx / (nx * ny));
+}
+
+// EdgeValid (plan §3.2 / A1-C1): an interior grid edge (axis, baseC) is VALID iff all 4 EdgeStencil
+// voxels are in-bounds — the EXACT predicate BackgroundGrid used to build _GridEdges, so the
+// stitched edge-set ⊆ the FP-populated edge-set. paper §2.1.1; design §5.2.
+bool EdgeValid(int axis, int3 baseC)
+{
+    [unroll] for (int s = 0; s < 4; s++)
+        if (!VoxInBounds(baseC + ES_VoxelOffset(axis, s))) return false;
+    return true;
+}
+
+// EdgeIsCut (plan §3.2): CUT iff its localEdge bit is set in ANY in-bounds stencil voxel.
+// FIX (2D-1 debug workflow w8tio0dk5): must OR across ALL in-bounds stencil voxels, NOT return
+// the FIRST one's bit. DetectCut (2C-fix RC2) sets the bit ONLY in OCCUPIED voxels, so a boundary
+// cut edge whose first in-bounds stencil voxel is UNOCCUPIED (bit never set) would be wrongly read
+// as uncut → SeverLinks would leave a perimeter hinge un-severed AND BuildCutTriangles would leave
+// that ring un-stitched. Any in-bounds voxel with the bit set ⇒ the edge is cut. paper §2.1.3; design §3.4.
+bool EdgeIsCut(int axis, int3 baseC)
+{
+    bool cut = false;
+    [unroll] for (int s = 0; s < 4; s++)
+    {
+        int3 vc = baseC + ES_VoxelOffset(axis, s);
+        if (VoxInBounds(vc) && ((_VoxelCutMask[VoxId(vc)] >> ES_LocalEdge(axis, s)) & 1u) != 0u) cut = true;
+    }
+    return cut;
+}
+
+// Emit one cut point (inline — called twice per cut edge, once per endpoint particle).
+// For particle at corner index p:
+//   side   = sign of dot(cornerPos[p] - P_hit, n_cut)   → which side of the cut plane
+//   P_side = P_hit + side*(D*0.5)*n_cut                  → offset ±D/2 across the cut
+//   localOffset = P_side - cornerPos[p]
+// paper §3.4 (p12: "two cutting points are generated on the cutting edge ... the gap gradually widens"):
+// the ±D/2 two-cut-point split IS described. Only the n_cut DIRECTION is paper-silent; the sign is chosen
+// by the endpoint-particle's side. design §3.4.
+void EmitCutPoint(float3 P_hit, int p, int edgeId)
+{
+    float3 pPos = _CornerPos[p];
+    // side: which side of the cut plane this endpoint is on
+    // PAPER-SILENT: sign(dot(particlePos - P_hit, n_cut)) gives the signed side.
+    float  side = sign(dot(pPos - P_hit, _NCut));
+    if (side == 0.0) side = 1.0;  // on the cut plane exactly — assign to +n_cut side
+
+    // P_side: offset the hit point ±D/2 toward this particle's side
+    float3 P_side = P_hit + side * (_D * 0.5) * _NCut;  // ±D/2 offset — paper §3.4 (only n_cut DIRECTION is paper-silent)
+
+    // Append via atomic counter
+    uint slot;
+    InterlockedAdd(_CutPointCounter[0], 1, slot);
+
+    // Capacity guard (review R2 #2): never write past the buffer. With emit-on-first-cut
+    // gating the total is <= 2*GridEdgeCount = _CutPointCapacity, but guard defensively
+    // (out-of-bounds RWStructuredBuffer writes are implementation-defined on DX11).
+    if (slot >= (uint)_CutPointCapacity) return;
+
+    CutPointGpu cp;
+    // ── Stage 2D-2 (paper §2.1.2 reconstruct-on-deformed): record the offset in the OWNER's MATERIAL
+    // frame at cut time. localOffset = R_owner^T · (P_side - pPos) un-rotates the world offset into the
+    // owner's undeformed frame; AccumulateCutFP re-rotates it by the CURRENT R each frame so the cut
+    // wall follows tissue ROTATION (not just translation). With R=identity this is byte-identical to the
+    // pre-2D-2 world offset (transpose(I)·x = x) → no regression on the translation demo.
+    //
+    // M1 (frame ordering): EmitCutPoint reads frame N-1's R (the persisted _ParticleRot, post-sever for
+    // ALL prior cuts; ComputeParticleRot runs AFTER cutDetector.Dispatch). AccumulateCutFP reads frame
+    // N's R. The edge cut THIS frame was intact in R_{N-1}, so the cut-frame offset carries a one-edge
+    // ΔR — a DECLARED sub-voxel approximation (the neighbour is near-rest at the cut instant; the point
+    // is reconstructed via the evolving post-sever R thereafter). For the translation demo R≈I ⇒ exact.
+    //
+    // M5 PAPER DEVIATIONS (declared): (1) INFERENCE R=polar(F) realizes Berndt [22] (§2.1.2 clean:361
+    // delegates the axis update to [22] without stating polar/F); (2) F EXCLUDES severed edges
+    // (paper-silent); (3) identity fallback ⇒ §3.9 translation-only regime (paper-silent). See
+    // Physics.compute ComputeParticleRot for F construction + the det/per-axis/deadband guards.
+    float3x3 R_owner = float3x3(_ParticleRot[p].r0, _ParticleRot[p].r1, _ParticleRot[p].r2);
+    cp.localOffset   = mul(transpose(R_owner), P_side - pPos);  // owner MATERIAL-frame offset (2D-2)
+    cp.ownerParticle = p;
+    cp.edgeId        = edgeId;
+    cp._pad          = 0.0;
+    cp._pad2         = int2(0, 0);
+    _CutPoint[slot]  = cp;
+}
+
+// ── DetectCut kernel ────────────────────────────────────────────────────────────────────────
+// One thread per GridEdge entry.
+// paper §2.1.3 / Eq6-8 / Fig 2.8; design §5.2 / §5.3 / §10.
+[numthreads(64,1,1)]
+void DetectCut(uint3 id : SV_DispatchThreadID)
+{
+    uint e = id.x;
+    if ((int)e >= _GridEdgeCount) return;
+
+    // Guard: skip if tool has not moved (degenerate sweep). design §10 / PAPER-SILENT.
+    if (_ToolValid == 0) return;
+
+    // Decode this grid edge
+    GridEdgeGpu2 ge = _GridEdges[e];
+    int  axis = ge.axis;
+    int3 baseC = int3(ge.bcX, ge.bcY, ge.bcZ);  // integer coords of the A endpoint
+
+    // Axis direction vector (integer, one-hot)
+    int3 axisDir = int3(axis == 0 ? 1 : 0,
+                        axis == 1 ? 1 : 0,
+                        axis == 2 ? 1 : 0);
+
+    // Corner A and B (global indices)
+    int3 cornerA_coord = baseC;
+    int3 cornerB_coord = baseC + axisDir;
+    int  idA = CorId(cornerA_coord);  // global corner index of A endpoint
+    int  idB = CorId(cornerB_coord);  // global corner index of B endpoint
+
+    // DETECTION ray = REST (undeformed) grid edge (workflow w87ghv7f6; see _VoxelL/_GridOrigin header).
+    // The cut is a MATERIAL-frame fact: M-T the swept blade against the static rest lattice so the cut
+    // targets a fixed material plane and cannot be missed when gravity sags the live edge out of the
+    // zero-thickness world plane (the residual-hinge bug). paper §2.1.3 ray = voxel grid edge; gap C21.
+    float3 O_rest    = _GridOrigin + (float3)cornerA_coord * _VoxelL;  // rest world pos of A
+    float3 Dvec_rest = (float3)axisDir * _VoxelL;                      // rest edge vector (= rest B - rest A)
+
+    // EMISSION ray = DEFORMED edge: the cut POINT must follow the tissue (paper §2.1.2 reconstruct-on-
+    // deformed). KEEP these deformed — used ONLY for P_hit below, NEVER for the detection M-T/cull.
+    float3 O    = _CornerPos[idA];
+    float3 Dvec = _CornerPos[idB] - O;
+
+    // ── Broadphase AABB cull on the REST edge (PAPER-SILENT robustness; design §10) ─────────
+    // MUST use the REST edge: the static rest target layer always straddles bladeY → never wrongly
+    // culled. (Culling on the DEFORMED edge would drop a sagged edge before M-T → re-open the hinge.)
+    float3 eMin = min(O_rest, O_rest + Dvec_rest);
+    float3 eMax = max(O_rest, O_rest + Dvec_rest);
+    if (any(eMax < _SweptAABBMin) || any(eMin > _SweptAABBMax)) return;
+
+    // ── Möller-Trumbore on the REST edge: test T1 and T2 (paper Eq6-8 / Fig 2.8, exact, no band) ──
+    float t1, u1, v1, t2, u2, v2;
+    bool  hit1 = MollerTrumbore(O_rest, Dvec_rest, _T1V0, _T1V1, _T1V2, t1, u1, v1);
+    bool  hit2 = MollerTrumbore(O_rest, Dvec_rest, _T2V0, _T2V1, _T2V2, t2, u2, v2);
+
+    bool  anyHit = hit1 || hit2;
+    if (!anyHit) return;
+
+    // Take the nearer hit (smaller t_ray). If only one hit, use it. paper §2.1.3.
+    float t_ray;  // MATERIAL straddle parameter along the REST edge, ∈[0,1] by construction (rest straddle)
+    if (hit1 && hit2)
+        t_ray = (t1 < t2) ? t1 : t2;
+    else
+        t_ray = hit1 ? t1 : t2;
+
+    // ── Intersection point on the DEFORMED edge (paper §2.1.2 material-frame tracking) ──────────
+    // P_hit = O_def + t_ray * Dvec_def. t_ray is the MATERIAL straddle parameter (=0.5 for the cut
+    // layer), so P_hit follows the material midpoint of the deformed edge — intentionally NOT the
+    // deformed edge's current world-y crossing (do NOT "fix" this back to a world-plane solve). A rest
+    // hit ⇒ t_ray ∈ [0,1] by construction; the clamp is a pure FP guard so P_hit stays on the edge.
+    float3 P_hit = O + clamp(t_ray, 0.0, 1.0) * Dvec;
+
+    // ── Mark cut bit in all 4 sharing voxels (design §3.3 / §5.2 / §10) ─────────────────
+    // Reuse GridConventions.EdgeStencil [axis][0..3] → (voxelOffset, localEdge).
+    // DO NOT create a second table — design §10 "reuse EdgeStencil".
+    // voxelCutMask[voxel] |= 1 << localEdge   (bitwise-OR atomic for thread safety).
+    //
+    // Idempotency (review R2 #1): DetectCut runs EVERY frame and voxelCutMask PERSISTS
+    // (cuts are cumulative). To avoid re-appending the same edge's 2 cut points every
+    // frame (unbounded CutPoint growth + duplicate-polluted 2C centroids), we emit cut
+    // points ONLY on the uncut→cut transition. The InterlockedOr OLD value of the first
+    // in-bounds voxel's local-edge bit is the canonical "was this edge already cut?" flag
+    // (each grid edge maps to exactly one (voxel,localEdge) bit per sharing voxel, and one
+    // thread owns this edge per dispatch, so the read is race-free for this bit).
+    // RC2 gate (plan §7): skip cut-bit propagation into NON-occupied voxels (no tissue → no cut),
+    // and track whether ANY of the edge's 4 stencil voxels is occupied → EDGE-granularity emit gate.
+    bool firstCut    = false;
+    bool sawAnyVox   = false;
+    bool edgeOccupied = false;
+    for (int s = 0; s < 4; s++)
+    {
+        int3 vc = baseC + ES_VoxelOffset(axis, s);   // voxel integer coord
+        if (!VoxInBounds(vc)) continue;
+
+        int  vid     = VoxId(vc);                    // flat voxel index
+        if (_VoxelOccupied[vid] == 0u) continue;     // RC2: don't mark cut bits in empty voxels
+        edgeOccupied = true;
+
+        int  localE  = ES_LocalEdge(axis, s);        // local edge id within this voxel
+        uint cutBit  = (uint)(1 << localE);          // bit for this local edge
+
+        // paper §2.1.3 / design §3.4: OR the cut bit atomically; capture old for first-cut test
+        uint old;
+        InterlockedOr(_VoxelCutMask[vid], cutBit, old);
+        if (!sawAnyVox)
+        {
+            sawAnyVox = true;
+            firstCut  = (old & cutBit) == 0u;        // bit was 0 before this OR → first cut
+        }
+    }
+
+    // ── Emit 2 cut points (one per endpoint particle) ONLY on first cut ───────────────────
+    // Each endpoint particle gets its own cut point offset ±D/2 along n_cut by its side.
+    // design §3.6 / §5.3; paper §2.1.3 / Fig 2.8 + §3.4 p12 (the ±D/2 two-cut-point split is paper §3.4;
+    // only the n_cut DIRECTION is paper-silent).
+    // RC2 gate (plan §7): emit iff ≥1 of the edge's 4 stencil voxels is occupied — no cut points
+    // for an edge that only borders empty space (would seed a flap in non-tissue voxels).
+    if (firstCut && edgeOccupied)
+    {
+        EmitCutPoint(P_hit, idA, (int)e);
+        EmitCutPoint(P_hit, idB, (int)e);
+    }
+}
+
+// ── MT_Test kernel ──────────────────────────────────────────────────────────────────────────
+// Oracle for MollerTrumbore_GpuOracle_Tests.cs.
+// Thread 0 writes: _MTResults[0]=t_ray, [1]=u_bary, [2]=v_bary, [3]=hitFlag.
+// The calling test sets _T1V0/V1/V2 as the triangle and _T2V0=O, _T2V1=Dvec (reused uniforms).
+// Alternatively use dedicated uniforms (_MTTestO, _MTTestDvec etc.) — but here we reuse
+// _T1V0 = O, _T1V1 = Dvec (edge), _T2V0/V1/V2 = triangle V0/V1/V2 for simplicity.
+// PAPER-SILENT: oracle only; not in the paper.
+[numthreads(1,1,1)]
+void MT_Test(uint3 id : SV_DispatchThreadID)
+{
+    // Test inputs provided via uniforms (see CutDetector / test):
+    //   _T1V0 = ray origin O
+    //   _T1V1 = ray direction Dvec (= B - O, not necessarily unit length)
+    //   _T2V0 = triangle vertex V0
+    //   _T2V1 = triangle vertex V1
+    //   _T2V2 = triangle vertex V2
+    float3 O    = _T1V0;
+    float3 Dvec = _T1V1;
+    float3 V0   = _T2V0;
+    float3 V1   = _T2V1;
+    float3 V2   = _T2V2;
+
+    float t_ray, u_bary, v_bary;
+    bool  hit = MollerTrumbore(O, Dvec, V0, V1, V2, t_ray, u_bary, v_bary);
+
+    _MTResults[0] = t_ray;
+    _MTResults[1] = u_bary;
+    _MTResults[2] = v_bary;
+    _MTResults[3] = hit ? 1.0 : 0.0;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// Stage 2C — cut topology + cut-surface generation
+// paper §2.1.1 (Fig 2.4 connectivity / Fig 2.5 cut surface); design §4 / §6.
+// Module map (plan §2 / §7): 1 ClearCutFP, 2 LookupConnectivity, 3 AccumulateCutFP,
+//   4 ComputeComponentFP (2C-fix: unified per-component QEF, was FinalizeCutFP), 5 BuildCutTriangles,
+//   6 DC_NormalizeCutFP. Modules 3+4 are the fixed-point-atomic-then-solve GPU realization of design's
+//   single "ComputeCutFeaturePoints" (same pattern as Stage-1 normals).
+// ═════════════════════════════════════════════════════════════════════════════════════════
+
+// ── Module 1: ClearCutFP (plan §2.1; design §6 unified clear) ─────────────────────────────
+// Per (voxel·8 slot): zero cutFPAccumPos, cutFPAccumCnt, _CutFP.w, cutFPNormal.
+// Per voxel (slot < VoxelCount): zero voxelFPCount.
+// Domain G(8*VoxelCount): the slot index s covers all accumulators; the s<VoxelCount sub-range
+// additionally clears the per-voxel voxelFPCount (one clear, no second dispatch).
+[numthreads(64,1,1)]
+void ClearCutFP(uint3 id : SV_DispatchThreadID)
+{
+    uint s = id.x;
+    if (s >= 8u * (uint)_VoxelCount) return;
+
+    _CutFPAccumPos[3 * s + 0] = 0;
+    _CutFPAccumPos[3 * s + 1] = 0;
+    _CutFPAccumPos[3 * s + 2] = 0;
+    _CutFPAccumCnt[s]         = 0;
+    _CutFP[s]                 = float4(0, 0, 0, 0);   // w=0 → invalid
+    _CutFPNormal[3 * s + 0]   = 0;                    // A2-F3: cut-FP normals zeroed HERE (not in DC_ClearNormals)
+    _CutFPNormal[3 * s + 1]   = 0;
+    _CutFPNormal[3 * s + 2]   = 0;
+
+    if (s < (uint)_VoxelCount) _VoxelFPCount[s] = 0u; // per-voxel compCount cleared in-range
+}
+
+// ── Module 2: LookupConnectivity (plan §3.3; design §4.1; paper §2.1.1) ───────────────────
+// Per voxel: voxelFPCount = (mask==0)?0:conn4096[mask].compCount.
+[numthreads(64,1,1)]
+void LookupConnectivity(uint3 id : SV_DispatchThreadID)
+{
+    uint v = id.x;
+    if (v >= (uint)_VoxelCount) return;
+    uint mask = _VoxelCutMask[v] & 0xFFFu;                         // 12-bit cut config
+    // RC2 gate (plan §7): non-occupied voxels never carry feature points (no tissue).
+    if (mask == 0u || _VoxelOccupied[v] == 0u) { _VoxelFPCount[v] = 0u; return; }
+    _VoxelFPCount[v] = (uint)_Conn4096[mask].compCount;            // paper §2.1.1
+}
+
+// ── Module 3: AccumulateCutFP (plan §3.4; design §4.2; paper §2.1.1 centroid) ─────────────
+// One thread per cut point. Scatter the cut point's world pos into the ≤4 shared voxels' OWNER-
+// COMPONENT slots. World pos at 2C = cornerPos[owner]+localOffset (the ±D/2-offset P_side from 2B,
+// so the two components' centroids end up offset by ≈ D). Component = the one containing the OWNER's
+// local corner (VERTEX-keyed; a cut edge straddles two components).
+// Invariant (A1-I1): each cutPoint contributes to slot 8*v+comp(owner) AT MOST ONCE per voxel v.
+[numthreads(64,1,1)]
+void AccumulateCutFP(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _CutPointCounter[0]) return;                          // self-guard (counter on GPU)
+
+    CutPointGpu cp = _CutPoint[i];
+    // ── Stage 2D-2 (paper §2.1.2): reconstruct world = cornerPos[owner] + R_owner · localOffset_material.
+    // localOffset was recorded in the owner's MATERIAL frame at cut time (EmitCutPoint: R_cut^T·offset);
+    // re-rotating by the CURRENT R_owner makes the cut wall follow tissue ROTATION. M1 (frame ordering):
+    // this reads frame N's R (ComputeParticleRot runs THIS frame, BEFORE dc.Build / AccumulateCutFP),
+    // whereas EmitCutPoint read R_{N-1}; see EmitCutPoint for the declared one-edge ΔR approximation.
+    // With R=identity this is byte-identical to the pre-2D-2 path (I·x = x) → translation demo unchanged.
+    float3x3 R_owner = float3x3(_ParticleRot[cp.ownerParticle].r0,
+                                _ParticleRot[cp.ownerParticle].r1,
+                                _ParticleRot[cp.ownerParticle].r2);
+    float3 world   = _CornerPos[cp.ownerParticle] + mul(R_owner, cp.localOffset);
+    int3 ownerCoord = CornerCoordHLSL(cp.ownerParticle);
+
+    GridEdgeGpu2 ge = _GridEdges[cp.edgeId];
+    int  axis  = ge.axis;
+    int3 baseC = int3(ge.bcX, ge.bcY, ge.bcZ);
+
+    for (int s = 0; s < 4; s++)
+    {
+        int3 vc = baseC + ES_VoxelOffset(axis, s);
+        if (!VoxInBounds(vc)) continue;
+        int  v    = VoxId(vc);
+        if (_VoxelOccupied[v] == 0u) continue;                     // RC2 gate (plan §7): empty voxel → no FP
+        uint mask = _VoxelCutMask[v] & 0xFFFu;
+        if (mask == 0u) continue;                                  // voxel not cut → no FP slot
+        int lc = LocalCornerOf(ownerCoord, vc);
+        if (lc < 0) continue;                                      // owner is an endpoint → lc≥0
+        int comp = Conn4096Comp(_Conn4096[mask], lc);
+        int slot = 8 * v + comp;
+        // Fixed-point centroid sum (paper §2.1.1 mean-of-cut-points; POS_SCALE, plan §3.4).
+        InterlockedAdd(_CutFPAccumPos[3 * slot + 0], (int)round(world.x * POS_SCALE));
+        InterlockedAdd(_CutFPAccumPos[3 * slot + 1], (int)round(world.y * POS_SCALE));
+        InterlockedAdd(_CutFPAccumPos[3 * slot + 2], (int)round(world.z * POS_SCALE));
+        InterlockedAdd(_CutFPAccumCnt[slot], 1);
+    }
+}
+
+// ── Module 4: ComputeComponentFP (plan §3.3 / §7 — replaces FinalizeCutFP) ─────────────────
+// The per-component cut dual vertex: for each connectivity component of a cut boundary voxel, write the
+// PURE CENTROID of that component's cut points. paper §2.1.1 (newpaper_clean.txt:343-344): "The feature
+// point is the centroid of all the cut points." Fig 2.4/2.5; design §3.3.
+//
+// Why this opens the cut: the two components' cut centroids are ±D/2 apart along n_cut (EmitCutPoint),
+// so the two per-component dual vertices sit on opposite sides of the blade → the skin (which selects
+// the per-component FP by its inside corner) terminates at two separated vertices → the slit opens.
+//
+// HISTORY: 2C shipped a fused QEF(isect-planes)+cut-centroid per-component vertex (declared D-item).
+// Replaced 2026-06-28 (workflow wggai2v70) by the paper's pure centroid: the per-frame QEF re-solve over
+// DEFORMED isect inputs jittered the dual vertex frame-to-frame, flipping _CutFP.w so BuildCutTriangles
+// dropped quads = the cut-surface HOLES. The centroid is deterministic (no re-solve) → no jitter → the
+// closer-to-paper formula is ALSO the bug fix. Boundary lip now sits at the cut centroid (≈ blade plane)
+// instead of the QEF-conformed isosurface point — a bounded sub-voxel notch, accepted.
+//
+// One thread per VOXEL (loops its components). isectMean is a pure-mean fallback for a degenerate
+// component with isect planes but no cut points (no QEF, no _CutPull, no D5).
+[numthreads(64,1,1)]
+void ComputeComponentFP(uint3 id : SV_DispatchThreadID)
+{
+    uint v = id.x;
+    if (v >= (uint)_VoxelCount) return;
+
+    uint mask = _VoxelCutMask[v] & 0xFFFu;
+    // RC2 gate (plan §7) + uncut skip: only cut, occupied voxels carry per-component FPs.
+    if (mask == 0u || _VoxelOccupied[v] == 0u) return;
+
+    // Voxel integer coord from flat id (mirror C# GridConventions.VoxelCoord).
+    int3 vCoord = int3((int)v % _Dims.x, ((int)v / _Dims.x) % _Dims.y, (int)v / (_Dims.x * _Dims.y));
+
+    Conn4096Gpu conn = _Conn4096[mask];
+    int compCount = conn.compCount;
+
+    int off = _VoxelIsectOffset[v];
+    int cnt = _VoxelIsectCount[v];
+
+    // Solve each component independently.
+    for (int comp = 0; comp < compCount; comp++)
+    {
+        int slot = 8 * (int)v + comp;
+
+        // ── Gather this component's isosurface intersection planes (plan §7 IMPORTANT-3) ─────
+        // Include isect entry i iff the component of its INSIDE endpoint == comp. Assigning to ONLY
+        // the inside endpoint's component (not both) keeps the two halves on different patches → the
+        // boundary ring does not re-occlude. mean(p) is the QEF seed when isects exist.
+        float3 isectMean = (float3)0;
+        int    nIncl     = 0;
+        for (int s = 0; s < cnt; s++)
+        {
+            IsectGpu it = _Isect[off + s];
+            int insideCorner = (it.insideA == 1) ? it.cornerA : it.cornerB;   // B1 flag
+            int3 insideCornerCoord = CornerCoordHLSL(insideCorner);
+            int lc = LocalCornerOf(insideCornerCoord, vCoord);
+            if (lc < 0) continue;                          // inside endpoint not a corner of this voxel
+            if (Conn4096Comp(conn, lc) != comp) continue;  // belongs to a different component
+            isectMean += _IsectWorld[off + s];
+            nIncl++;
+        }
+        bool hasIsect = (nIncl > 0);
+        if (hasIsect) isectMean /= (float)nIncl;     // KEPT: isectMean is the _CutFP fallback when !hasCut (below)
+
+        // ── This component's cut centroid (from AccumulateCutFP) ─────────────────────────────
+        int   ccnt = _CutFPAccumCnt[slot];
+        bool  hasCut = (ccnt > 0);
+        float3 cutC = (float3)0;
+        if (hasCut)
+        {
+            cutC = float3(_CutFPAccumPos[3 * slot + 0],
+                          _CutFPAccumPos[3 * slot + 1],
+                          _CutFPAccumPos[3 * slot + 2]) / POS_SCALE / (float)ccnt;
+        }
+
+        // Invalid component: neither an isect plane nor a cut point → no dual vertex.
+        if (!hasIsect && !hasCut)
+        {
+            _CutFP[slot] = float4(0, 0, 0, 0);             // w=0 invalid → skipped by stitch/build
+            continue;
+        }
+
+        // ── Cut feature point = PURE CENTROID of the component's cut points (paper §2.1.1) ──────
+        // paper newpaper_clean.txt:344: "The feature point is the centroid of all the cut points."
+        // FIX (workflow wggai2v70): the previous per-frame QEF gradient descent (isosurface-plane
+        // descent + _CutPull pull + D5 box-clamp, seeded at the DEFORMED isectMean) re-solved the dual
+        // vertex from scratch EVERY frame, so under the bouncing deformation it JITTERED frame-to-frame
+        // → slot validity flipped → BuildCutTriangles dropped quads → the cut-surface HOLES/SPIKES the
+        // user reported. The pure centroid is DETERMINISTIC per cut-point set (no re-solve, no jitter),
+        // and the two components' centroids are already ±D/2 apart (EmitCutPoint along n_cut) so the gap
+        // == D and the skin still splits per component — no QEF / _CutPull / D5 needed. isectMean is a
+        // pure-mean fallback for a degenerate component with isect planes but (rarely) no cut points.
+        // NOTE: still uses the STATIC world cut-point offset (no per-particle R-frame); under pure
+        // TRANSLATION (the freed lower half falling) the centroid tracks correctly. The remaining
+        // rotation drift needs 2D-2 (Berndt R-frame) + 2D-2b (temporal interpolation) — next modules.
+        _CutFP[slot] = hasCut ? float4(cutC, 1.0) : float4(isectMean, 1.0);
+    }
+}
+
+// ── Module 4b: InterpCutFP — temporal feature-point interpolation (Stage 2D-2b) ───────────────
+// PAPER BASIS: newpaper_clean.txt:1271-1276 (Discussion / limitations). The paper attributes a "sudden
+// separation of the two sides of the cutting surface over a large distance, rather than a smooth split,
+// under large deformations" to post-cut feature-point DRIFT, and fixes it by "interpolat[ing] the
+// positions of post-cut feature points from the previous frame to the current frame" → visually smooth
+// transitions. The paper gives NO formula (α / seeding / validity are PAPER-SILENT) and flags this as a
+// visual approximation that "does not fully adhere to physical principles."
+//
+// M1 (one faithful realization): the paper's "interpolate prev→current" is literal at the STEP level
+// (per-frame lerp of last-displayed → current). Chaining it every frame = EXPONENTIAL SMOOTHING (EMA):
+//   displayed_N = lerp(displayed_{N-1}, curr_N, α),  α = _CutFPInterp.
+// α = 1 ⇒ lerp(prev,curr,1)=curr AND newly-valid=curr ⇒ _CutFP is BYTE-IDENTICAL to pre-2D-2b (the OFF
+// switch). EMA introduces a steady-state lag under SUSTAINED drift that the paper accepts. Alternatives
+// the paper text does not exclude (declared, not implemented): (a) fixed-N-frame ease from the cut
+// instant; (b) per-frame-displacement-clamped drift.
+//
+// M2 (seeding targets DRIFT-SNAP, not the appearance pop): the artifact is "feature point DRIFT"
+// (clean:1270) = per-frame movement of an ALREADY-EXISTING FP. So the smoothing targets the per-frame
+// jump of an already-valid slot; a NEWLY-valid slot (prev invalid) appears at curr (its first post-cut
+// value — the literal reading, since a just-appeared FP has no previous post-cut value). Easing the
+// appearance from the pre-cut continuous DC vertex is a DIFFERENT feature the paper never describes →
+// OUT OF SCOPE (pointer: 2D-3).
+//
+// M5 (declared artifacts — paper-silent, accepted): (a) DIFFERENTIAL-LAG SHEAR (TRANSIENT): two FPs of
+// one cut quad at different radii from a spin axis lag by different amounts → quad shear (worst-case
+// instantaneous ≈ v·(1−α)/α; bounded transient peak on the one-shot solver-damped spin, not a floor) →
+// recommend α not too small. (b) EMA LAGS the 2D-2 R-frame rotation: with α<1 the displayed FP TRAILS the
+// R-reconstructed curr, so on the rigid post-cut spin the wall floats off the spinning piece → recommend
+// α near 1 (≥0.5) there; 2D-2b's REAL benefit is the cut-OPENING transients DURING the sweep. (c)
+// CUMULATIVE-RECUT SLOT-RENUMBER SMEAR: a second cut in an already-cut voxel can renumber components, so
+// _PrevCutFP[8v+comp] may refer to a different physical component → a single-frame smear (rare; declared).
+//
+// One thread per slot (8*VoxelCount). GUARD mirrors ClearCutFP EXACTLY (8u*_VoxelCount, NOT _CutSlotCount).
+[numthreads(64,1,1)]
+void InterpCutFP(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = id.x;
+    if (slot >= 8u * (uint)_VoxelCount) return;   // mirror ClearCutFP guard exactly
+    float4 curr = _CutFP[slot];
+    float4 prev = _PrevCutFP[slot];
+    float4 outv;
+    if (curr.w < 0.5)        outv = float4(0,0,0,0);                                       // no cut FP now
+    else if (prev.w < 0.5)   outv = curr;                                                  // newly valid -> appear at current
+    else                     outv = float4(lerp(prev.xyz, curr.xyz, _CutFPInterp), 1.0);   // EMA smooth the drift
+    _CutFP[slot]     = outv;   // consumers (DC_Stitch, BuildCutTriangles, DC_NormalsScatter, DC_NormalizeCutFP) use the smoothed FP
+    _PrevCutFP[slot] = outv;   // persist this frame's displayed FP for next frame (EMA)
+}
+
+// ── EmitCutQuad helper (plan §3.6) ────────────────────────────────────────────────────────
+// Append the valid cut-FP slots of one cut grid edge as triangles into the SHARED _Tri buffer.
+//   n==4 → 2 tris with the DC diagonal (0,1,2)+(0,2,3) over the present slots (stencil order).
+//   n==3 → 1 tri over the 3 present slots.
+//   n <3 → none (missing corners → degenerate, skip).
+// Winding is DISPLAY-SIGN-AGNOSTIC (two-sided render, ReconSurface Cull Off + SV_IsFrontFace flip,
+// plan §3.7 / A1-C2) — no insideA-analog. Internal tag = 0x80000000 | slot. Appends via
+// InterlockedAdd(_TriCounter[0], 3*ntris) (SAME counter as DC_Stitch); overflow guard drops faces.
+void EmitCutQuad(bool ok[4], float3 fp[4], int tag[4], int n)
+{
+    if (n < 3) return;
+
+    // Compact the present slots into ord[0..n-1] in stencil order.
+    int ord[4]; int m = 0;
+    [unroll] for (int s = 0; s < 4; s++) if (ok[s]) { ord[m] = s; m++; }
+
+    int ntris = (n >= 4) ? 2 : 1;
+
+    uint baseIdx;
+    InterlockedAdd(_TriCounter[0], (uint)(3 * ntris), baseIdx);
+    // Overflow guard (plan §3.6 / R-E): never write past 3*_TriCapacity (SAME budget as DC_Stitch).
+    if (baseIdx + (uint)(3 * ntris) > (uint)(_TriCapacity * 3)) return;
+
+    // Triangle 1: present slots 0,1,2
+    _Tri[baseIdx + 0] = tag[ord[0]];
+    _Tri[baseIdx + 1] = tag[ord[1]];
+    _Tri[baseIdx + 2] = tag[ord[2]];
+
+    if (ntris == 2)
+    {
+        // Triangle 2: present slots 0,2,3 (shares diagonal 0-2 — DC convention)
+        _Tri[baseIdx + 3] = tag[ord[0]];
+        _Tri[baseIdx + 4] = tag[ord[2]];
+        _Tri[baseIdx + 5] = tag[ord[3]];
+    }
+}
+
+// ── Module 5: BuildCutTriangles (plan §3.6; design §4.3; paper Fig 2.5) ───────────────────
+// One thread per particle (grid corner). For each incident CUT grid-edge, gather THIS particle's
+// connectivity-component FP in the 4 shared voxels → quad → ≤2 tris into the SAME _Tri buffer.
+// Each undirected edge has ONE base corner, so a cut edge is visited by exactly its two endpoint
+// particles → each endpoint emits its OWN face = two parallel faces (the gap); no dup, no miss.
+[numthreads(64,1,1)]
+void BuildCutTriangles(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= (uint)_CornerCount) return;
+    int3 c = CornerCoordHLSL(p);
+
+    // Corner c's ≤6 incident grid edges as (axis, baseCorner):
+    //   +x=(0,c) -x=(0,c-ex) +y=(1,c) -y=(1,c-ey) +z=(2,c) -z=(2,c-ez)
+    int  axes[6] = {0, 0, 1, 1, 2, 2};
+    int3 bs[6]   = { c, c - int3(1,0,0), c, c - int3(0,1,0), c, c - int3(0,0,1) };
+
+    for (int e = 0; e < 6; e++)
+    {
+        int  axis  = axes[e];
+        int3 baseC = bs[e];
+        if (!EdgeValid(axis, baseC)) continue;                    // shared predicate (plan §3.2)
+        if (!EdgeIsCut(axis, baseC)) continue;
+
+        float3 fp[4]; int tag[4]; bool ok[4]; int n = 0;
+        for (int s = 0; s < 4; s++)
+        {
+            ok[s] = false;
+            int3 vc = baseC + ES_VoxelOffset(axis, s);            // vc in-bounds by EdgeValid
+            int  v    = VoxId(vc);
+            if (_VoxelOccupied[v] == 0u) continue;                // RC2 gate (plan §7): empty voxel → no FP corner
+            uint mask = _VoxelCutMask[v] & 0xFFFu;
+            if (mask == 0u) continue;                             // shared voxel uncut → no FP corner
+            int lc = LocalCornerOf(c, vc);
+            if (lc < 0) continue;
+            int comp = Conn4096Comp(_Conn4096[mask], lc);
+            int slot = 8 * v + comp;
+            float4 f = _CutFP[slot];
+            if (f.w < 0.5) continue;                              // invalid FP → missing corner
+            fp[s]  = f.xyz;
+            tag[s] = (int)(0x80000000u | (uint)slot);            // internal tag (bit31 set)
+            ok[s]  = true;
+            n++;
+        }
+        EmitCutQuad(ok, fp, tag, n);                              // 4→2 tris, 3→1, <3→none
+    }
+}
+
+// ── Module 6: DC_NormalizeCutFP (plan §3.7; design §6; PAPER-SILENT) ──────────────────────
+// Per (voxel·8 slot): normalize cutFPNormal → cutFPNormalF. Mirrors DC_NormalsNormalize.
+[numthreads(64,1,1)]
+void DC_NormalizeCutFP(uint3 id : SV_DispatchThreadID)
+{
+    uint s = id.x;
+    if (s >= 8u * (uint)_VoxelCount) return;
+    float3 nv = float3(_CutFPNormal[3 * s + 0],
+                       _CutFPNormal[3 * s + 1],
+                       _CutFPNormal[3 * s + 2]) / NORMAL_SCALE;
+    float len = length(nv);
+    _CutFPNormalF[s] = (len > 1e-6) ? nv / len : float3(0, 0, 0);
+}
+
+// ── Stage 2D-1: SeverLinks — physical severing (paper §2.1.2 line 367; plan 2026-06-28-dc-2d1-severing.md) ──
+// When a grid edge is cut, break the mass-spring physical connection so the two halves separate under
+// gravity. paper:367 "when the cut is complete, the physical connection of that edge is severed"; this
+// targets the paper:520-522 failure mode (visually severed while forces still act across the ends).
+// The force kernels ALREADY honor the guards: AccumulateStructural skips _NbrIdx<0 (Physics.compute:94),
+// AccumulateBending returns on alive==0 (Physics.compute:128). SeverLinks is the SOLE WRITER of these two
+// buffers — Physics.compute declares them read-only StructuredBuffer; do NOT change that (single-writer,
+// race-free across the cutDetector.Dispatch / next-frame solver.Step barrier).
+//
+// BendPairGpu mirrors C# ReconBuffers.BendPairGpu / PhysicsCommon.hlsl (32 bytes). Guarded LOCAL decl (NOT
+// #include "PhysicsCommon.hlsl" — that would drag SpringGpu/AtomicAddForce/DOPRI tables into the cut shader).
+#ifndef BENDPAIRGPU_DEFINED
+#define BENDPAIRGPU_DEFINED
+struct BendPairGpu { int i, j, k; float theta0; int alive; int _p0, _p1, _p2; }; // 32 bytes
+#endif
+
+RWStructuredBuffer<int>         _NbrIdx;    // int[6*cornerCount]; slots 0=-x,1=+x,2=-y,3=+y,4=-z,5=+z; -1=none
+RWStructuredBuffer<BendPairGpu> _BendPairs; // BendPairGpu[15*cornerCount]; {i,j,k,theta0,alive,3 pad}
+
+// One thread per interior grid edge. Idempotent (writes constants; scan reads build-time j/k) → dispatch
+// every frame AFTER DetectCut (so EdgeIsCut sees this frame's bits).
+[numthreads(64,1,1)]
+void SeverLinks(uint3 id : SV_DispatchThreadID)
+{
+    uint e = id.x;
+    if (e >= (uint)_GridEdgeCount) return;
+
+    GridEdgeGpu2 ge = _GridEdges[e];
+    int  axis  = ge.axis;
+    int3 baseC = int3(ge.bcX, ge.bcY, ge.bcZ);
+    if (!EdgeValid(axis, baseC)) return;        // in-range (same predicate as the gridEdges build)
+    if (!EdgeIsCut(axis, baseC)) return;        // only cut edges (cumulative _VoxelCutMask) — paper:367
+
+    int3 axisDir = int3(axis == 0 ? 1 : 0, axis == 1 ? 1 : 0, axis == 2 ? 1 : 0);
+    int idA = CorId(baseC);                     // edge A endpoint (lower-coord)
+    int idB = CorId(baseC + axisDir);           // B = A's +axis neighbor
+    int sPlus  = 2 * axis + 1;                  // +x=1,+y=3,+z=5 — idA's slot toward idB (NbrDelta)
+    int sMinus = 2 * axis;                      // -x=0,-y=2,-z=4 — idB's slot toward idA
+
+    // (1) sever the STRUCTURAL link, BOTH directions — AccumulateStructural gathers per-particle, so the
+    //     A-B spring must be removed from A's slot AND B's slot independently (Physics.compute:93-94).
+    //     _RestNbr is intentionally left stale: it is read only AFTER the n<0 guard (Physics.compute:96),
+    //     so a severed slot's RestNbr is never read.
+    _NbrIdx[6 * idA + sPlus]  = -1;
+    _NbrIdx[6 * idB + sMinus] = -1;
+
+    // (2) sever BENDING pairs whose arm crosses the cut edge (Physics.compute:128 skips alive==0). The cut
+    //     edge (A,B) is an arm only of a pair CENTERED at A (arm j|k==B) or at B (arm j|k==A) — an arm
+    //     always includes its center, and A,B are adjacent so no third center hosts it: complete, no over-kill.
+    for (int p = 0; p < 15; p++)
+    {
+        int ia = 15 * idA + p; BendPairGpu a = _BendPairs[ia];
+        if (a.alive != 0 && (a.j == idB || a.k == idB)) { a.alive = 0; _BendPairs[ia] = a; }
+        int ib = 15 * idB + p; BendPairGpu b = _BendPairs[ib];
+        if (b.alive != 0 && (b.j == idA || b.k == idA)) { b.alive = 0; _BendPairs[ib] = b; }
+    }
+}

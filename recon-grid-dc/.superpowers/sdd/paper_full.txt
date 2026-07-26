@@ -1,0 +1,999 @@
+                                         Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+                                                       Contents lists available at ScienceDirect
+
+                       Computer Methods and Programs in Biomedicine
+
+                     journal homepage: https://www.sciencedirect.com/journal/computer-methods-and-
+                                                                   programs-in-biomedicine
+
+A real-time reconstructed grid method for soft tissue cutting and haptic
+
+Liang Li , Lai Zhou ,1, Xueyu Zhou
+
+Pre-research Department, China Simulation Sciences Co. Ltd., No. 1 Kangqiao East Road, Building 2, Pudong New District, Shanghai, 201315, China
+
+ARTICLE INFO         ABSTRACT
+
+Keywords:            Background and Objective: The virtual surgery system is crucial for medical training and preoperative
+Virtual surgery      planning. To address the issues faced in existing research, such as distorted grids, cutting with volume loss, low
+Soft tissue cutting  computational efficiency, and surgical tool penetration, this paper proposes a parallel data structure optimized
+Haptic               for GPU computation. This structure enables efficient cutting with minimal volume loss and provides force
+                     feedback effects without model penetration.
+                     Methods: This paper applies the Dual Contouring algorithm within the deformable grid framework for real-
+                     time mesh reconstruction, which can be divided into surface reconstruction during deformation and cutting
+                     surface reconstruction. By precomputing all possible voxel grid connections and the calculation methods for
+                     the feature points of each mesh, feature point positions can be quickly determined within a single GPU thread,
+                     accelerating the reconstruction process. Additionally, the force feedback algorithm based on Signed Distance
+                     Field and the Finger-proxy model addresses the penetration issue when the surgical tool collides with soft
+                     tissue.
+                     Results: Simulation results show that, compared to traditional mesh cutting methods, the proposed approach
+                     retains the non-manifold surface features at the cut areas during real-time cutting, and the frame rate does not
+                     decrease as the number of cuts increases. The use of the Signed Distance Field for collision detection ensures
+                     that the tool has both collision volume and force feedback effects.
+                     Conclusion: The proposed method can handle interactive cutting and collision operations in various surgical
+                     simulations and achieves an interactive frame rate that meets real-time requirements, contributing to more
+                     efficient and realistic virtual surgery simulations.
+
+1. Introduction                                                              modeling of biological soft tissues is typically achieved by establishing
+                                                                             physically based constitutive equations. This process involves dividing
+    With the continuous evolution of computer hardware and software          the soft tissue model into smaller mechanical units and adjusting their
+technologies, alongside iterative advancements in force feedback inter-      poses based on local connectivity relationships to control the overall
+action devices, virtual surgery systems are playing an increasingly vital    shape of the model [4]. Commonly used modeling methods include the
+role in the medical field. In virtual environments, three-dimensional ge-    Mass-Spring Model (MSM), Finite Element Method (FEM), and Position-
+ometric and physical modeling of human organ models, combined with           Based Dynamics (PBD) [5­7]. Beyond addressing the complexities of
+haptic algorithms and devices for simulated surgical operations [1],         nonlinear biomechanical models, real-time modifications to the three-
+enables specific organs or tissues to be repeatedly utilized. These ap-      dimensional topological structure of soft tissues, including procedures
+proaches hold significant importance for preoperative planning, train-       such as cutting, electrocoagulation, and tearing, represent a critical
+ing, reducing the demand for real samples, and mitigating the risk of        area of focus. Precisely replicating the deformation behavior of soft
+disease transmission [2].                                                    tissue organs during interactive processes poses a major challenge in
+                                                                             contemporary research on virtual surgery technology.
+    Interactive simulation of soft tissues primarily involves research into
+key technologies such as physical modeling, geometric modeling, and              In recent years, researchers have made significant progress in ex-
+force-tactile feedback. The nonlinear, anisotropic mechanical behavior       ploring various physical modeling techniques for soft tissues. When
+of biological soft tissues [3] is significantly more complex than that of    employing mesh-based methods, detailed spatial descriptions of mesh
+isotropic soft tissues, making deformation simulation a prerequisite for     segmentation enable precise representation of complex boundaries and
+visual and force-tactile feedback in simulation systems. The mechanical
+
+   Corresponding author.
+      E-mail addresses: liang.li@csssim.com (L. Li), lai.zhou@csssim.com (L. Zhou), xueyu.zhou@csssim.com (X. Zhou).
+
+   1 These authors contributed equally to this work.
+
+https://doi.org/10.1016/j.cmpb.2025.109123
+Received 20 March 2025; Received in revised form 24 September 2025; Accepted 15 October 2025
+Available online 20 October 2025
+0169-2607/© 2025 The Authors. Published by Elsevier B.V. This is an open access article under the CC BY-NC-ND license (http://creativecommons.org/licenses/by-
+nc-nd/4.0/).
+L. Li et al.                                                                                                 Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+internal structures [8,9]. In finite element simulations, achieving high-      adaptive grids for geometric modeling, achieving better smoothness
+precision soft tissue modeling requires high-quality mesh division and         and visual quality of the cutting surfaces [24,25]. Chen et al. improved
+numerical integration, which demands substantial computational re-             tetrahedral subdivision methods, employing progressive planar cutting
+sources. Consequently, the Finite Element Method (FEM) is better               while simultaneously performing optimization and simulation to ensure
+suited for offline simulations [10]. To enhance computational perfor-          consistency between topological structures and force models, enabling
+mance and enable FEM for real-time soft tissue deformation simulation,         more flexible cutting paths. However, such mesh-based cutting ap-
+researchers have pursued further advancements. Marinkovi et al. pro-           proaches inevitably generate a large number of simulation elements
+posed a simplified geometrically nonlinear co-rotational finite element        after multiple cuts, leading to reduced solving speeds [26]. In addition
+formulation, enhanced by coupled mesh techniques, allowing complex             to traditional mesh-based cutting methods, volumetric models with
+geometric shapes to be modeled with relatively simple computational            both surface and internal structures can be constructed from CT/MRI
+models [11]. For specific soft tissue organs, the Corotational Cut Finite      data. By further optimizing the incision shape using second-order Bézier
+Element Method can be employed, utilizing background meshes and                curves, it becomes possible to achieve partial cuts that preserve internal
+multilayer embedding algorithms to automatically capture complex               features [27,28].
+geometries. Surface details are derived from binarized images, bypass-
+ing the complexity of mesh generation and enabling real-time needle                Although current technical approaches can meet specific require-
+insertion simulations for various soft tissues without requiring mesh          ments for soft tissue modeling or cutting under constrained conditions,
+conformity [12]. Additionally, by discretizing FEM and converting the          simulations often focus on individual functionalities in isolation. From
+effect of external forces on soft tissue deformation into a constraint         a visual standpoint, achieving low-volume-loss cutting while maintain-
+estimation problem, deformation behavior can be estimated from lo-             ing a smooth frame rate and user experience remains challenging.
+cal surface displacement data, thereby improving FEM computational             Regarding force feedback, traditional methods typically rely on ap-
+efficiency [13]. Compared to FEM, the Mass-Spring Model (MSM)                  plying increased reaction forces to prevent penetration. While these
+is frequently used in real-time simulations due to its lower over-             approaches can be effective within moderate force ranges, excessive
+all computational cost and high adaptability to geometric topological          user input may still lead to undesirable outcomes--such as excessive
+structures [14]. However, when simulating high-stiffness deformations,         compression of the tissue or visual artifacts like interpenetration.
+large time steps can compromise stability, and parameter tuning re-
+mains challenging. To enhance its accuracy and stability, researchers              This paper proposes a CUDA-parallelized Dual Contouring algorithm
+have introduced a series of improvements and applied them to various           for real-time three-dimensional model reconstruction. The proposed
+soft tissue modeling scenarios. Duan et al. utilized a predict­correct         method generates low-loss cutting surfaces during progressive soft
+method to refine explicit integration results, incorporating nonlinear         tissue cutting simulations and prevents the physical simulation of soft
+properties and volume constraints to reflect biomechanical characteris-        tissues from being adversely affected by elongated triangular facets
+tics and the incompressibility of soft tissues in simulations [15]. Beyond     after multiple cuts. The paper employs structural springs and bending
+integrating MSM into traditional volumetric meshes, modeling solely on         springs for soft tissue physical modeling [29], utilizes an adaptive
+surface triangular meshes can also preserve volume. Hongly Va et al.           Runge­Kutta method for updating particle positions [30], and leverages
+leveraged the divergence theorem and implicit constraints to construct         GPU acceleration for particle position calculations, ensuring both the
+MSM within surface triangular meshes, achieving stable deformation             accuracy and real-time performance of soft tissue modeling. To tackle
+and volume preservation while significantly reducing computational             the issue of penetration between soft tissues and surgical instruments
+complexity compared to traditional volumetric meshes [16]. To better           during interaction, this paper introduces a method combining Signed
+capture force propagation [17] and modeling precision, Zhang et al.            Distance Functions with the Finger-Proxy model to determine the op-
+combined convolutional neural networks (CNNs) with traditional phys-           timal position of surgical instruments following collisions with soft
+ical models, incorporating biomechanical parameters and optimizing             tissues. This method ensures that, upon collision, the surgical instru-
+the model via neural networks to achieve heterogeneous soft tissue             ment exerts appropriate pressure and friction forces on the soft tissue,
+deformation effects [18].                                                      preventing protrusions or incorrect displacements of particles within
+                                                                               the collision region due to penetration. Furthermore, the paper designs
+    In simulating soft tissue cutting, real-time coupling of biomechan-        a soft tissue interaction system accommodating multiple operating con-
+ical properties with dynamic meshes is essential, requiring both high-         ditions, achieving smooth progressive cutting and stable force feedback
+precision physical model representations and adaptive updates to topo-         effects. The primary contributions of this paper are summarized as
+logical structures [19]. Wu et al. performed physical modeling based on        follows:
+tetrahedral mesh structures, implementing liver resection by subdivid-
+ing and removing tetrahedra at cutting edges. However, the triangles                · Propose a parallel-accelerated Dual Contouring algorithm to
+generated on cutting surfaces depend on tetrahedral size, resulting                   achieve real-time three-dimensional reconstruction under both
+in coarse meshes that fail to accurately represent the incision [20].                 fine cutting and electrocoagulation cutting processes, while in-
+Jerábková et al. used refined hexahedral voxels with the Marching                     tegrating a nonlinear physical modeling approach to ensure that
+Cubes (MC) algorithm for real-time geometric modeling and coarse                      both visual and physical effects are accurately represented simul-
+mesh models for dynamic modeling, achieving cutting by removing                       taneously.
+refined voxels and updating surfaces. However, repeated cuts led to
+noticeable volume loss [21]. Fortunately, some volume loss also occurs              · Propose a force feedback algorithm based on signed distance
+in real electrocoagulation cutting. Berndt et al. simulated monopolar                 fields, effectively preventing the loss of force feedback or in-
+electrocoagulation cutting of soft tissues using Position-Based Dynam-                correct deformation of soft tissues caused by model penetration
+ics (PBD) and MC algorithms, dynamically adjusting the positional                     during collisions between surgical instruments and soft tissues.
+relationship between hexahedral voxel vertices and isosurfaces to ex-
+clude specific vertices during surface reconstruction, thereby achieving            · Design cutting and collision simulation experiments to validate
+electrocoagulation effects [22]. Yu et al. built on this by developing                the proposed method, with results demonstrating that the method
+an Aggregated Finding Connected Components (AFCC) algorithm to                        can generate smooth and realistic incisions while adapting to
+address discrepancies between visual meshes and simulation models                     various operating conditions and collision interactions.
+during cluster separation, avoiding ghost forces and visual artifacts in
+discontinuous cutting [23]. To produce low-loss cutting surfaces, Wu               Rest of paper is organized as follows: Section 2 introduces the
+et al. employ a coarse grid for mechanical modeling combined with              cutting, soft tissue modeling, and collision interaction methods. Sec-
+                                                                               tion 3 provides a detailed description of the virtual simulation platform
+                                                                               and multi-threaded computation framework. Section 4 presents the
+                                                                               simulation process. Conclusions are drawn after simulation results.
+
+                                                                            2
+L. Li et al.                                                                                     Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+                              Fig. 2.1. Process of geometric surface rendering for soft tissues.
+
+                                                                                 The new feature point position is written as following,
+
+                                                                               1 = 0 +   
+                                                                               
+                                                                                                                                                             (4)
+                                                                                            (    )
+                                                                                  = 0.1  1 -
+                                                                               
+
+                                                                                               
+
+                                                                               
+
+                                                                               where  is used to scale the update step, allowing the feature points to
+
+                                                                               converge to their final positions more quickly. The maximum number
+
+                                                                               of iterations is m. At this point, based on all the edges that intersect
+
+                                                                               with the iso-surface, the feature points of the surrounding four cubes
+
+                                                                               are connected to form the outer surface. This method shares the same
+
+                                                                               limitation as matrix decomposition, where face intersections may oc-
+
+                                                                               cur, primarily because the feature points extend beyond their respective
+
+                     Fig. 2.2. Feature point update method.                    voxels. Let the voxel edge length be  and the position be (x,y,z), then
+
+                                                                               the signed distance field can be obtained:
+
+                                                                                (, , )  =  max(max(|      -    |  -   ,  |  -    |  -   ), |  -    |  -   )  (5)
+                                                                                                       |       |     2   |       |     2|          |     2
+2. Methods
+
+                                                                               when the SDF value is negative, the iteration is stopped, resulting in a
+
+    To preserve edge features during real-time cutting and ensure that         smooth, non-intersecting surface.
+multiple cuts do not degrade frame rates, this paper adopts the Dual
+Contouring (DC) method for surface reconstruction. As illustrated in           2.1. Cutting process
+Fig. 2.1, the input volumetric data is divided into a uniform background
+grid, followed by adaptive octree subdivision. The intersection proper-        2.1.1. The static cutting process
+ties of each cube with the isosurface are recorded, including the local            As shown in the Fig. 2.3, the surface reconstruction and cutting
+coordinates of intersection points and the normal vectors of the outer
+surface. Feature point positions are then computed, and adjacent voxel         diagram in 2D, the deformable object is embedded in the background
+feature points are connected to form an approximate surface.                   grid, and its surface is reconstructed using Dual Contouring. The re-
+                                                                               construction of the outer surface is the preprocessing step before the
+      -1  (             ))2)                                                   cutting, and its complexity does not affect the real-time performance.
+           (                                                                   In this process, the blue grid represents the voxel grid used for re-
+                  (                                          (1)               construction, where the 12 edges of each voxel are used both for
+                                                                               3D reconstruction and to represent the physical interactions between
+   =                 -                                                         particles. When reconstructing the outer surface, the voxel edges that
+                                                                               intersect with the isosurface are marked as ``Intersecting edges'', and
+      =0                                                                       the intersection points generated on the voxel edges are marked as ``In-
+                                                                               tersecting Points''. The global coordinates of these intersection points,
+    The above represents the quadratic error function for feature points,      their local coordinates within the voxel, and the normals at these
+where  and  denote the intersection point and normal of the th                 points are also recorded. To quickly identify the intersecting edges, a
+edge of the cube, respectively, and  is the feature point position. By         Marching Cubes lookup table is used. Each voxel intersecting with the
+minimizing the value of , an approximation of  can be obtained. To             isosurface computes the feature points as shown in Fig. 2.2. Then, for
+avoid performance degradation caused by using matrix decomposition             each intersecting edge, the feature points from the surrounding four
+to solve the Quadratic Error Function (QEF), this paper adopts the             voxels are connected to form two triangular surfaces. The figure on
+method proposed in [31]. The approach utilizes a particle movement             the right illustrates the specific cutting process, where the yellow line
+approximation and Hermite data to generate a single feature point              represents the cutting path. During the cutting process, the voxel edges
+within the cube at the boundary. Furthermore, spatial constraints and          being cut are marked as ``Cutting edge'', and the intersection point
+gradient information are employed to optimize the vertex positions.            location information is recorded. The surface generation during the
+                                                                               cutting process differs from that of the outer surface. The cut internal
+    As shown in Fig. 2.2, the initial feature points are obtained by first     voxel grid will dynamically compute its undirected graph connectivity.
+calculating the average of all intersection points within the grid. The        This graph has 8 vertices and 12 edges, and each voxel, when cut, can
+following relationships can be derived:                                        form up to 8 feature points. Therefore, the connectivity component
+                                                                               of each vertex needs to be obtained. The connectivity of the voxel
+0  =                                                         (2)               is pre-calculated and stored as a 2D array, with a total of 212(4096)
+                                                                               possible configurations. Similar to the Marching Cubes lookup table,
+                                                                               each edge has two states: intersecting with the target contour or not.
+                                                                               Thus, the state of each edge can be represented by a binary bit, where
+      =1
+
+    The feature point motion direction  is obtained based on the
+positions of the intersection points and their normals:
+
+      
+
+ =  (- (0 - )  2 )                                           (3)
+
+      =1
+
+                                                                            3
+L. Li et al.                                                                        Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+                                                  Fig. 2.3. Static cutting method.
+
+              Fig. 2.4. Voxel connectivity graph disconnection.
+
+              Fig. 2.5. Local surface rendering.                                2.1.2. The dynamic cutting process
+                                                                                    As shown in Fig. 2.6, in general, soft tissue undergoes deformation
+
+                                                                                due to internal and external forces before cutting, causing its internal
+                                                                                voxel grid to become distorted and no longer be a uniform hexahedron.
+                                                                                The coordinate axes of the particles are rotated due to the influence
+                                                                                of the surrounding connections. The calculation of the new coordinate
+                                                                                system is based on the method described in [22].
+
+                                                                                    Each coordinate axis' positive and negative directions are mapped
+                                                                                to the six surrounding edges of the particle. When an edge is cut, the
+                                                                                local coordinates of the cut point, relative to the two vertices of the
+                                                                                edge, are recorded. This is done based on the condition that the edge
+                                                                                has not undergone any deformation. As shown in the Fig. 2.7, when the
+                                                                                cut is complete, the physical connection of that edge is severed, and the
+                                                                                new cut point is computed using the corresponding coordinate axes.
+
+``0'' indicates no intersection and ``1'' indicates intersection. When none     2.1.3. Cutting path
+of the edges intersect, the state is stored as the index ``000000000000''.          In virtual surgery, real-time performance is a critical factor. Com-
+When the th edge is cut, the index can be quickly updated using a
+bitwise or operation to obtain the new connectivity.                            plex mesh structures increase computational burdens, especially dur-
+                                                                                ing cutting operations, where a large amount of mesh data must be
+    Each vertex within a voxel has three edges. For each connected              processed. This can lead to high computational costs and increased
+component, the edges that are cut and the cut points of all its vertices        latency [32,33]. As shown in Fig. 2.8, to accurately detect the inter-
+need to be identified. The feature point is the centroid of all the cut         section between the cutting surgical instrument and the mesh during
+points. As shown in Fig. 2.4, the voxel is divided into two connected           cutting, and to generate continuous cutting paths, this paper defines
+components, and each connected component has its corresponding                  the surgical instrument as a cutting line. The cutting plane is formed
+feature point. Each edge that contains a vertex will participate in the         by the cutting path of the previous and current frames, and the cut-
+calculation, and the cut edges will be calculated twice.                        ting plane consists of two triangles. This cutting plane persists in
+                                                                                the simulation at any given frame. The advantage of this approach
+    After all the voxel grids and edges are calculated, each particle's 6       is that it prevents collision detection failure due to low frame rates
+edges and 8 neighboring quadrants are traversed. If an edge is cut, the         or rapid movement of the surgical instrument. For collision detection
+corresponding feature points of the four neighboring quadrants of that          between the cutting plane and the mesh, this paper employs the Möller-
+edge are found for the particle. As shown in Fig. 2.5, V1 and V2 share          Trumbore algorithm for fast ray-triangle intersection tests. The core
+two feature points, and they are connected respectively to form two             of this method is to determine intersection conditions by calculating
+triangles.                                                                      the geometric relationship between the ray and the triangle, without
+
+                                                                             4
+L. Li et al.                                                                      Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+                                           Fig. 2.6. The direction of the particles changes after deformation.
+
+         Fig. 2.7. Surface rendering after changing particle directions.          Fig. 2.8. Ray-based cutting method.
+
+explicitly calculating the intersection point. This makes it more efficient       is a technique where an electric current is directly applied to tissue,
+than other algorithms that require solving quadratic equations, which is          generating heat through high-frequency current to cut and coagulate
+particularly important for large-scale parallel computation on hardware           tissue. Its advantages include reducing intraoperative bleeding, improv-
+to enhance performance [34,35].                                                   ing surgical precision, and enhancing safety. This type of cutting is
+                                                                                  often accompanied by some thermal damage and minimal volume loss.
+    Let the ray origin and direction be  and , and the triangle vertices          Similar volume loss simulations also exist in ophthalmic surgery, such
+be  0,  1, and  2. The parameterized equation for the intersection                as in cataract surgery, where ultrasound phacoemulsification is used to
+point is:                                                                         break the lens into small fragments and then aspirate them [37].
+
+  +  =  0 + 1 + 2                                                                     As shown in Fig. 2.9, the ablation cutting simulation process with
+                                                                                  volume loss is depicted. When the surgical instrument's cutting path
+  1 =  1 -  0                                                             (6)     passes through the soft tissue, the state of particles within a certain
+                                                                                  range is altered. Initially, the particles outside the isosurface are di-
+                                                                                  rectly deleted and no longer participate in force calculations or surface
+ 2 =  2 -  0                                                                      generation. The particles initially within the isosurface are designated
+                                                                                  as ``ablated particles'', and the edges connecting these particles are
+                                                                                  marked as ``ablated edges''. At this point, the particles are deleted,
+                                                                                  cutting points are generated along the ``ablated edges'', and finally, all
+  The parameter  represents the ray parameter, and  and  are                      voxel grids are updated and the surface is redrawn.
+
+the barycentric coordinates that must satisfy the following conditions:           2.2. Soft tissue modeling
+
+  0,   0, and  +   1. The parameters are solved using Cramer's                        Soft tissue modeling accurately describes the physical properties of
+                                                                                  the tissue, ensuring that the physical response of the cut tissue part
+rule to solve the system of linear equations:                                     is consistent with the uncutted part. The modeling needs to consider
+                                                                                  not only geometric deformations but also the internal mechanical be-
+                                                                                  haviors, such as tension, compression, and bending. During the cutting
+                                                                                  process, the model helps calculate the forces exerted by the cutting
+                                                                                  surgical instrument on the soft tissue and how the tissue recovers or
+                                                                                  changes under the applied force.
+  [           -1   -2    ]     = 
+                                                                                      In this paper, structural springs and bending springs based on hexa-
+                                                                          (7)     hedral structured grids are applied to the computation of soft tissue. As
+                           
+
+                         
+
+
+  =  0 - 
+
+
+
+                                 |       -1    -2     |  
+                                 |                    |
+
+                      1          |                    |
+                   -1
+   =                           |               -2  |     
+                         -2   |     |              |     
+              |                     |
+              |               |     |              |
+       
+              |               |          -1        |                      (8)
+                                                   |     
+                              |
+
+   (2 ×  )1((2 × )1)                |              |
+
+=  -(2 × ) ((2 × )1) 
+
+       ( ×  )1((2 × )1)          
+                                 
+
+2.1.4. Ablation cutting process
+    In surgery, besides traditional blade cutting, electrocautery and ul-
+
+trasound technologies are also widely used [36]. Electrocautery cutting
+
+                                                                               5
+L. Li et al.                                                                                             Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+                                                     Fig. 2.9. Ablation cutting process.
+
+                                                     Fig. 2.10. Local elastic structure.
+
+shown in Fig. 2.6, a two-dimensional schematic illustrates the deforma-             The force experienced by particles  and  can be obtained by
+tion of the soft tissue grid. To ensure proper coupling between surface         converting the bending moment as follows:
+rendering and internal force calculation during soft tissue cutting, and
+to avoid scenarios where the soft tissue appears visually severed while               M     (    ( - 0) +             )
+forces are still acting on the separated ends, the physical model grid                
+is used for surface rendering.s shown in Fig. 2.10, the Kelvin­Voigt                     =                                 × (  ×   ) ×  
+model is adopted to simulate the viscoelasticity of soft tissue. Structural
+springs are used to model the stretching and compression of the soft                                                                                                  (14)
+tissue, while bending springs simulate resistance to bending and shear.
+The traditional diagonal shear springs in hexahedral grid methods are                 M     (    ( - 0) +             )
+omitted in this approach.                                                             
+                                                                                         =                                 × (  ×  ) ×  
+    For particle i, its motion equation is:
+                                                                                
+
+                                                                                where          =      -     is  the  unit  vector  from  particle    to  particle  .  The
+
+                                                                                                     -   
+                                                                                                         
+
+                                                                                force on particle  under the influence of the bending moment can be
+
+                                                                                expressed as:
+
+  +  int =  ext                                               (9)                   =  -(         +      )                                                            (15)
+                                                                                                       
+
+    The internal force  int consists of two components: the elastic force           The total force exerted on particle  by the bending springs can be
+generated by linear stretching or compression  , and the bending force          expressed as:
+induced by changes in the angle between adjacent springs  :
+
+                                                                                       14
+
+ int  =         +                                             (10)                  =                                                                                 (16)
+                                                                                               
+
+    For any given particle, there can be up to six neighboring par-                    =0
+
+ticles, six structural spring connections, and fifteen pairs of bending             In soft tissue simulation, time integration methods are used to
+
+constraints. The force relationship between the central particle and any        numerically solve the ordinary differential equations that describe the
+
+of its surrounding particles is given by:                                       dynamic behavior of soft tissues. Choosing an appropriate time integra-
+
+                                   -                                            tion method is crucial for the stability and accuracy of the simulation
+  
+      =  -             -                 -   ( -  )           (11)              results. Compared to implicit integration and small-step explicit inte-
+                            
+
+                                  -    
+                                       
+                                                                                gration, this paper adopts the adaptive step-size Runge­Kutta method,
+                                       
+
+where  and  represent the stiffness coefficient and damping coeffi-             which can simultaneously meet the requirements for both solution
+
+cient of the structural spring, respectively. The total force exerted by        accuracy and efficiency. With CUDA acceleration, this algorithm can be
+
+the structural springs on particle  is:                                         used to validate the cutting and force feedback algorithms presented in
+
+         5                                                                      this paper. Given the current time step , the position of the particle is
+                                                                                , and the state vector of the particle is  = [ ] , the following
+                                                              (12)              can be obtained:
+                
+    =
+
+         =0
+
+    For particle  and any two surrounding particles  and  forming the
+
+th bending constraint, the bending moment it experiences is:                                  [         ext +  int ]
+                                                                                 (, ) =                     
+ =   ( - 0)                                                                                                                                                           (17)
+
+                                                              (13)
+
+                                                                             6
+L. Li et al.                                                                                                                        Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+    For the time step , the 7 slopes at  =  +  can be calculated as
+follows in the Runge­Kutta method:
+
+ 1 =  (, )
+
+             (                          (         ))
+              
+  2    =        +     1  ,      +          1  1
+                      5                    5
+
+             (        3                  (    3         9      ))
+                      10                      40        40   2
+  3    =        +         ,      +                1  +
+
+             (        4                 (  44           56         32     ))
+                      5                    45           15         9
+  4    =        +        ,      +              1  -         2  +       3
+
+             (        8                 (  19372            25360         64448          212      ))
+                      9                    6561             2187          6561           729
+  5    =        +        ,      +                 1     -          2   +         3  -         4
+
+             (                       (  9017            355        46732            49           5103      ))
+                                        3168            33         5247             176          18656
+  6    =        + ,           +                1  -          2  +         3     +        4    -         5
+
+
+
+             (                       (  35             500         125           2187         11    ))
+                                        384            1113        192           6784         84  6
+  7    =        + ,           +               1   +          3  +       4    -         5  +
+
+
+
+
+                                                                                                           (18)     Fig. 2.11. Haptic model.(a)The proxy tool remains on the external surface,
+                                                                                                                    resulting in a positional and angular deviation from the actual tool. (b)The
+    The fourth-order solution and the fifth-order solution are respec-                                              distance between the tool and the surface is iteratively calculated using the
+tively:                                                                                                             SDF of triangular faces. (c)The tool does not collide with the mesh. (d)The
+                                                                                                                    tool collides with the mesh.
+
+  (4)     =     +   5179     1   +  7571      3   +  393    4  -   92097   5     +  187   6   +   1   7
+    +1              57600           16695            640           339200           2100          40
+
+  (5)     =     +   35     1  +  500    3     +   125  4    -  2187  5    +  11  6                                  the position of the proxy surgical instrument as P, and the orientation
+    +1              384          1113             192          6784          84                                     quaternions as  and , respectively. The position deviation P, the
+                                                                                                                    rotation axis k, and the rotation angle  can then be determined.
+
+
+                                                                                                           (19)
+
+  The error can be obtained as:                                                                                     P = PB - PA                (22)
+
+  =  (5+)1   -  (4+)1                                                                                      (20)
+                         
+                                                                                                                    q = q  q-1 = (q, q, q, q)
+                                                                                                                                               (23)
+
+  The new time step size n can be obtained based on the error as:
+
+  = 10-3                                                                                                             = 2 arccos(q)             (24)
+
+  n    =       0.9    (  )15                                                                               (21)
+
+                                                                                                                                 q
+                                                                                                                                 q
+ 0.2 < n < 5                                                                                                        k=  1        q       0     (25)
+                                                                                                                                    ,
+                                                                                                                                    
+where  is the error threshold. The step size adjustment can theoreti-                                                   sin(2)      
+
+                                                                                                                           
+
+cally generate any value, but unrestricted step size changes may lead to
+
+numerical issues or inefficiencies. Therefore, upper and lower bounds
+
+need to be set.                                                                                                         As shown in Fig. 2.11 (b), the distance from the surgical instrument
+                                                                                                                    to each nearby triangle face is computed in parallel to determine the
+2.3. Haptic rendering                                                                                               closest distance between the soft tissue and the surgical instrument.
+                                                                                                                    Both the surgical instrument and the triangular faces in space are con-
+    In order to provide realistic haptic feedback in virtual surgery,                                               vex shapes. When using the alternating projection method to compute
+allowing users to clearly perceive the shape, stiffness, and other prop-                                            the nearest point, each projection mapping is a non-expansive mapping.
+erties of the model's surface, appropriate force feedback calculation                                               As a result, after each projection, the computed shortest distance is
+methods need to be established for both the surgical instrument and                                                 always less than or equal to that of the previous iteration.
+the organ model. Traditional force feedback methods mainly focus
+on physical modeling of the soft tissue itself, with the force often                                                 = (Triangle, )            (26)
+concentrated at the tip of the surgical instrument. This results in no                                              
+force feedback when other parts of the surgical instrument collide,                                                 +1 = (Tool, )
+and even causes penetration issues [38,39]. A key problem in virtual
+surgery is how to establish collision constraints between the entire                                                 =  - 
+surgical instrument and the soft tissue [22,40].
+                                                                                                                    +1 = +1 - 
+    This paper proposes an improvement based on the Finger-Proxy                                                    
+algorithm, simplifying the complex collision detection process between                                              +1  
+surgical instruments. As shown in Figs. 2.11 (b), (c), and (d), the                                                 
+surgical instrument is first approximated as a slender capsule, with its
+volume represented by a directed distance field. Unlike [22], the force                                             where  denotes a point on the triangle,  denotes a point on the
+feedback in this paper is no longer based on particle-surgical instrument                                           tool, (Triangle, ) represents the mapping of  to its nearest point
+collisions, but rather on collisions between the triangular faces of the                                            on the triangle, and (Tool, ) represents the mapping of  to its
+soft tissue model and the soft tissue itself.                                                                       nearest point on the tool.
+
+    As shown in Fig. 2.11 (a), the Physical surgical instrument controls                                            As shown in Algorithm 1, an iterative optimization approach is used
+the position and orientation of the proxy surgical instrument. The proxy
+surgical instrument is displayed on the rendering interface, while the                                              to obtain the closest distance and the nearest points of the two models.
+Physical surgical instrument is hidden. By calculating their position
+and orientation deviations in real-time, the proxy surgical instrument                                              First, an arbitrary point   is selected on the surgical instrument as
+gradually approaches the Physical surgical instrument in discrete steps.                                            the starting point. Using the directed distance field function of the
+Let the position of the Physical surgical instrument be denoted as P,
+                                                                                                                    triangular face, the nearest point  and the direction are determined.
+                                                                                                                    Then, using the directed distance field of the surgical instrument, the
+
+                                                                                                                    nearest point on the surgical instrument is found, and the position
+
+                                                                                                                    of  is updated. When the magnitude of the two directed distances
+
+                                                                                                                    is smaller than the error threshold, stop the iteration. If penetration
+
+                                                                                                                    occurs, and the closest distance is smaller than the surgical instrument
+
+                                                                                                                    radius, the minimum separation direction is determined, and the proxy
+
+                                                                                                                 7
+L. Li et al.                                                                                                Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+Algorithm 1 Get the new position of Proxy tool after collision                to connect Unity3D with the force feedback device, providing the
+                                                                              ability to integrate 3D haptics into Unity and add haptic effects to the
+1: Input: Triangles, Proxy Tool                                               virtual world. The force feedback device converts the operator's control
+                                                                              commands into mechanical motion data, which is input into the server
+2: Output: Proxy Tool Position ()                                             to precisely control the movement of the surgical instrument in the
+3:   1 × 10-3                                                                 virtual surgery environment. The server calculates and analyzes the
+                                                                              input data, simulates the interaction between the surgical instrument
+4:   0.1                                                                      and the soft tissue model, and then transmits the resulting geometric
+                                                                              data and surgical instrument movement information to the display.
+5: Initialize Minimum Separation Vector ms to a large value                   Simultaneously, the server also transmits the force feedback from the
+6: while True do                                                              model to the haptic feedback device, allowing the user to experience
+                                                                              this feedback through the device's handle.
+7: for each triangle in Triangles do
+                                                                              3.2. Virtual simulation computing framework
+8:            Select the starting point 0 on the tool
+                                                                                  As shown in Fig. 3.1, the overall computational framework of this
+9:              0                                                             paper consists of two computational stages: the preprocessing stage
+                                                                              and the real-time simulation stage, each sub-thread's output to other
+10:           while  < 100 do                                                 threads is highlighted with yellow boxes. In the preprocessing stage,
+                                                                              the first step is to generate the background grid, based on which an
+11:           0  SDF(triangle, 0)                                             outer surface is created by calculating the intersection points between
+                                                                              the grid and the isosurface. The state information of the voxel corner
+12:           1  SDF(tool, 0)                                                 points is then labeled. Afterward, the feature points within each voxel
+                                                                              grid are computed using the GPU, and for each edge intersecting with
+13:                      -        -  +1  -                                    the isosurface, feature points of the surrounding four voxels are con-
+                                                                              nected to form two triangular faces, ultimately generating a continuous
+                                                                              surface. In the real-time update stage, simulation calculations for the
+14:           if || <  then                                                   soft tissue are performed across three CPU threads. In the soft tissue
+                                                                              modeling thread, the forces, positions, and orientations of particles are
+15:                     -                                                     calculated, and the results are used to update the eight corner points
+                                                                              of the background voxel grid in the geometry reconstruction thread.
+16:                  if  < ms then                                            In the geometry reconstruction thread, the cutting operation is per-
+                                                                              formed. On one hand, this affects the calculation of subsequent feature
+17:                   ms                                                      points and surface generation, and on the other hand, it changes the
+                                                                              connectivity between soft tissue particles while updating their forces
+18:                   break                                                   and orientations. After the surface is reconstructed, the triangular face
+                                                                              information is used in the force feedback thread for collision detection
+19:                  end if                                                   between the surgical instrument and the soft tissue. In this thread,
+                                                                              the proxy surgical instrument's position is updated in real-time to pre-
+20:           end if                                                          vent penetration, and the position and orientation deviations between
+                                                                              the proxy surgical instrument and the actual surgical instrument are
+21:              + 1                                                          calculated to compute the forces. Once the force feedback results are
+                                                                              obtained, a reaction force threshold is set and applied to update the
+22:           end while                                                       particle positions, ensuring smooth collision forces without penetration.
+                                                                              The data communication rules between threads are that the same data
+23: end for                                                                   should not be written to by two threads simultaneously on the CPU.
+                                                                              If linear operations need to be performed on the data, atomic addition
+24:    +   ms                                                                 operations must be used in the GPU, and excessive atomic operations on
+                                                                              the same thread are prohibited, otherwise, parallel computation would
+25: if ms <  then                                                             degrade to serial computation.
+
+26:           break                                                               Our method is presented as a fully parallelized solution, featuring
+                                                                              a multithreaded design framework that effectively avoids data races. It
+27: end if                                                                    integrates soft tissue geometric modeling, physical modeling, and force
+                                                                              feedback computation modules. The coupling between multiple threads
+28: end while                                                                 in our approach does not affect the execution and output of individual
+                                                                              threads. Even when the three threads run independently, users can
+29: Return the                                                                ignore any visual or haptic discomfort caused by thread delays at a
+                                                                              certain frame rate.
+surgical instrument is moved outward, ensuring that the proxy surgical
+                                                                                  As shown in Fig. 3.2, the soft tissue calculation framework in this
+instrument always stays on the surface of the soft tissue. At this point,     paper includes three sub-threads for data computation and one Unity
+                                                                              visual rendering main thread. In the soft tissue simulation, the number
+the force feedback value is calculated based on the position and pose         of particles has the greatest impact on performance. The particles and
+                                                                              their surrounding links are the most frequently used data in the GPU
+deviation of the two surgical instruments, and the reaction force is          sub-threads. For different particle counts, the relationship between the
+                                                                              frame rates of inter-thread operations is as follows:
+applied to the particles of the nearby triangle faces, as shown in Fig.
+
+2.11 (a).
+
+    The force feedback calculation for the surgical instrument is as
+follows:
+
+{
+
+    =    -                                                      (27)
+
+    =      -   
+
+     The force feedback applied to the surgical instrument consists of
+
+two components: a restoring term proportional to the position error
+
+and a damping term proportional to the velocity. The damping term
+
+only takes effect during contact to counteract oscillations. Where  is
+
+the linear force,  is the position stiffness coefficient,  is the linear
+velocity damping coefficient,  is the instrument's linear velocity,  is
+
+the torque,  is the orientation stiffness coefficient,  is the angular
+velocity damping coefficient, and  is the angular velocity vector.
+
+3. Results
+
+3.1. Experimental platform
+
+    In the virtual surgery platform presented in this paper, the server
+is configured with an NVIDIA RTX A2000 GPU and a 12th Gen
+Intel® CoreTM i7-12700H processor. The software surgical instruments
+used include the Unity3D 2021.3 development engine, CUDA 12.5,
+Visual Studio 2022, and Matlab 2021. For the hardware part, the Omni
+haptic feedback device acts as both the force feedback device and the
+virtual surgical instrument manipulator. All computational processes in
+this paper are based on C++ and CUDA, with the rendering interface
+implemented using Unity3D and C#. The OpenHaptics plugin is used
+
+                                                                           8
+L. Li et al.  Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+                       Fig. 3.1. Computing framework.
+
+              Fig. 3.2. The frame rates of different threads.
+                                                9
+L. Li et al.                                                                    Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+              Fig. 3.3. Cutting results of the model using different Methods. (a) Tetrahedral Method. (b) Our Method. (c) MC Method.
+
+              Fig. 3.4. Volume loss rate during soft tissue cutting.            Fig. 3.5. Average frame rate drop during soft tissue cutting.
+
+3.3. Comparison                                                                 frame. Every 50 frames, we calculate the average frame rate over the
+                                                                                preceding 50 frames and compare it to the frame rate before cutting to
+    This paper experimentally verifies the advantages of the proposed           determine the average frame rate loss.
+cutting algorithm by comparing it with the traditional Marching Cubes
+(MC) cutting algorithm and the tetrahedral cutting algorithm. Com-                  The figure clearly demonstrates that, compared to the tetrahedral
+pared to the MC method, the proposed approach ensures minimal                   cutting method, the proposed method maintains a relatively stable
+volume loss during cutting while retaining the ablation effect of the           frame rate during cutting, with a slower rate of decline. In the tetra-
+MC algorithm. This allows the simulation to maintain small incision             hedral cutting method, tetrahedral voxels are subdivided to generate
+gaps when using a blade while also adapting to surgical procedures              smaller voxels, helping to ensure volume stability during blade cutting.
+involving ablation effects, such as electrocautery or ultrasonic emul-          However, as more voxels are generated during the cutting process,
+sification. Compared to traditional tetrahedral cutting, the proposed           mechanical relationships must be re-established, and the impact of
+method avoids dynamically adding new particles or voxels and elim-              elongated triangles on mechanical simulations needs to be considered.
+inates concerns about the impact of distorted triangular faces or tetra-        This increases computational complexity, affecting the efficiency of soft
+hedra on mechanical simulation. As a result, it prevents the increase in        tissue cutting. In contrast, the proposed method does not introduce
+computation time caused by the growing number of cutting surfaces.              new particles but only increases the number of voxels that need to be
+                                                                                rendered, optimizing the speed of frame rate decline and bringing its
+    As shown in Figs. 3.3 and 3.4, under zero-gravity conditions, the           performance loss rate closer to that of the MC algorithm.
+volume loss rate of soft tissue gradually increases as cutting progresses;
+if this trend continues, the tissue volume will eventually approach zero            When handling mesh splitting, compared with the classical ap-
+after multiple cuts. This paper compares the volume loss rates during           proach of soft tissue modeling using complete hexahedral meshes com-
+cutting among the MC cutting method, the tetrahedral cutting method,            bined with the dual-contouring method, our approach directly com-
+and the proposed method. Since the tetrahedral method cuts along                putes the positions of feature points using the coordinate frames of
+the mesh edges, volume loss mainly arises from slight smoothing of              six-degree-of-freedom particles, thereby avoiding the need to update
+vertices, resulting in relatively less volume loss. However, both the           the full mesh vertex list. Since each particle's update is influenced
+MC method and the proposed DC method use an approximate solution                by surrounding particles, updating the coordinate frame of each par-
+based on vertex averaging when processing internal vertices, causing            ticle introduces additional computation; however, this operation can
+more noticeable volume loss at the edges. Compared to the MC method,            be efficiently parallelized, with each thread performing at most six
+the proposed method maintains a relatively lower loss rate on internal          atomic additions per particle. Timing comparisons of the mesh update
+cut surfaces, demonstrating the ability to handle progressive cutting           process indicate that our method achieves a clear advantage in mesh
+and preserving a certain degree of realism during small-scale cuts.             reconstruction speed, as shown in Table 1.
+
+    As shown in Fig. 3.5, a comparison of frame rates during the                    As shown in Fig. 3.6, in traditional soft tissue simulations, the in-
+cutting process between the proposed method and other methods is                teraction between the surgical tool and soft tissue is typically modeled
+presented. During continuous cutting, we estimate the approximate               using the Finger-Proxy algorithm within the Chai3D framework for
+frames processed per second by measuring the execution time of each             force feedback, or by directly applying force to individual particles or
+                                                                                groups of particles. However, this method does not ensure that parts of
+
+                                                                            10
+L. Li et al.                                                                                      Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+              Table 1
+
+              Mesh reconstruction time for different particle counts.
+
+              Time (ms)  Particle Count                                12626        18617  24609  29842  35075  44688  54301
+              Method                              9580 11103
+                                                                        6.27         9.17  12.07  13.91  15.75  19.84  23.92
+                         Hexahedral+DC  5.13 5.70                       1.12         1.52   1.91   2.21   2.51   4.08   5.66
+                                Ours    0.87 1.00
+
+Fig. 3.6. Comparison of two force feedback models. Left: the classic point-to-          The results show that the proposed method performs excellently in
+surface(Finger-Proxy) collision model. Right: the improved volume-to-surface        soft tissue cutting and collision interactions. As shown in Fig. 3.8, the
+collision model.                                                                    cutting results under zero gravity conditions. The algorithm proposed
+                                                                                    in this paper supports cutting with varying widths. By changing the
+                 Fig. 3.7. Force growth during the collision process.               thickness  of the surgical instrument, two cutting points are generated
+                                                                                    on the cutting edge and bound to the particles at both ends. The figure
+the surgical tool other than the tip have a collision volume, which can             illustrates the process of gradually increasing the cutting width from
+result in model penetration, as illustrated in the left image. When an ap-          zero. It can be seen from the figure that as the blade width increases,
+proximate tool presses against particles, if the applied pressure exceeds           the cutting gap gradually widens. Fig. 3.9 shows the cutting results
+a certain threshold, the model may experience excessive deformation,                when a point of the soft tissue is fixed and it naturally falls under the
+or the tool may penetrate the tissue. To address this issue, the proposed           influence of gravity. During the cutting operation, the soft tissue below
+method uses a signed distance field to approximate the representation               the cut gradually opens due to gravity. From the dashed line in the
+of the surgical tool. By combining this with the force rendering concept            figure, it can be seen that the tissue in the upper half moves upward by
+of the Finger-Proxy model, it ensures that the surgical tool remains                a certain distance before and after the cut, successfully disconnecting
+outside the soft tissue, thereby preventing the penetration problem, as             the physical connection between the upper and lower halves, thereby
+shown in the right image. As shown in Fig. 3.7, the force feedback                  reducing the overall gravity of the soft tissue. After the particle position
+curve after smoothing during the collision process is presented. When               changes, the cutting point can adjust its world coordinates according
+the tool presses down from top to bottom, the force along the z-axis                to the position and orientation of the corresponding particle. In the
+gradually increases at the initial moment. After approximately 2 s, the             fourth part of the figure, it can be observed that even when the particles
+tool collides at other positions, and at this point, the forces along the x         undergo significant displacement and the soft tissue posture changes
+and y axes also begin to gradually increase.                                        noticeably, the mesh still displays correctly.
+
+3.4. Interaction simulation                                                             Fig. 3.10 shows the cut surfaces of soft tissue after multiple cuts,
+                                                                                    including cross cuts, multiple planar cuts, and curved cuts. After cutting
+    To further validate the practical effectiveness of our algorithm in             and deformation under applied forces, the method is able to maintain
+applications, simulation experiments on soft tissue interactions un-                the integrity of the cut surfaces and the continuity of the textures,
+der different conditions were conducted. These experiments mainly                   ensuring visual realism. It supports various cutting conditions and can
+included soft tissue cutting, tearing, and collision effects.                       adapt to surgical scenarios requiring multiple cuts. Fig. 3.11 illustrates
+                                                                                    the results of the collision between soft tissue and surgical instruments.
+    In our model, the voxel partitioning is based on the AABB bounding              By computing the minimum distance between the surgical instrument
+box, a total of 54,301 particles were used for soft tissue surface ren-             and the soft tissue using the proposed method, the position of the
+dering and dynamic modeling, the voxel size was set to 0.25 cm. The                 surgical instrument can be updated in real time. An elastic connection is
+stiffness coefficient  was set to 7.5 × 104 N/m, the bending coefficient            established between the proxy surgical instrument and the physical sur-
+ to 2 × 104 N/m, with damping coefficients  = 0.92 and  = 0.9. The                  gical instrument to ensure that the instrument remains on the surface
+time step was set to 0.02 s.                                                        of the soft tissue while exerting forces on both the tissue and the user.
+                                                                                    As shown in the figure, even under large deformations, the surgical
+                                                                                    tool and the soft tissue can maintain the correct relative geometric
+                                                                                    relationship.
+
+                                                                                        Fig. 3.12 illustrates the process of dragging the soft tissue after
+                                                                                    cutting, with cutting continuing during the dragging operation. As
+                                                                                    shown in the figure, the cutting surface fitted by the proposed method
+                                                                                    accurately follows the direction of the applied force, making it suitable
+                                                                                    for simulating scenarios in surgical environments where incisions are
+                                                                                    further cut after being stretched.
+
+                                                                                        Fig. 3.13 present the cutting results of different soft tissues and the
+                                                                                    results of ablation cutting. This method can be applied to liver cutting,
+                                                                                    vascular or intestinal cutting, as well as surgical simulations such
+                                                                                    as phacoemulsification and lens fragmentation in cataract treatment.
+                                                                                    The proposed approach demonstrates good adaptability to surfaces of
+                                                                                    varying complexity.
+
+                                                                                    4. Discussion
+
+                                                                                        In soft tissue modeling and simulation, surface mesh processing
+                                                                                    methods typically include MC, DC, and the tetrahedral method [21­
+                                                                                    23,26]. These methods are designed to utilize mesh nodes for surface
+                                                                                    rendering and dynamic simulation. The MC and DC methods gener-
+                                                                                    ally employ structured meshes for mechanical simulation, whereas the
+                                                                                    tetrahedral method directly uses the vertices of triangular meshes as
+                                                                                    nodes for dynamic simulation. To address the volume loss and frame
+
+                                                                                11
+L. Li et al.                                                                  Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+              Fig. 3.8. The result of changing the cutting width under zero gravity.
+
+              Fig. 3.9. The cutting result under the influence of gravity with a fixed point.
+
+              Fig. 3.10. Soft tissue after multiple cuts.                     to finish. Otherwise, rendering artifacts such as flickering or blackened
+                                                                              surfaces may occur. Future work will focus on designing algorithms that
+                                                                              fully exploit GPU hardware resources. Beyond model processing, we
+                                                                              also consider force haptic rendering in human­computer interaction.
+                                                                              When handling collisions between tools and soft tissue, we refer to the
+                                                                              methods proposed by Zhang, Berndt, et al. [22,40], which approximate
+                                                                              the shape of surgical instruments using bounding boxes. Combining
+                                                                              the Finger-Proxy algorithm [38] and signed distance fields, we ensure
+                                                                              that surgical tools remain on the outer surface of the soft tissue. This
+                                                                              prevents penetration even when excessive speed or force is applied
+                                                                              during operation.
+
+rate degradation caused by an increasing number of cutting planes in          5. Conclusion
+soft tissue cutting simulation, this paper proposes a novel parallelized
+DC strategy that adapts to dynamic and fractured mesh rendering.                  This paper proposes a virtual simulation algorithm applicable to
+We preprocess all possible cutting cases of hexahedral voxel grids and        both blade cutting and blunt surgical instrument cutting, providing
+encapsulate them into a lookup table. The corresponding lookup indices        a novel solution for force feedback between soft tissue and surgical
+are stored in binary form, allowing for quick retrieval of mesh connec-       instruments. To meet real-time requirements, the algorithm's com-
+tivity when computing feature points. This enables the determination          ponents are parallelized using the CUDA framework for accelerated
+of the number of feature points within each voxel and the contribution        computation, and the complexity of the geometric modeling algorithm
+value of each edge to these feature points, as illustrated in Fig. 3.2.       is optimized. Cutting simulation experiments under various working
+Our method maintains real-time performance even when simulating ap-           conditions were conducted to validate the effectiveness of both blade
+proximately 50,000 particles. Instead of duplicating or subdividing the       cutting and blunt surgical instrument ablation cutting.
+mesh, our approach processes the cut mesh directly, preventing addi-
+tional computational overhead in dynamic simulation. As shown in Fig.             This study still has certain limitations. For example, the integration
+3.4, during continuous cutting, the decrease in frame rate is relatively      of physical modeling and geometric modeling within adaptive mesh-
+slow. In contrast, when using the tetrahedral subdivision algorithm           ing has not yet been achieved, there is still significant volume loss,
+for cutting, the frame rate declines more rapidly. Our cutting method         and unlimited cutting is not yet supported, which poses challenges
+balances low-volume loss cutting and real-time performance. However,          for simulating thin-walled heterogeneous soft tissues. Compared with
+our approach does not yet consider how to handle fractured meshes             traditional mesh cutting methods, due to feature point drift, our ap-
+after adaptive mesh cutting. When using mechanical simulation meshes          proach may cause a sudden separation of the two sides of the cutting
+for 3D reconstruction, even if mechanical modeling and geometric mod-         surface over a large distance, rather than a smooth split, under large
+eling run on separate threads, the computational load of the mechanical       deformations. To address this issue, we interpolate the positions of post-
+simulation thread must be considered. Therefore, the number of par-           cut feature points from the previous frame to the current frame, thereby
+ticles is limited. On GPU computing, our method extensively utilizes          achieving visually smooth transitions. However, this strategy does not
+atomic operations. Specifically, when multiple springs exert forces on        fully adhere to physical principles and requires further refinement.
+the same particle, force accumulation requires atomic operations. The
+next computational step must wait until all GPU threads complete this             In future work, we will continue to explore techniques in virtual
+force accumulation. Additionally, mesh smoothing also relies on atomic        surgery simulation, with particular focus on biomechanical modeling
+operations. Since multiple triangular faces share the same vertex, and        algorithms, aiming to improve the mechanical performance and in-
+each triangle contributes to the normal vector calculation in different       teractive experience of virtual soft tissues. The video related to the
+GPU threads, the final normal computation must wait for all threads           work presented in this paper can be found at the following link: https:
+                                                                              //youtu.be/eK_QKEXwyag.
+
+                                                                          12
+L. Li et al.                                                                                         Computer Methods and Programs in Biomedicine 273 (2026) 109123
+              Fig. 3.11. Collision and grasping of soft tissues in different regions.
+
+              Fig. 3.12. Soft tissue being pulled while being cut.
+
+              Table 2                                                Description
+              Explanation of key terms in Fig. 2.2.
+                                                                     A volumetric grid used for 3D reconstruction.
+                Term                                                 An edge that intersects with the isosurface.
+                                                                     A point in the volumetric data where the level set function equals zero,
+                Voxel grid                                           typically representing an implicitly defined surface.
+                Intersecting edge                                    The point where an edge intersects with the isosurface or the cutting plane.
+                Level Set                                            A point located inside the isosurface.
+                                                                     A point located outside the isosurface.
+                Intersecting Point                                   The initial feature point obtained by averaging intersecting points.
+                Internal Corner Point                                A refined point after iterative update from the initial average point.
+                External Corner Point                                The surface normal at the intersecting point.
+                Initial Average Point                                The update direction of the feature point.
+                Feature Point
+                Normal
+                Direction
+
+              Table 3                                                Description
+              Explanation of key terms in Fig. 2.3.
+                                                                     An edge that intersects with the cutting plane.
+                Term                                                 The trajectory of the cutting path.
+                                                                     The point where an edge intersects with the isosurface or the cutting plane.
+                Cutting edge                                         A feature point located on the outer surface.
+                Cutting line                                         A feature point located on the inner surface.
+                Intersecting point
+                External feature point
+                Internal feature point
+
+                                                                              Methodology, Funding acquisition. Xueyu Zhou: Software, Investiga-
+                                                                              tion.
+
+              Fig. 3.13. Cutting results of different soft tissues.           Ethics statement
+
+                                                                                  The author certify that this manuscript is original and has not been
+                                                                              published and will not be submitted elsewhere for publication while
+                                                                              being considered by Computer Methods and Programs in Biomedicine.
+                                                                              And the study is not split up into several parts to increase the quantity
+                                                                              of submissions and submitted to various journals or to one journal
+                                                                              over time. No data have been fabricated or manipulated (including
+                                                                              images) to support your conclusions. No data, text, or theories by
+                                                                              others are presented as if they were our own. The submission has
+                                                                              been received explicitly from all co-authors. And authors whose names
+                                                                              appear on the submission have contributed sufficiently to the scientific
+                                                                              work and therefore share collective responsibility and accountability
+                                                                              for the results.
+
+CRediT authorship contribution statement                                      Declaration of competing interest
+
+    Liang Li: Writing ­ original draft, Methodology, Investigation, Data          The authors declare that they do not have any commercial or
+curation, Conceptualization. Lai Zhou: Writing ­ review & editing,            associative interest that represents a conflict of interest in connection
+                                                                              with the work submitted.
+
+                                                                          13
+L. Li et al.                                                                                                                   Computer Methods and Programs in Biomedicine 273 (2026) 109123
+
+Acknowledgments                                                                                  [18] X. Zhang, Z. Wang, W. Sun, S. Jha, et al., Heterogeneous soft tissue deformation
+                                                                                                         model based on cellular neural networks: Application in pulmonary hamartomas
+    This work was supported by the 2022 Shanghai Rising Star Program                                     surgery, Biomed. Signal Process. Control. 95 (2024) 106290, http://dx.doi.org/
+(including Sailing Program) [grant numbers No. 22YF1417400].                                             10.1016/j.bspc.2024.106290.
+
+Appendix. Nomenclature tables                                                                    [19] J. Li, T. Liu, L. Kavan, B. Chen, Interactive cutting and tearing in projective
+                                                                                                         dynamics with progressive cholesky updates, ACM Trans. Graph. 40 (6) (2021)
+    See Tables 2 and 3                                                                                   1­12, http://dx.doi.org/10.1145/3478513.3480505.
+
+References                                                                                       [20] W. Hongyu, Y. Haonan, Y. Fan, S. Jian, G. Yuan, T. Ke, H. Aimin, Interactive
+                                                                                                         hepatic parenchymal transection simulation with haptic feedback, Virtual Real.
+  [1] A.R. See, J.A.G. Choco, K. Chandramohan, Touch, texture and haptic feedback:                       Intell. Hardw. 3 (5) (2021) 383­396, http://dx.doi.org/10.1016/j.vrih.2021.09.
+         a review on how we feel the world around us, Appl. Sci. 12 (9) (2022) 4686,                     003.
+         http://dx.doi.org/10.3390/app12094686.
+                                                                                                 [21] G. Jeábková, S. Barbier, F. Faure, J. Allard, Volumetric modeling and interactive
+  [2] K. McCloskey, R. Turlip, H.S. Ahmad, Y.G. Ghenbot, D. Chauhan, J.W. Yoon,                          cutting of deformable bodies, Prog. Biophys. Mol. Biol. 103 (2­3) (2010)
+         Virtual and augmented reality in spine surgery: a systematic review, World                      217­224, http://dx.doi.org/10.1016/j.pbiomolbio.2010.09.012.
+         Neurosurg. 173 (2023) 96­107, http://dx.doi.org/10.1016/j.wneu.2023.02.068.
+                                                                                                 [22] I. Berndt, R. Torchelsen, A. Maciel, Efficient surgical cutting with position-based
+  [3] D. Zuo, M. Zhu, D. Chen, Q. Xue, S. Avril, K. Hackl, Y. He, Three-dimensional                      dynamics, IEEE Comput. Graph. Appl. 37 (3) (2017) 24­31, http://dx.doi.org/
+         anisotropic unified continuum model for simulating the healing of damaged                       10.1109/MCG.2017.45.
+         soft biological tissues, Biomech. Model. Mechanobiol. 23 (6) (2024) 2193­2212,
+         http://dx.doi.org/10.1007/s10237-024-01888-6.                                           [23] P. Yu, Z. Zhao, R. Wang, J. Pan, Real-time soft body dissection simulation with
+                                                                                                         parallelized graph-based shape matching on gpu, Comput. Methods Programs
+  [4] P. Madhikar, J. Åström, M. Karttunen, Cellsim3d: Gpu accelerated software for                      Biomed. 250 (2024) 108171, http://dx.doi.org/10.1016/j.cmpb.2024.108171.
+         simulations of cellular growth and division in three dimensions, Comput. Phys.
+         Comm. 232 (2018) 206­213, http://dx.doi.org/10.1016/j.cpc.2018.05.024.                  [24] J. Wu, C. Dick, R. Westermann, Interactive high-resolution boundary surfaces for
+                                                                                                         deformable bodies with changing topology, Vriphys 11 (2011) 29­38.
+  [5] A. Ballit, T.-T. Dao, Hypermsm: A new msm variant for efficient simulation
+         of dynamic soft-tissue deformations, Comput. Methods Programs Biomed. 216               [25] J. Wu, R. Westermann, C. Dick, Real-time haptic cutting of high-resolution soft
+         (2022) 106659, http://dx.doi.org/10.1016/j.cmpb.2022.106659.                                    tissues, 2014, pp. 469­475.
+
+  [6] H. Xie, J. Song, B. Gao, Y. Zhong, C. Gu, K.-S. Choi, Finite-element Kalman filter         [26] S. Chen, R. Yang, L. Ma, M. Xu, Y. Zhou, Hybrid optimization-based cutting
+         with state constraint for dynamic soft tissue modelling, Comput. Biol. Med. 135                 simulation for soft objects, Comput.-Aided Des. 163 (2023) 103561, http://dx.
+         (2021) 104594, http://dx.doi.org/10.1016/j.compbiomed.2021.104594.                              doi.org/10.1016/j.cad.2023.103561.
+
+  [7] M. Macklin, M. Müller, N. Chentanez, Xpbd: position-based simulation of com-               [27] W. Shi, P.X. Liu, M. Zheng, Cutting procedures with improved visual effects and
+         pliant constrained dynamics, in: Proceedings of the 9th International Conference                haptic interaction for surgical simulation systems, Comput. Methods Programs
+         on Motion in Games, 2016, pp. 49­54, http://dx.doi.org/10.1145/2994258.                         Biomed. 184 (2020) 105270.
+         2994272.
+                                                                                                 [28] W. Shi, P.X. Liu, M. Zheng, A new volumetric geometric model for cutting
+  [8] S.F. Johnsen, Z.A. Taylor, M.J. Clarkson, J. Hipwell, M. Modat, B. Eiben, L.                       procedures in surgical simulation, Comput. Methods Programs Biomed. 178
+         Han, Y. Hu, T. Mertzanidou, D.J. Hawkes, et al., Niftysim: A gpu-based nonlinear                (2019) 77­84.
+         finite element package for simulation of soft tissue biomechanics, Int. J. Comput.
+         Assist. Radiol. Surg. 10 (2015) 1077­1095, http://dx.doi.org/10.1007/s11548-            [29] Y. Tang, S. Liu, Y. Deng, Y. Zhang, L. Yin, W. Zheng, An improved method
+         014-1118-5.                                                                                     for soft tissue modeling, Biomed. Signal Process. Control. 65 (2021) 102367,
+                                                                                                         http://dx.doi.org/10.1016/j.bspc.2020.102367.
+  [9] S. Hang, Tetgen, a delaunay-based quality tetrahedral mesh generator, ACM
+         Trans. Math. Software 41 (2) (2015) 11, http://dx.doi.org/10.1145/2629697.              [30] X. Zhang, W. Zhang, W. Sun, A. Song, A new soft tissue deformation model based
+                                                                                                         on Runge-Kutta: application in lung, Comput. Biol. Med. 148 (2022) 105811,
+[10] M. Cardoso, B. Feijóo, A.P. Castro, F. Ribeiro, P.R. Fernandes, Axisymmetric finite                 http://dx.doi.org/10.1016/j.compbiomed.2022.105811.
+         element modelling of the human lens complex under cataract surgery, Symmetry
+         13 (4) (2021) 696, http://dx.doi.org/10.3390/sym13040696.                               [31] L.A. Schmitz, Analysis and acceleration of high quality isosurface contouring,
+                                                                                                         2009, http://hdl.handle.net/10183/151064.
+[11] D. Marinkovi, M. Zehn, Corotational finite element formulation for virtual-
+         reality based surgery simulators, Phys. Mesomech. 21 (2018) 15­23, http://dx.           [32] C.R. Koger, S.S. Hassan, J. Yuan, Y. Ding, Virtual reality for interactive medical
+         doi.org/10.1134/S1029959918010034.                                                              analysis, Front. Virtual Real. 3 (2022) 782854, http://dx.doi.org/10.3389/frvir.
+                                                                                                         2022.782854.
+[12] H.P. Bui, S. Tomar, S.P. Bordas, Corotational cut finite element method for real-
+         time surgical simulation: Application to needle insertion simulation, Comput.           [33] J. Zhang, J. Qian, H. Zhang, L. He, B. Li, J. Qin, H. Dai, W. Tang, W. Tian,
+         Methods Appl. Mech. Engrg. 345 (2019) 183­211, http://dx.doi.org/10.1016/j.                     Maxillofacial surgical simulation system with haptic feedback, J. Ind. Manag.
+         cma.2018.10.023.                                                                                Optim. 17 (6) (2021) http://dx.doi.org/10.3934/jimo.2020137.
+
+[13] H. Xie, J. Song, Y. Zhong, C. Gu, K.-S. Choi, Constrained finite element method             [34] T. Mller, B. Trumbore, Fast, Minimum Storage Ray-Triangle Intersection, ACM,
+         for runtime modeling of soft tissue deformation, Appl. Math. Model. 109 (2022)                  2005, http://dx.doi.org/10.1145/1198555.1198746.
+         599­612, http://dx.doi.org/10.1016/j.apm.2022.05.020.
+                                                                                                 [35] V. Shumskiy, Gpu ray tracing­comparative study on ray-triangle intersection
+[14] W. Xu, Y. Wang, W. Huang, Y. Duan, An efficient nonlinear mass­spring model                         algorithms, 2013, pp. 78­91, http://dx.doi.org/10.1007/978-3-642-39759-2_6.
+         for anatomical virtual reality, IEEE Trans. Instrum. Meas. 71 (2022) 1­10,
+         http://dx.doi.org/10.1109/TIM.2022.3164132.                                             [36] S. Samal, R. Ramchandani, D. Mohanty, Comparison of intraoperative and
+                                                                                                         postoperative outcomes with skin flaps raised using either harmonic scalpels
+[15] Y. Duan, W. Huang, H. Chang, W. Chen, J. Zhou, S.K. Teo, Y. Su, C.K. Chui,                          or electrocautery during modified radical mastectomy, Cureus 16 (6) (2024)
+         S. Chang, Volume preserved mass­spring model with novel constraints for soft                    http://dx.doi.org/10.7759/cureus.62320.
+         tissue deformation, IEEE J. Biomed. Heal. Inform. 20 (1) (2014) 268­280,
+         http://dx.doi.org/10.1109/JBHI.2014.2370059.                                            [37] S.C. Ugurbas, S. Caliskan, A. Alpay, S.H. Ugurbas, Impact of intelligent
+                                                                                                         phacoemulsification software on torsional phacoemulsification surgery, Clin.
+[16] H. Va, M.-H. Choi, M. Hong, Real-time surface-based volume constraints on                           Ophthalmol. (2012) 1493­1498, http://dx.doi.org/10.2147/OPTH.S35283.
+         mass­spring model in unity3d, IEEE Access 11 (2023) 17857­17869, http://dx.
+         doi.org/10.1109/ACCESS.2023.3245130.                                                    [38] Y. Liu, B. Liu, A review of virtual surgical object modeling technology based
+                                                                                                         on force feedback, Int. J. Adv. Netw. Monit. Control. 7 (2) (2022) 24­31,
+[17] J. Zhang, Y. Zhong, C. Gu, Soft tissue deformation modelling through neural                         http://dx.doi.org/10.2478/ijanmc-2022-0013.
+         dynamics-based reaction­diffusion mechanics, Med. Biol. Eng. Comput. 56 (2018)
+         2163­2176, http://dx.doi.org/10.1007/s11517-018-1849-5.                                 [39] Y. Liu, B. Liu, A review of virtual surgical object modeling technology based
+                                                                                                         on force feedback, in: Monitoring and Control (ANMC) Cooperate, vol. 24, Xi'an
+                                                                                                         Technological University (CHINA) West Virginia University (USA) Huddersfield
+                                                                                                         University of UK (UK), 2022, http://dx.doi.org/10.2478/ijanmc-2022-0013.
+
+                                                                                                 [40] X. Zhang, J. Duan, W. Sun, T. Xu, S.K. Jha, A three-stage cutting simulation
+                                                                                                         system based on mass­spring model, Comput. Model. Eng. Sci. 127 (1) (2021)
+                                                                                                         117­133, http://dx.doi.org/10.32604/cmes.2021.012034.
+
+                                                                                             14
+

@@ -1,0 +1,45 @@
+# Unity generated and local caches
+**/[Ll]ibrary/
+**/[Tt]emp/
+**/[Oo]bj/
+**/[Bb]uild/
+**/[Bb]uilds/
+**/[Ll]ogs/
+**/[Uu]ser[Ss]ettings/
+**/[Mm]emoryCaptures/
+**/[Rr]ecordings/
+
+# IDE and generated project files
+**/.vs/
+**/.vscode/
+**/.idea/
+**/.dotnet/
+**/.dotnet_home/
+**/*.csproj
+**/*.sln
+**/*.slnx
+**/*.user
+**/*.userprefs
+**/*.unityproj
+**/*.booproj
+**/*.pidb
+**/*.suo
+**/*.pdb
+**/*.mdb
+**/*.opendb
+**/*.VC.db
+
+# Native build output and local test artifacts
+**/cuda_plugin/build-*/
+**/cuda_plugin/tests/__pycache__/
+**/*.log
+**/*.tmp
+**/*.stackdump
+**/.DS_Store
+
+# Local Git history backups from the previous nested repositories
+**/.git-local-history/
+
+# Authentication command output
+gh-auth-output.txt
+gh-auth-error.txt

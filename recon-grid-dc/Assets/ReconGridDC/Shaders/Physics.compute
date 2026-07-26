@@ -1,0 +1,506 @@
+// Physics.compute — GPU mass-spring solver kernels for Stage 1B-i.
+// Implements structural force (Eq11 + DEVIATION D2), bending force (Eq13-16),
+// and adaptive Dormand-Prince RK45 (Eq18/19, DEVIATION D3, DEVIATION D4).
+// SM5.0 target — no float InterlockedAdd; fixed-point int atomics throughout.
+
+#pragma kernel ClearForces
+#pragma kernel AccumulateStructural
+#pragma kernel AccumulateBending
+#pragma kernel SeedTrialFromState
+#pragma kernel BuildTrialState
+#pragma kernel ComputeSlope
+#pragma kernel IntegrateY5
+#pragma kernel ComputeError
+
+// ── Stage 2D-2 (paper §2.1.2, Berndt [22] rotated axes): per-particle rotation frame ──────────
+#pragma kernel ComputeParticleRot
+
+#include "PhysicsCommon.hlsl"
+
+// ── Shared uniforms ───────────────────────────────────────────────────────────────────────────────
+int   _CornerCount;
+int   _BendPairCount;
+float _Ks;   // structural spring stiffness  (7.5e4)
+float _Cs;   // structural spring damping    (0.92)
+float _Kb;   // bending stiffness            (2e4)
+float _Cb;   // bending damping              (0.9)
+int   _Stage; // current RK stage index (0-6) for BuildTrialState / ComputeSlope
+float _H;    // current substep size h
+
+// ── Buffers ───────────────────────────────────────────────────────────────────────────────────────
+// Force / topology
+RWStructuredBuffer<int>       _ForceInt;      // int[3*cornerCount] fixed-point accumulator
+StructuredBuffer<int>         _NbrIdx;        // int[6*cornerCount]; -1 = no neighbor
+StructuredBuffer<float3>      _RestNbr;       // float3[6*cornerCount]; rest offset to each neighbor
+StructuredBuffer<BendPairGpu> _BendPairs;     // BendPairGpu[bendPairCount]
+
+// Trial state (read-only views for force kernels — C# Bind() points both names at same buffers)
+StructuredBuffer<float3>      _YTrialPos;
+StructuredBuffer<float3>      _YTrialVel;
+
+// Trial state (RW views for RK stage kernels)
+RWStructuredBuffer<float3>    _YTrialPosRW;
+RWStructuredBuffer<float3>    _YTrialVelRW;
+
+// Committed y_n state (updated by IntegrateY5)
+RWStructuredBuffer<float3>    _CornerPos;
+RWStructuredBuffer<float3>    _Vel;
+
+// Per-particle properties
+StructuredBuffer<float>       _Mass;
+StructuredBuffer<int>         _Pinned;
+// Stage 2D-1b (paper §2.1.4, paper:485-499): 1=active tissue corner, 0=inactive (outside-isosurface)
+// corner. Outside corners are "directly deleted" per the paper → treated EXACTLY like pinned: zero
+// slope, frozen pos+vel, and excluded from the RK45 error norm. Bound by MassSpringSolver.Bind.
+StructuredBuffer<int>         _Active;
+StructuredBuffer<float3>      _ExtForce;
+
+// RK45 slope scratch: stride-24 struct {float3 dx; float3 dv}[7*cornerCount].
+// Indexing: _KSlope[stage * _CornerCount + p].
+struct Slope { float3 dx; float3 dv; };
+RWStructuredBuffer<Slope>     _KSlope;
+
+// Error reduction (fixed-point InterlockedMax over a uint scalar)
+RWStructuredBuffer<uint>      _ErrMax;
+
+// ── Stage 2D-2 (paper §2.1.2 / Berndt [22]): per-particle rotated coordinate frame ──────────────
+// RotGpu = the 3 ROWS of a 3x3 rotation R (9 explicit floats, 36 bytes). C# twin: ReconBuffers.RotGpu
+// (explicit r0x..r2z, NOT 3 float3 — avoids vector-alignment ambiguity). float3x3 R = float3x3(r0,r1,r2)
+// rotates v via mul(R,v) (row-major); transpose(R)=R^-1. ComputeParticleRot is the SOLE writer; the cut
+// kernels (Cutting.compute) read it as StructuredBuffer (cross-shader, single-writer = race-free).
+struct RotGpu { float3 r0, r1, r2; };       // 36 bytes (rows of R)
+RWStructuredBuffer<RotGpu> _ParticleRot;    // RotGpu[cornerCount]; written by ComputeParticleRot
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Task 3 — ClearForces
+// Zero the fixed-point force accumulator (ForceInt) for all particles.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+[numthreads(64, 1, 1)]
+void ClearForces(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= (uint)_CornerCount) return;
+    _ForceInt[3 * p + 0] = 0;
+    _ForceInt[3 * p + 1] = 0;
+    _ForceInt[3 * p + 2] = 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Task 3 — AccumulateStructural (Eq11 + DEVIATION D2, per-particle gather)
+// Each thread handles one particle p and sums forces from ALL its neighbors.
+// DEVIATION D2: rest length L0 IS subtracted from the displacement: F = -Ks*(|d|-L0)*dir - Cs*(vi-vj)
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+[numthreads(64, 1, 1)]
+void AccumulateStructural(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= (uint)_CornerCount) return;
+
+    float3 xi = _YTrialPos[p];
+    float3 vi = _YTrialVel[p];
+    float3 F  = float3(0, 0, 0);
+
+    [loop]
+    for (int s = 0; s < 6; s++)
+    {
+        int n = _NbrIdx[6 * p + s];
+        if (n < 0) continue;
+        // Stage 2D-1b (paper §2.1.4, paper:485-499): skip the spring across an active↔inactive edge.
+        // The structural force is gather-based over _NbrIdx (NOT the CPU springs[] list, which the
+        // force kernels never read — see ReconBuffers.Springs doc), so the CPU-side spring gating is
+        // mirrored HERE: a frozen inactive neighbor at rest would otherwise anchor this active corner
+        // to the empty lattice (recreating the cage). Inactive p is itself frozen in ComputeSlope, so
+        // it does not matter what force inactive corners gather — gating the neighbor side suffices.
+        if (_Active[n] == 0) continue;
+
+        float L0 = length(_RestNbr[6 * p + s]);
+        float3 d   = xi - _YTrialPos[n];
+        float  len = length(d);
+        if (len < 1e-8) continue;
+
+        float3 dir = d / len;
+
+        // DEVIATION D2: subtract rest length L0; paper's Eq11 omitted it
+        float3 fs = -_Ks * (len - L0) * dir - _Cs * (vi - _YTrialVel[n]);
+        F += fs;
+    }
+
+    // Per-particle gather: add result atomically so bending kernel can also write
+    AtomicAddForce(_ForceInt, (int)p, F);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Task 4 — AccumulateBending (Eq13-16)
+// Each thread handles one bending pair (i = center, j and k = arms).
+// theta_dot is computed analytically from trial velocities.  // PAPER-SILENT
+// Singularity guard: if sin²(theta) <= EPS_SIN2, skip entire pair.  // PAPER-SILENT
+// Cross-product orderings: F_ij uses (Nik × Nij); F_ik uses (Nij × Nik).
+// Center receives -(F_ij + F_ik) for momentum conservation.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+[numthreads(64, 1, 1)]
+void AccumulateBending(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)_BendPairCount) return;
+
+    BendPairGpu bp = _BendPairs[n];
+    if (bp.alive == 0) return;
+
+    float3 xi = _YTrialPos[bp.i];
+    float3 xj = _YTrialPos[bp.j];
+    float3 xk = _YTrialPos[bp.k];
+    float3 vi = _YTrialVel[bp.i];
+    float3 vj = _YTrialVel[bp.j];
+    float3 vk = _YTrialVel[bp.k];
+
+    float3 Nij = normalize(xi - xj);   // unit vector from j toward center i
+    float3 Nik = normalize(xi - xk);   // unit vector from k toward center i
+
+    float c  = clamp(dot(Nij, Nik), -1.0, 1.0);
+    float s2 = 1.0 - c * c;
+
+    // PAPER-SILENT: singularity guard — EPS_SIN2 is the only threshold; no separate d-floor
+    if (s2 <= EPS_SIN2) return;
+
+    float d     = sqrt(s2);
+    float theta = acos(c);
+
+    // PAPER-SILENT: theta_dot = -cdot / sqrt(1 - c^2), cdot from UnitDeriv on trial velocities
+    float3 dNij   = UnitDeriv(xi, xj, vi, vj);
+    float3 dNik   = UnitDeriv(xi, xk, vi, vk);
+    float  cdot   = dot(dNij, Nik) + dot(Nij, dNik);
+    float  theta_dot = -cdot / d;  // PAPER-SILENT
+
+    // Eq14 scalar (Cb damps via theta_dot inside the scalar, matches C29)
+    float scal = _Kb * (theta - bp.theta0) + _Cb * theta_dot;
+
+    // Eq13: bending forces — cross-product orderings differ between F_ij and F_ik
+    float3 F_ij = scal * cross(cross(Nik, Nij), Nij);  // Nik × Nij then × Nij
+    float3 F_ik = scal * cross(cross(Nij, Nik), Nik);  // Nij × Nik then × Nik (reversed)
+
+    // Eq16: center gets -(F_ij + F_ik) to conserve momentum
+    AtomicAddForce(_ForceInt, bp.j, F_ij);
+    AtomicAddForce(_ForceInt, bp.k, F_ik);
+    AtomicAddForce(_ForceInt, bp.i, -(F_ij + F_ik));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Task 5 — RK45 kernels
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+// SeedTrialFromState: copy committed y_n to trial buffers (stage 0 uses y_n directly)
+[numthreads(64, 1, 1)]
+void SeedTrialFromState(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= (uint)_CornerCount) return;
+    _YTrialPosRW[p] = _CornerPos[p];
+    _YTrialVelRW[p] = _Vel[p];
+}
+
+// BuildTrialState: yTrial = y_n + H * sum_j(DOPRI_A[stage][j] * k_j)
+// Called for stages 1-6 (not stage 0 which seeds from y_n via SeedTrialFromState).
+[numthreads(64, 1, 1)]
+void BuildTrialState(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= (uint)_CornerCount) return;
+
+    float3 dx = float3(0, 0, 0);
+    float3 dv = float3(0, 0, 0);
+
+    [unroll]
+    for (int j = 0; j < 6; j++)
+    {
+        float a = DOPRI_A[_Stage][j];
+        if (a != 0.0)
+        {
+            // KSlope indexing: stage * cornerCount + particle
+            Slope k = _KSlope[j * _CornerCount + (int)p];
+            dx += a * k.dx;
+            dv += a * k.dv;
+        }
+    }
+
+    _YTrialPosRW[p] = _CornerPos[p] + _H * dx;
+    _YTrialVelRW[p] = _Vel[p]       + _H * dv;
+}
+
+// ComputeSlope: k[stage] = f(t, yTrial) = [yTrialVel, (ExtForce + ForceInt) / m]
+// DEVIATION D3 (corrected): acceleration = (F_ext + F_int)/m. _ForceInt holds the ACTUAL restoring
+// force (Eq11/Eq14; Eq11's leading minus already makes it restoring), so Newton gives +F_int.
+// Pinned particles: slope is zero (no motion regardless of forces).
+[numthreads(64, 1, 1)]
+void ComputeSlope(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= (uint)_CornerCount) return;
+
+    Slope k;
+    // Stage 2D-1b (paper §2.1.4): inactive (outside-isosurface) corners are frozen EXACTLY like pinned.
+    if (_Pinned[p] != 0 || _Active[p] == 0)
+    {
+        // Pinned or inactive: no motion
+        k.dx = float3(0, 0, 0);
+        k.dv = float3(0, 0, 0);
+    }
+    else
+    {
+        k.dx = _YTrialVelRW[p];  // dx/dt = v (from trial state)
+        // DEVIATION D3 (corrected): a = (F_ext + F_int)/m. _ForceInt = actual restoring force on the
+        // particle (Eq11/Eq14). Eq9's (F_ext - F_int) treats F_int as -actual; using minus with Eq11's
+        // actual force makes springs anti-restoring -> divergence (oscillator drifts out, gravity explodes).
+        float3 Fint = ReadForce(_ForceInt, (int)p);
+        k.dv = (_ExtForce[p] + Fint) / _Mass[p];
+    }
+
+    // KSlope indexing: stage * cornerCount + particle
+    _KSlope[_Stage * _CornerCount + (int)p] = k;
+}
+
+// IntegrateY5: advance committed state by y5 = y_n + H * sum_i(DOPRI_B5[i] * k_i)
+// Pinned particles: keep position unchanged and zero velocity.
+// PAPER-SILENT (always-accept): we always apply y5; step size is adjusted for next substep.
+[numthreads(64, 1, 1)]
+void IntegrateY5(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= (uint)_CornerCount) return;
+
+    // Stage 2D-1b (paper §2.1.4): inactive (outside-isosurface) corners are frozen EXACTLY like pinned.
+    if (_Pinned[p] != 0 || _Active[p] == 0)
+    {
+        // Pinned or inactive: keep position unchanged; zero velocity to prevent drift
+        _Vel[p] = float3(0, 0, 0);
+        return;
+    }
+
+    float3 dx = float3(0, 0, 0);
+    float3 dv = float3(0, 0, 0);
+
+    [unroll]
+    for (int i = 0; i < 7; i++)
+    {
+        float b = DOPRI_B5[i];
+        if (b != 0.0)
+        {
+            Slope k = _KSlope[i * _CornerCount + (int)p];
+            dx += b * k.dx;
+            dv += b * k.dv;
+        }
+    }
+
+    _CornerPos[p] += _H * dx;
+    _Vel[p]       += _H * dv;
+}
+
+// ComputeError: per-particle max-norm of H * sum_i((B5-B4)_i * k_i)
+// Accumulates via InterlockedMax on ErrMax[0] (fixed-point uint, scale ERR_SCALE).
+// Pinned particles are skipped.
+[numthreads(64, 1, 1)]
+void ComputeError(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= (uint)_CornerCount) return;
+    // Stage 2D-1b (paper §2.1.4): skip pinned AND inactive corners — frozen corners must not inflate
+    // the cross-substep RK45 error norm (they have zero slope, so their error contribution is spurious).
+    if (_Pinned[p] != 0 || _Active[p] == 0) return;
+
+    float3 edx = float3(0, 0, 0);
+    float3 edv = float3(0, 0, 0);
+
+    [unroll]
+    for (int i = 0; i < 7; i++)
+    {
+        float db = DOPRI_B5[i] - DOPRI_B4[i];
+        if (db != 0.0)
+        {
+            Slope k = _KSlope[i * _CornerCount + (int)p];
+            edx += db * k.dx;
+            edv += db * k.dv;
+        }
+    }
+
+    // Max-norm over all 6 state components (position + velocity error)
+    float e = _H * max(
+        max(max(abs(edx.x), abs(edx.y)), abs(edx.z)),
+        max(max(abs(edv.x), abs(edv.y)), abs(edv.z))
+    );
+
+    // Fixed-point reduction: InterlockedMax on uint (ERR_SCALE = 1e6)
+    InterlockedMax(_ErrMax[0], (uint)(e * ERR_SCALE));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// Stage 2D-2 — ComputeParticleRot (paper §2.1.2 / Berndt [22] rotated axes)
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// Per-particle rotation R = polar(F), F = the local deformation gradient built from the corner's
+// INTACT incident edges (severed slots NbrIdx<0 EXCLUDED so a freed other-half cannot corrupt the
+// frame). The cut-surface points (Cutting.compute EmitCutPoint/AccumulateCutFP) record/reconstruct
+// their owner-frame offset through this R so the cut walls follow tissue ROTATION (not just
+// translation). With R=identity the cut FP is byte-identical to the pre-2D-2 translation path.
+//
+// M5 PAPER DEVIATIONS (declared):
+//  1. INFERENCE: R=polar(F) realizes Berndt [22]; §2.1.2 (clean:361) delegates the axis update to [22]
+//     without stating polar/F. The six-edge deformation gradient is the right input class (clean:363-364).
+//  2. DEVIATION (paper-silent): F EXCLUDES severed edges (NbrIdx<0) so a freed component cannot corrupt
+//     the frame; §2.1.2 maps axes to "the six surrounding edges" but is silent on cut-edge exclusion.
+//  3. PAPER-SILENT: the identity fallback (guards below) reduces the cut point to the translation-only
+//     offset = the §3.9-validated regime (clean:1164-1166); degrades gracefully.
+//
+// Net-new HLSL: there was ZERO float3x3/determinant/inverse code in any shader; the small helpers are
+// written inline here (transpose is the HLSL builtin).
+
+// det3x3: explicit 3x3 determinant of the row-major matrix (rows a,b,c).
+float Det3x3(float3x3 m)
+{
+    // m[0]=row0, m[1]=row1, m[2]=row2 (HLSL indexes float3x3 by ROW).
+    return m[0].x * (m[1].y * m[2].z - m[1].z * m[2].y)
+         - m[0].y * (m[1].x * m[2].z - m[1].z * m[2].x)
+         + m[0].z * (m[1].x * m[2].y - m[1].y * m[2].x);
+}
+
+// Inverse3x3 via the adjugate (cofactor-transpose) ÷ det. Caller guarantees det != 0 (det>eps gate).
+float3x3 Inverse3x3(float3x3 m)
+{
+    float det = Det3x3(m);
+    float invDet = 1.0 / det;
+
+    // Cofactor matrix C (Cij = (-1)^(i+j) * minor_ij); inverse = transpose(C) / det = adjugate/det.
+    // Write the adjugate (= transpose(cofactors)) directly: adj[i][j] = cofactor[j][i].
+    float3x3 adj;
+    adj[0] = float3(
+        (m[1].y * m[2].z - m[1].z * m[2].y),    // adj00 = +cof00
+       -(m[0].y * m[2].z - m[0].z * m[2].y),    // adj01 = -cof10
+        (m[0].y * m[1].z - m[0].z * m[1].y));   // adj02 = +cof20
+    adj[1] = float3(
+       -(m[1].x * m[2].z - m[1].z * m[2].x),    // adj10 = -cof01
+        (m[0].x * m[2].z - m[0].z * m[2].x),    // adj11 = +cof11
+       -(m[0].x * m[1].z - m[0].z * m[1].x));   // adj12 = -cof21
+    adj[2] = float3(
+        (m[1].x * m[2].y - m[1].y * m[2].x),    // adj20 = +cof02
+       -(m[0].x * m[2].y - m[0].y * m[2].x),    // adj21 = -cof12
+        (m[0].x * m[1].y - m[0].y * m[1].x));   // adj22 = +cof22
+    return adj * invDet;
+}
+
+// IdentityRot: write R = I into the per-particle slot (the universal fallback frame).
+void WriteIdentityRot(uint c)
+{
+    RotGpu rg;
+    rg.r0 = float3(1, 0, 0);
+    rg.r1 = float3(0, 1, 0);
+    rg.r2 = float3(0, 0, 1);
+    _ParticleRot[c] = rg;
+}
+
+[numthreads(64, 1, 1)]
+void ComputeParticleRot(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= (uint)_CornerCount) return;
+
+    // Pinned or inactive corners: no meaningful frame → identity (frozen anchors / empty space).
+    if (_Pinned[c] != 0 || _Active[c] == 0)
+    {
+        WriteIdentityRot(c);
+        return;
+    }
+
+    // ── Build F = (Σ_s d_s ⊗ r_s) · M^-1 over INTACT incident edges (NbrIdx>=0, neighbor active) ──
+    // r_s = rest edge to neighbor s; d_s = deformed edge. M = Σ r_s⊗r_s is DIAGONAL for the axis-
+    // aligned rest lattice (restNbr = ±L·axis), so M^-1 = diag(1/mx,1/my,1/mz). Fsum accumulates the
+    // outer products: Fsum[i][j] += d_s[i]*r_s[j] (row i scaled by d_s[i], column = r_s).
+    float3 Fr0 = float3(0, 0, 0);   // Fsum row 0
+    float3 Fr1 = float3(0, 0, 0);   // Fsum row 1
+    float3 Fr2 = float3(0, 0, 0);   // Fsum row 2
+    float mx = 0.0, my = 0.0, mz = 0.0;   // diagonal of M = Σ r_s⊗r_s
+
+    float3 cPos = _CornerPos[c];
+
+    [loop]
+    for (int s = 0; s < 6; s++)
+    {
+        int nbr = _NbrIdx[6 * (int)c + s];
+        if (nbr < 0) continue;              // severed/boundary slot → excluded (M5 deviation 2)
+        if (_Active[nbr] == 0) continue;    // inactive neighbor → excluded (frozen empty-space corner)
+
+        float3 r_s = _RestNbr[6 * (int)c + s];       // rest edge to neighbor
+        float3 d_s = _CornerPos[nbr] - cPos;          // deformed edge
+
+        // outer(d_s, r_s): Fsum[i][j] += d_s[i] * r_s[j]
+        Fr0 += d_s.x * r_s;
+        Fr1 += d_s.y * r_s;
+        Fr2 += d_s.z * r_s;
+
+        // M diagonal (axis-aligned lattice ⇒ off-diagonals vanish; only the squared components matter)
+        mx += r_s.x * r_s.x;
+        my += r_s.y * r_s.y;
+        mz += r_s.z * r_s.z;
+    }
+
+    // M3 PER-AXIS GATE: a corner with no intact edge on some axis gives a ZERO diagonal → 1/0 → NaN
+    // poisons F/R and every cut point on it. Strictly stronger than an "edge count" test. axisEps ~1e-8.
+    const float axisEps = 1e-8;
+    if (min(mx, min(my, mz)) < axisEps)
+    {
+        WriteIdentityRot(c);
+        return;
+    }
+
+    // F = Fsum · M^-1 — scale COLUMN j by 1/m_j (column j = the j-th component of every row).
+    float3 invM = float3(1.0 / mx, 1.0 / my, 1.0 / mz);
+    float3x3 F;
+    F[0] = Fr0 * invM;
+    F[1] = Fr1 * invM;
+    F[2] = Fr2 * invM;
+
+    // M2 REFLECTION/DEGENERACY GATE: the Higham polar iteration PRESERVES sign(det F); for det F<=0 it
+    // converges to a det=-1 REFLECTION (mirrors the wall, worse than identity), and |det F|~0 is singular.
+    // Gate d <= detEps (covers BOTH) → identity. detEps ~1e-9.
+    const float detEps = 1e-9;
+    float dF = Det3x3(F);
+    if (dF <= detEps)
+    {
+        WriteIdentityRot(c);
+        return;
+    }
+
+    // M4 DEADBAND: keep genuinely-TRANSLATING tissue at R≡I so the verified translation demo is provably
+    // unperturbed (live ComputeParticleRot would otherwise re-introduce ~1e-3 sub-voxel jitter from
+    // gravity-sag/bounce on points the centroid fix just made static). ‖F-I‖_Frobenius < deadband ~1e-3.
+    float3x3 FmI;
+    FmI[0] = F[0] - float3(1, 0, 0);
+    FmI[1] = F[1] - float3(0, 1, 0);
+    FmI[2] = F[2] - float3(0, 0, 1);
+    float fro2 = dot(FmI[0], FmI[0]) + dot(FmI[1], FmI[1]) + dot(FmI[2], FmI[2]);
+    const float deadband = 1e-3;
+    if (fro2 < deadband * deadband)
+    {
+        WriteIdentityRot(c);
+        return;
+    }
+
+    // R = polar(F): Higham iteration R_{k+1} = 0.5*(R_k + R_k^{-T}), R_0 = F, ~6 iters. Orthonormal,
+    // det=+1 (the det>eps gate keeps every iterate non-singular). R_k^{-T} = transpose(inverse(R_k)).
+    float3x3 R = F;
+    [unroll]
+    for (int it = 0; it < 6; it++)
+    {
+        float3x3 Rinv  = Inverse3x3(R);
+        float3x3 RinvT = transpose(Rinv);
+        R[0] = 0.5 * (R[0] + RinvT[0]);
+        R[1] = 0.5 * (R[1] + RinvT[1]);
+        R[2] = 0.5 * (R[2] + RinvT[2]);
+    }
+
+    // Write R rows to the per-particle slot.
+    RotGpu rg;
+    rg.r0 = R[0];
+    rg.r1 = R[1];
+    rg.r2 = R[2];
+    _ParticleRot[c] = rg;
+}

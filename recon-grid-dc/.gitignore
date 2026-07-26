@@ -1,0 +1,38 @@
+# Unity generated / transient
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# IDE / VS
+.vs/
+.vscode/
+.idea/
+*.csproj
+*.sln
+*.user
+*.userprefs
+*.unityproj
+*.booproj
+*.pidb
+*.suo
+
+# OS / misc
+.DS_Store
+*.tmp
+*.stackdump
+
+# Crash reports
+sysinfo.txt
+crashlytics-build.properties
+
+# Transient review/diff dumps (scratch, not part of the project)
+*-review-package.txt
+
+# Asset meta files are intentionally TRACKED (do NOT ignore *.meta)
+cuda_plugin/tests/__pycache__/

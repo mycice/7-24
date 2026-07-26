@@ -1,0 +1,16 @@
+{
+  "name": "ReconGridDC",
+  "rootNamespace": "ReconGridDC",
+  "references": ["Unity.Mathematics", "Haply.Inverse"],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "autoReferenced": true,
+  "versionDefines": [
+    {
+      "name": "co.haply.inverse",
+      "expression": "",
+      "define": "HAPLY_INVERSE"
+    }
+  ]
+}

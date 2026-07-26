@@ -1,0 +1,10 @@
+{
+  "name": "ReconGridDC.Tests",
+  "rootNamespace": "ReconGridDC.Tests",
+  "references": ["ReconGridDC", "Unity.Mathematics"],
+  "includePlatforms": ["Editor"],
+  "precompiledReferences": ["nunit.framework.dll"],
+  "defineConstraints": ["UNITY_INCLUDE_TESTS"],
+  "overrideReferences": true,
+  "autoReferenced": false
+}
