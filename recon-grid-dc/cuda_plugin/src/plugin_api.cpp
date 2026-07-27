@@ -9,6 +9,7 @@
 #include "dc_recon.h"
 #include "physics.h"
 #include "cut.h"
+#include "organ_context.h"
 
 #define LCS_API extern "C" __declspec(dllexport)
 
@@ -140,6 +141,24 @@ LCS_API int LCS_GetCornerPos(float* out) { return recon_readback_corner_pos(out)
 // [DEBUG-CUT] (v4.1 P3): 16 per-frame debug counters + 2 raw atomic counters + runtime cutFPInterp.
 // Call after LCS_Finalize each frame (frame already synced); layout documented in cuda/cut.h.
 LCS_API int LCS_GetCutDebug(unsigned int* out18, float* alphaOut) { return cut_get_debug(out18, alphaOut); }
+
+// GPU-resident migration phase 1. These contexts are intentionally independent from the legacy
+// singleton reconstruction/cutting path until later phases elect a single runtime driver.
+LCS_API int LCS_OrganCreate(uint32_t* outHandle) { return organ_context_create(outHandle); }
+LCS_API int LCS_OrganDestroy(uint32_t handle) { return organ_context_destroy(handle); }
+LCS_API int LCS_OrganInitialize(uint32_t handle, const OrganContextInitDesc* desc,
+                                const float* restPositions3, const int* tetIds4,
+                                const float* inverseMass, const float* restVolumes,
+                                const int* tetActive, const int* surfaceTriangleIds3,
+                                const int* edgeConstraintIds2, const float* edgeRestLengths)
+{
+    return organ_context_initialize(handle, desc, restPositions3, tetIds4, inverseMass, restVolumes,
+                                    tetActive, surfaceTriangleIds3, edgeConstraintIds2, edgeRestLengths);
+}
+LCS_API int LCS_OrganGetStats(uint32_t handle, OrganContextStats* outStats)
+{
+    return organ_context_get_stats(handle, outStats);
+}
 
 // Free all device buffers.
 LCS_API void LCS_Shutdown()

@@ -16,6 +16,7 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(LiverCudaSim SHARED
     src/plugin_api.cpp      # exported C ABI (host C++)
+    cuda/organ_context.cu   # GPU-resident organ context ownership + diagnostics (migration phase 1)
     cuda/dc_recon.cu        # DC reconstruction kernels + host API (CUDA)
     cuda/physics.cu         # physics host API  - body swapped to XPBD (design rev-B 9-(4) GO-LIVE)
     cuda/cut.cu             # cutting: paper Eq6-8 M-T detect + sever + cut-FP chain (CUDA)

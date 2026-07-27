@@ -67,6 +67,8 @@ namespace ReconGridDC.Stage1TetPhysics
         {
             _loader = GetComponent<TetMeshLoader>();
             _visualizer = GetComponent<TetMeshVisualizer>();
+            if (GetComponent<CudaOrganContextBridge>() == null)
+                gameObject.AddComponent<CudaOrganContextBridge>();
             ConfigureLoader();
         }
 
