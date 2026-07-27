@@ -154,6 +154,12 @@ namespace ReconGridDC.Cuda
         [Header("Game-mode camera")]
         public bool setupOrbitCamera = true;
 
+        [Header("Performance HUD")]
+        [Tooltip("Shows smoothed FPS and frame time below the existing cut diagnostics in the Game view.")]
+        public bool showPerformanceHud = true;
+        [Tooltip("Time window used to smooth the FPS display. Lower values react faster; higher values are steadier.")]
+        [Range(0.1f, 2f)] public float fpsSmoothingSeconds = 0.5f;
+
         // ── native plugin P/Invoke ────────────────────────────────────────────────────────────
         const string DLL = "LiverCudaSim";
 
@@ -175,6 +181,7 @@ namespace ReconGridDC.Cuda
         [DllImport(DLL)] static extern int  LCS_ComputeRotations();
         [DllImport(DLL)] static extern int  LCS_SetCutRestMetric(float[] alignedRestPositions, float voxelSizeX, float voxelSizeY, float voxelSizeZ);
         [DllImport(DLL)] static extern void LCS_ClearCutRestMetric();
+        [DllImport(DLL)] static extern int  LCS_SetCutGravityStabilization(int enabled, float gravityX, float gravityY, float gravityZ, float gapWorld, float alignmentExponent);
         [DllImport(DLL)] static extern int  LCS_Finalize();
         [DllImport(DLL)] static extern int  LCS_GetSurfaceCounts(out int vertexCount, out int indexCount);
         [DllImport(DLL)] static extern int  LCS_GetSurface([Out] float[] outPos3, [Out] float[] outNrm3, [Out] int[] outIdx);
@@ -218,6 +225,7 @@ namespace ReconGridDC.Cuda
         bool      _externalUploadUnsupported;
         bool      _cutRestMetricActive;
         bool      _cutRestMetricUnsupported;
+        bool      _gravitySafeCutUnsupported;
 
         public bool IsInitialized => initialized && cutReady;
         public int GridCornerCount => _gridRestCorners != null ? _gridRestCorners.Length : 0;
@@ -279,6 +287,27 @@ namespace ReconGridDC.Cuda
             _cutRestMetricActive = false;
         }
 
+        public bool ConfigureGravitySafeCutSurface(bool enabled, Vector3 gravity, float gapWorld, float alignmentExponent)
+        {
+            if (!cutReady || _gravitySafeCutUnsupported)
+                return false;
+            try
+            {
+                int rc = LCS_SetCutGravityStabilization(enabled ? 1 : 0,
+                    gravity.x, gravity.y, gravity.z, Mathf.Max(0f, gapWorld),
+                    Mathf.Clamp(alignmentExponent, 0.5f, 4f));
+                if (rc == 0) return true;
+                Debug.LogError($"[Stage3Coupling] LCS_SetCutGravityStabilization failed (rc={rc}).", this);
+            }
+            catch (System.EntryPointNotFoundException)
+            {
+                _gravitySafeCutUnsupported = true;
+                Debug.LogError("[Stage3Coupling] The deployed LiverCudaSim.dll lacks the gravity-safe cut-surface API. " +
+                               "Close Unity and rebuild/deploy cuda_plugin.", this);
+            }
+            return false;
+        }
+
         /// <summary>
         /// Shows or hides only the CUDA/Dual-Contouring presentation. The CUDA simulation,
         /// cutter, and buffers remain initialized so Stage 3 can switch presentation modes
@@ -329,6 +358,9 @@ namespace ReconGridDC.Cuda
         float     diagInitMeanY = float.NaN;
         int       _diagFrame;
         string _hudCoverage = "";
+        float _smoothedFrameSeconds;
+        float _displayFps;
+        float _displayFrameMilliseconds;
 
         // [DEBUG-CUT] (v4.1 P3): read the 16 GPU counters EVERY frame (the device window is one
         // chain — 1 Hz sampling would discard 59/60 frames and miss exactly the transients being
@@ -452,6 +484,7 @@ namespace ReconGridDC.Cuda
 
         void Update()
         {
+            UpdatePerformanceHud();
             if (!initialized || !cutReady || mesh == null) return;
 
             // a. Either retain the original CUDA physics path or let Stage 3 provide the current
@@ -488,6 +521,24 @@ namespace ReconGridDC.Cuda
             PollCutDebug();
             if ((_diagFrame++ % 60) == 0) LogGravityMotion();
             if (Input.GetKeyDown(KeyCode.P)) DumpDiagnostics();
+        }
+
+        void UpdatePerformanceHud()
+        {
+            float frameSeconds = Time.unscaledDeltaTime;
+            if (frameSeconds <= 0f) return;
+
+            if (_smoothedFrameSeconds <= 0f)
+                _smoothedFrameSeconds = frameSeconds;
+            else
+            {
+                float window = Mathf.Max(0.1f, fpsSmoothingSeconds);
+                float blend = 1f - Mathf.Exp(-frameSeconds / window);
+                _smoothedFrameSeconds = Mathf.Lerp(_smoothedFrameSeconds, frameSeconds, blend);
+            }
+
+            _displayFps = 1f / Mathf.Max(0.000001f, _smoothedFrameSeconds);
+            _displayFrameMilliseconds = _smoothedFrameSeconds * 1000f;
         }
 
         // [DEBUG-CUT] per-frame poll + host aggregation + gated print (v4.1 P3). One line answers:
@@ -711,6 +762,8 @@ namespace ReconGridDC.Cuda
                 GUI.Label(new Rect(10, 10, 900, 22), _hudCoverage);
             if (_cutter != null && !string.IsNullOrEmpty(_cutter.LastSweepStatus))
                 GUI.Label(new Rect(10, 32, 900, 22), _cutter.LastSweepStatus);
+            if (showPerformanceHud && _displayFps > 0f)
+                GUI.Label(new Rect(10, 54, 300, 22), $"FPS: {_displayFps:F1}  |  Frame: {_displayFrameMilliseconds:F1} ms");
         }
 
         // Auto-size the rod to span the whole tissue cross-section so the swept ribbon can mark a complete

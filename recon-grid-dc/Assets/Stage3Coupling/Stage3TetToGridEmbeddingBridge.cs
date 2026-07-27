@@ -51,6 +51,14 @@ namespace ReconGridDC.Stage3Coupling
         [Tooltip("Makes CUDA cut-point reconstruction and cutting tolerances use the regular grid after it has been fitted to the tetrahedral organ. Choose this before entering Play; do not toggle after a cut has already been created.")]
         public bool adaptCudaCuttingMetric = true;
 
+        [Header("Gravity-Safe Cut Surface")]
+        [Tooltip("Adds a small render-only separation to CUDA cut feature points when the cut normal is aligned with gravity. This does not move tetrahedral physics vertices or change gripper collision and grasping.")]
+        public bool stabilizeCutSurfaceAgainstGravity = true;
+        [Tooltip("Minimum additional cut-surface gap as a fraction of the fitted CUDA voxel length. Horizontal cuts receive the full value; vertical cuts receive none.")]
+        [Range(0f, 0.5f)] public float gravitySafeGapInVoxels = 0.12f;
+        [Tooltip("Exponent applied to abs(dot(cutNormal, gravityDirection)). Values above 1 restrict stabilization more strongly to near-horizontal cut planes.")]
+        [Range(0.5f, 4f)] public float gravityAlignmentExponent = 1.5f;
+
         [Header("Readback")]
         [Tooltip("Stage 3 forces synchronous tetrahedron position readback while active. This makes the update order deterministic, but can reduce frame rate.")]
         public bool forceSynchronousTetReadback = true;
@@ -76,6 +84,8 @@ namespace ReconGridDC.Stage3Coupling
         [SerializeField] float conservativeCutStepLength;
         [SerializeField] float cutMetricScale = 1f;
         [SerializeField] string cutMetricStatus = "Waiting for embedding.";
+        [SerializeField] float gravitySafeGapWorld;
+        [SerializeField] string gravitySafeCutStatus = "Waiting for embedding.";
         [SerializeField] int lastUploadFrame = -1;
         [SerializeField] string lastStatus = "Waiting for Stage 1 tetra body and CUDA liver.";
 
@@ -138,6 +148,8 @@ namespace ReconGridDC.Stage3Coupling
         {
             insideTolerance = Mathf.Max(0f, insideTolerance);
             minimumMappingCoverageForLocalDeformation = Mathf.Clamp(minimumMappingCoverageForLocalDeformation, 0f, 100f);
+            gravitySafeGapInVoxels = Mathf.Clamp(gravitySafeGapInVoxels, 0f, 0.5f);
+            gravityAlignmentExponent = Mathf.Clamp(gravityAlignmentExponent, 0.5f, 4f);
             if (!Application.isPlaying)
             {
                 ApplyPresentation();
@@ -259,6 +271,7 @@ namespace ReconGridDC.Stage3Coupling
             {
                 cudaLiver.SetExternalGridDeformationActive(false);
                 cudaLiver.ClearStage3CutRestMetric();
+                cudaLiver.ConfigureGravitySafeCutSurface(false, Vector3.zero, 0f, gravityAlignmentExponent);
             }
         }
 
@@ -301,6 +314,7 @@ namespace ReconGridDC.Stage3Coupling
             {
                 cudaLiver.ClearStage3CutRestMetric();
                 cutMetricStatus = "Disabled; original CUDA cutting metric is active.";
+                ConfigureGravitySafeCutSurface();
                 return;
             }
 
@@ -317,6 +331,23 @@ namespace ReconGridDC.Stage3Coupling
             cutMetricStatus = configured
                 ? "Active: CUDA cutting uses anisotropic Stage 3 voxel extents and aligned rest edges."
                 : "Failed: original CUDA cutting metric remains active.";
+            ConfigureGravitySafeCutSurface();
+        }
+
+        void ConfigureGravitySafeCutSurface()
+        {
+            gravitySafeGapWorld = Mathf.Max(0f, gravitySafeGapInVoxels * effectiveCutVoxelLength);
+            Vector3 gravity = tetSoftBody != null && tetSoftBody.enableGravity
+                ? new Vector3(0f, tetSoftBody.gravityY, 0f)
+                : Vector3.zero;
+            bool active = stabilizeCutSurfaceAgainstGravity && gravity.sqrMagnitude > 1e-8f && gravitySafeGapWorld > 0f;
+            bool configured = cudaLiver != null && cudaLiver.ConfigureGravitySafeCutSurface(
+                active, gravity, gravitySafeGapWorld, gravityAlignmentExponent);
+            gravitySafeCutStatus = configured
+                ? (active
+                    ? "Active: render-only cut gap scales with cut-normal/gravity alignment."
+                    : "Inactive: gravity is disabled or stabilization is switched off.")
+                : "Failed: deployed CUDA plugin does not support gravity-safe cut surfaces.";
         }
 
         void ApplyPresentation()

@@ -419,6 +419,10 @@ MonoBehaviour:
   minimumMappingCoverageForLocalDeformation: 95
   organPresentation: 0
   showPhysicsProxy: 0
+  adaptCudaCuttingMetric: 1
+  stabilizeCutSurfaceAgainstGravity: 0
+  gravitySafeGapInVoxels: 0.12
+  gravityAlignmentExponent: 2.91
   forceSynchronousTetReadback: 1
   logDiagnostics: 1
   totalGridCorners: 0
@@ -433,6 +437,14 @@ MonoBehaviour:
   maxGridDisplacement: 0
   maxMappedLocalDisplacement: 0
   localTetDeformationApplied: 0
+  originalCutVoxelLength: 0
+  alignedRestEdgeLengths: {x: 0, y: 0, z: 0}
+  effectiveCutVoxelLength: 0
+  conservativeCutStepLength: 0
+  cutMetricScale: 1
+  cutMetricStatus: Waiting for embedding.
+  gravitySafeGapWorld: 0
+  gravitySafeCutStatus: Waiting for embedding.
   lastUploadFrame: -1
   lastStatus: Waiting for Stage 1 tetra body and CUDA liver.
 --- !u!4 &1078170379
@@ -577,8 +589,8 @@ MonoBehaviour:
   thicknessCutPlaneSamples: 5
   cutFPInterp: 1
   enableKeyboardControl: 1
-  keyboardMoveSpeed: 5
-  keyboardRotationSpeed: 60
+  keyboardMoveSpeed: 1
+  keyboardRotationSpeed: 10
   moveLeftKey: 97
   moveRightKey: 100
   moveBackwardKey: 115
@@ -783,7 +795,7 @@ MonoBehaviour:
   youngsModulus: 3000
   poissonsRatio: 0.257
   damping: 0.044
-  enableGravity: 1
+  enableGravity: 0
   gravityY: -9.81
   groundY: -3
   showGroundPlane: 1

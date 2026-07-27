@@ -54,6 +54,11 @@ void cut_set_tool(const CutToolDesc* tool);
 int  cut_set_rest_metric(const float* alignedRestPositions, float voxelSizeX, float voxelSizeY, float voxelSizeZ);
 void cut_clear_rest_metric();
 
+// Render-only cut-wall separation used by Stage 3 dual-representation coupling. It offsets only
+// reconstructed cut feature points and never changes physics particles, constraints, or collisions.
+int cut_set_gravity_stabilization(int enabled, float gravityX, float gravityY, float gravityZ,
+                                  float gapWorld, float alignmentExponent);
+
 // DetectCut (Stage 6, paper SS2.1.3 Eq6-8 verbatim): Moller-Trumbore of the swept cutting plane
 // (2 WORLD triangles, prev+cur tool frames) against the CURRENT DEFORMED grid edges + SeverLinks.
 // Cut points are recorded on the undeformed edge (alongRest, SS2.1.2) and reconstructed via the

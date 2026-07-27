@@ -88,6 +88,10 @@ static float       g_cutVoxelL = 0.f;
 static float3      g_cutVoxelSize = { 0.f, 0.f, 0.f };
 static float       g_cutVoxelMaxL = 0.f;
 static float       g_tearStretchRatio = 0.f;
+static bool        g_gravityStabilizationEnabled = false;
+static float3      g_gravityDirection = { 0.f, -1.f, 0.f };
+static float       g_gravitySafeGap = 0.f;
+static float       g_gravityAlignmentExponent = 1.f;
 
 // ── Stage-6 host state ────────────────────────────────────────────────────────────────────────
 static bool   g_toolSet        = false;          // at least one cut_set_tool received
@@ -521,7 +525,9 @@ __global__ void k_AccumulateCutFP(int cutPointCapacity,
                                   const GridEdgeGpu2* gridEdges, const unsigned int* voxelOccupied,
                                   const unsigned int* voxelCutMask, const Conn4096Gpu* conn4096,
                                   int* cutFPAccumPos, int* cutFPAccumCnt,
-                                  const int* active, int* cutNrmAccum)
+                                  const int* active, int* cutNrmAccum,
+                                  int gravityStabilizationEnabled, float3 gravityDirection,
+                                  float gravitySafeGap, float gravityAlignmentExponent)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     // OOB guard (diagnosis D1 minor): the emit counter increments BEFORE the capacity check, so
@@ -539,6 +545,12 @@ __global__ void k_AccumulateCutFP(int cutPointCapacity,
     RotGpu R = particleRot[cp.ownerParticle];
     float3 world = cornerPos[cp.ownerParticle] + mulRv(R, cp.localOffset);   // re-rotate by current R
     float3 nrmW  = mulRv(R, cp.matNrm);                                      // v4.1 P2: world cut normal
+    if (gravityStabilizationEnabled != 0 && gravitySafeGap > 0.f)
+    {
+        float alignment = fminf(fmaxf(fabsf(dot3(nrmW, gravityDirection)), 0.f), 1.f);
+        float weight = powf(alignment, gravityAlignmentExponent);
+        world = world + nrmW * (0.5f * gravitySafeGap * weight);
+    }
     int3 ownerCoord = CornerCoordCuda(cp.ownerParticle, dims);
 
     GridEdgeGpu2 ge = gridEdges[cp.edgeId];
@@ -1036,6 +1048,23 @@ void cut_clear_rest_metric()
     g_cutVoxelMaxL = g_cdesc.voxelL;
 }
 
+int cut_set_gravity_stabilization(int enabled, float gravityX, float gravityY, float gravityZ,
+                                  float gapWorld, float alignmentExponent)
+{
+    if (!g_cut_ready || gapWorld != gapWorld || alignmentExponent != alignmentExponent ||
+        gapWorld < 0.f || alignmentExponent < 0.5f || alignmentExponent > 4.f)
+        return -3051;
+    float3 gravity = make_float3(gravityX, gravityY, gravityZ);
+    float gravityLength = length3(gravity);
+    g_gravityStabilizationEnabled = enabled != 0 && gravityLength > 1e-6f && gapWorld > 0.f;
+    g_gravityDirection = gravityLength > 1e-6f
+        ? gravity / gravityLength
+        : make_float3(0.f, -1.f, 0.f);
+    g_gravitySafeGap = gapWorld;
+    g_gravityAlignmentExponent = alignmentExponent;
+    return 0;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Stage-6 detection host orchestration (task_plan.md Stage 6).
 //   cut_detect()       - per C# rod substep (rod moved, tissue frozen): SS2.1.3 world quad M-T.
@@ -1127,7 +1156,9 @@ int cut_fp_chain()
     k_LookupConnectivity<<<Gc(vc), 64>>>(vc, d_voxelCutMask, d_voxelOccupied, d_conn4096, d_voxelFPCount, d_dbg);
     k_AccumulateCutFP<<<Gc(cpc), 64>>>(cpc, d_cutPointCounter, d_cutPoint, c_particleRot, c_cornerPos, g_cdims,
                                        d_gridEdges, d_voxelOccupied, d_voxelCutMask, d_conn4096,
-                                       d_cutFPAccumPos, d_cutFPAccumCnt, c_active, d_cutNrmAccum);
+                                       d_cutFPAccumPos, d_cutFPAccumCnt, c_active, d_cutNrmAccum,
+                                       g_gravityStabilizationEnabled ? 1 : 0, g_gravityDirection,
+                                       g_gravitySafeGap, g_gravityAlignmentExponent);
     k_ComputeComponentFP<<<Gc(vc), 64>>>(vc, g_cdims, d_voxelCutMask, d_voxelOccupied, d_conn4096,
                                          c_voxelIsectOffset, c_voxelIsectCount, c_isect, c_isectWorld,
                                          d_cutFPAccumCnt, d_cutFPAccumPos, d_cutFP,
@@ -1196,6 +1227,10 @@ void cut_shutdown()
     g_cutRestMetricEnabled = false; g_cutVoxelL = 0.f;
     g_cutVoxelSize = make_float3(0.f, 0.f, 0.f); g_cutVoxelMaxL = 0.f;
     g_tearStretchRatio = 0.f;
+    g_gravityStabilizationEnabled = false;
+    g_gravityDirection = make_float3(0.f, -1.f, 0.f);
+    g_gravitySafeGap = 0.f;
+    g_gravityAlignmentExponent = 1.f;
     cudaFree(d_conn4096);        d_conn4096 = nullptr;
     cudaFree(d_voxelOccupied);   d_voxelOccupied = nullptr;
     cudaFree(d_voxelCutMask);    d_voxelCutMask = nullptr;

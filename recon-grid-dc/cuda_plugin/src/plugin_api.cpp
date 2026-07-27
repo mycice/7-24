@@ -94,6 +94,14 @@ LCS_API void LCS_ClearCutRestMetric()
     cut_clear_rest_metric();
 }
 
+LCS_API int LCS_SetCutGravityStabilization(int enabled,
+                                           float gravityX, float gravityY, float gravityZ,
+                                           float gapWorld, float alignmentExponent)
+{
+    return cut_set_gravity_stabilization(enabled, gravityX, gravityY, gravityZ,
+                                         gapWorld, alignmentExponent);
+}
+
 // ── Stage 3: cutting ───────────────────────────────────────────────────────────────────────────
 // Allocate + upload the cut buffers (Conn4096 LUT, gridEdges, occupancy). Call AFTER LCS_Init + LCS_InitPhysics.
 LCS_API int LCS_InitCut(const CutInitDesc* desc, const void* conn4096, const void* gridEdges, const int* voxelOccupied,
