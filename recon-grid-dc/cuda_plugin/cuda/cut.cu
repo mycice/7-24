@@ -41,6 +41,7 @@ struct ToolGpu
 // ── Cut-owned device buffers ─────────────────────────────────────────────────────────────────
 static GridEdgeGpu2*  d_gridEdges      = nullptr;  // [gridEdgeCount]
 static float3*        d_prevCorner     = nullptr;  // [cornerCount] corner positions at the previous tick (CCD)
+static float3*        d_cutRestCorner  = nullptr;  // [cornerCount] optional Stage 3 aligned rest positions
 static Conn4096Gpu*   d_conn4096       = nullptr;  // [4096]
 static unsigned int*  d_voxelOccupied  = nullptr;  // [voxelCount] (1/0)
 static unsigned int*  d_voxelCutMask   = nullptr;  // [voxelCount] (cumulative, 12-bit)
@@ -82,6 +83,11 @@ static CutInitDesc g_cdesc = {};
 static int3        g_cdims = {};
 static CutToolDesc g_tool  = {};
 static bool        g_cut_ready = false;
+static bool        g_cutRestMetricEnabled = false;
+static float       g_cutVoxelL = 0.f;
+static float3      g_cutVoxelSize = { 0.f, 0.f, 0.f };
+static float       g_cutVoxelMaxL = 0.f;
+static float       g_tearStretchRatio = 0.f;
 
 // ── Stage-6 host state ────────────────────────────────────────────────────────────────────────
 static bool   g_toolSet        = false;          // at least one cut_set_tool received
@@ -91,6 +97,16 @@ static float  g_tearLen2  = 0.f;                 // (tau*L)^2, 0 = tear law disa
 
 static int Gc(int n) { int g = (n + 63) / 64; return g < 1 ? 1 : g; }
 static float3 mk3(const float* a) { return make_float3(a[0], a[1], a[2]); }
+
+__device__ __forceinline__ float BoxSdfAnisotropic(float3 p, float3 c, float3 size)
+{
+    float3 q = make_float3(fabsf(p.x - c.x) - 0.5f * size.x,
+                           fabsf(p.y - c.y) - 0.5f * size.y,
+                           fabsf(p.z - c.z) - 0.5f * size.z);
+    float3 outside = make_float3(fmaxf(q.x, 0.f), fmaxf(q.y, 0.f), fmaxf(q.z, 0.f));
+    float outsideLength = sqrtf(dot3(outside, outside));
+    return outsideLength + fminf(fmaxf(q.x, fmaxf(q.y, q.z)), 0.f);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // EmitCutPoint (device)  - record one cut point in the owner's MATERIAL frame (paper SS2.1.2).
@@ -140,6 +156,7 @@ __device__ __forceinline__ void EmitCutPoint(float3 P_hit, float3 alongRest, int
 __device__ __forceinline__ void MarkAndEmit(int e, int axis, int3 baseC, int3 axisDir, int idA, int idB,
                                             float t_ray, float3 P_hit, float3 ncut, float toolD,
                                             float voxelL, int3 dims, const float3* cornerPos,
+                                            const float3* cutRestCorner,
                                             unsigned int* voxelCutMask, const unsigned int* voxelOccupied,
                                             CutPointGpu* cutPoint, unsigned int* cutPointCounter,
                                             int cutPointCapacity, const RotGpu* particleRot)
@@ -158,9 +175,16 @@ __device__ __forceinline__ void MarkAndEmit(int e, int axis, int3 baseC, int3 ax
     }
     if (firstCut && edgeOccupied)
     {
-        float3 axisF  = make_float3((float)axisDir.x, (float)axisDir.y, (float)axisDir.z);
-        float3 alongA = (t_ray * voxelL) * axisF;
-        float3 alongB = ((t_ray - 1.0f) * voxelL) * axisF;
+        float3 restEdge;
+        if (cutRestCorner != nullptr)
+            restEdge = cutRestCorner[idB] - cutRestCorner[idA];
+        else
+        {
+            float3 axisF = make_float3((float)axisDir.x, (float)axisDir.y, (float)axisDir.z);
+            restEdge = voxelL * axisF;
+        }
+        float3 alongA = t_ray * restEdge;
+        float3 alongB = (t_ray - 1.0f) * restEdge;
         EmitCutPoint(P_hit, alongA, idA, e, ncut, toolD, cornerPos, particleRot, cutPoint, cutPointCounter, cutPointCapacity);
         EmitCutPoint(P_hit, alongB, idB, e, ncut, toolD, cornerPos, particleRot, cutPoint, cutPointCounter, cutPointCapacity);
     }
@@ -175,6 +199,7 @@ __device__ __forceinline__ void MarkAndEmit(int e, int axis, int3 baseC, int3 ax
 __global__ void k_DetectCutQuad(int gridEdgeCount, ToolGpu tool, float voxelL, int3 dims,
                                 int cutPointCapacity, const int* cornerInside,
                                 const float3* cornerPos, const GridEdgeGpu2* gridEdges,
+                                const float3* cutRestCorner,
                                 unsigned int* voxelCutMask, const unsigned int* voxelOccupied,
                                 CutPointGpu* cutPoint, unsigned int* cutPointCounter,
                                 const RotGpu* particleRot)
@@ -220,7 +245,7 @@ __global__ void k_DetectCutQuad(int gridEdgeCount, ToolGpu tool, float voxelL, i
     float3 P_hit = O + t_ray * Dvec;          // world hit ON the deformed edge (no offset)
 
     MarkAndEmit(e, axis, baseC, axisDir, idA, idB, t_ray, P_hit, tool.ncut, tool.d, voxelL, dims,
-                cornerPos, voxelCutMask, voxelOccupied, cutPoint, cutPointCounter, cutPointCapacity,
+                cornerPos, cutRestCorner, voxelCutMask, voxelOccupied, cutPoint, cutPointCounter, cutPointCapacity,
                 particleRot);
 }
 
@@ -237,7 +262,8 @@ __global__ void k_DetectCutQuad(int gridEdgeCount, ToolGpu tool, float voxelL, i
 __global__ void k_DetectCutCCD(int gridEdgeCount, float3 S, float3 E, float3 emitNcut, float toolD,
                                float voxelL, int3 dims, int cutPointCapacity,
                                const float3* prevPos, const float3* curPos,
-                               const GridEdgeGpu2* gridEdges, const int* nbrIdx, const int* cornerInside,
+                               const GridEdgeGpu2* gridEdges, const float3* cutRestCorner,
+                               const int* nbrIdx, const int* cornerInside,
                                unsigned int* voxelCutMask, const unsigned int* voxelOccupied,
                                CutPointGpu* cutPoint, unsigned int* cutPointCounter,
                                const RotGpu* particleRot)
@@ -332,7 +358,7 @@ __global__ void k_DetectCutCCD(int gridEdgeCount, float3 S, float3 E, float3 emi
         float  nLen = length3(nHit);
         float3 nEmit = (nLen > 1e-8f) ? nHit / nLen : emitNcut;
         MarkAndEmit(e, axis, baseC, axisDir, idA, idB, t_ray, P_hit, nEmit, toolD, voxelL, dims,
-                    curPos, voxelCutMask, voxelOccupied, cutPoint, cutPointCounter, cutPointCapacity,
+                    curPos, cutRestCorner, voxelCutMask, voxelOccupied, cutPoint, cutPointCounter, cutPointCapacity,
                     particleRot);
         return;                                   // first valid crossing cuts the edge
     }
@@ -351,9 +377,10 @@ __global__ void k_DetectCutCCD(int gridEdgeCount, float3 S, float3 E, float3 emi
 // margin; bridges blow through ANY tau within a frame or two at terminal velocity). Gated on
 // g_toolSet (host) so an uncut liver can never tear.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-__global__ void k_TearOverstretch(int gridEdgeCount, float tearLen2, int3 dims, float voxelL,
+__global__ void k_TearOverstretch(int gridEdgeCount, float tearStretchRatio, int3 dims, float voxelL,
                                   float toolD, const GridEdgeGpu2* gridEdges, const int* nbrIdx,
                                   const int* active, const float3* cornerPos,
+                                  const float3* cutRestCorner,
                                   unsigned int* voxelCutMask, const unsigned int* voxelOccupied,
                                   CutPointGpu* cutPoint, unsigned int* cutPointCounter,
                                   int cutPointCapacity, const RotGpu* particleRot, unsigned int* dbg)
@@ -388,14 +415,18 @@ __global__ void k_TearOverstretch(int gridEdgeCount, float tearLen2, int3 dims, 
     float3 A = cornerPos[idA], B = cornerPos[idB];
     float3 d = B - A;
     float  len2 = dot3(d, d);
-
-    if (len2 <= tearLen2) return;
+    float3 restEdge = cutRestCorner != nullptr
+        ? cutRestCorner[idB] - cutRestCorner[idA]
+        : voxelL * make_float3((float)axisDir.x, (float)axisDir.y, (float)axisDir.z);
+    float restLen2 = dot3(restEdge, restEdge);
+    float tearLen2 = tearStretchRatio * tearStretchRatio * restLen2;
+    if (restLen2 <= 1e-12f || len2 <= tearLen2) return;
 
     float3 ncut  = d / sqrtf(len2);                            // tear plane  - the overstretched edge
     float3 P_hit = A + 0.5f * d;                               // midpoint: side=-1 for A, +1 for B (R1 verified)
     if (dbg) atomicAdd(&dbg[15], 1u);                          // CUMULATIVE tear counter (see slot map)
     MarkAndEmit(e, axis, baseC, axisDir, idA, idB, 0.5f, P_hit, ncut, toolD, voxelL, dims,
-                cornerPos, voxelCutMask, voxelOccupied, cutPoint, cutPointCounter, cutPointCapacity,
+                cornerPos, cutRestCorner, voxelCutMask, voxelOccupied, cutPoint, cutPointCounter, cutPointCapacity,
                 particleRot);
 }
 
@@ -551,7 +582,7 @@ __global__ void k_ComputeComponentFP(int voxelCount, int3 dims, const unsigned i
                                      const int* voxelIsectOffset, const int* voxelIsectCount,
                                      const IsectGpu* isect, const float3* isectWorld,
                                      const int* cutFPAccumCnt, const int* cutFPAccumPos, float4* cutFP,
-                                     const int* voxelCorner, const float3* cornerPos, float voxelL,
+                                     const int* voxelCorner, const float3* cornerPos, float3 voxelSize,
                                      int qefIters, const int* cornerInside, const int* cutNrmAccum)
 {
     int v = blockIdx.x * blockDim.x + threadIdx.x;
@@ -566,7 +597,7 @@ __global__ void k_ComputeComponentFP(int voxelCount, int3 dims, const unsigned i
     int off = voxelIsectOffset[v];
     int cnt = voxelIsectCount[v];
 
-    float halfL = 0.5f * voxelL;
+    float3 halfSize = 0.5f * voxelSize;
 
     for (int comp = 0; comp < compCount; comp++)
     {
@@ -635,15 +666,15 @@ __global__ void k_ComputeComponentFP(int voxelCount, int3 dims, const unsigned i
                 }
                 float a = 0.1f * (1.0f - (float)it2 / (float)qefIters);   // Eq4
                 float3 xn = x + a * F;
-                if (BoxSdf(xn, bc, voxelL) >= 0.0f) break;                 // D5 stop
+                if (BoxSdfAnisotropic(xn, bc, voxelSize) >= 0.0f) break;  // D5 stop
                 x = xn;
             }
         }
 
         // DEVIATION D5 / Eq5 clamp: keep the FP inside its deformed voxel box.
-        x.x = fminf(fmaxf(x.x, bc.x - halfL), bc.x + halfL);
-        x.y = fminf(fmaxf(x.y, bc.y - halfL), bc.y + halfL);
-        x.z = fminf(fmaxf(x.z, bc.z - halfL), bc.z + halfL);
+        x.x = fminf(fmaxf(x.x, bc.x - halfSize.x), bc.x + halfSize.x);
+        x.y = fminf(fmaxf(x.y, bc.y - halfSize.y), bc.y + halfSize.y);
+        x.z = fminf(fmaxf(x.z, bc.z - halfSize.z), bc.z + halfSize.z);
 
         // D4 variant-(c) skin-side projection, AFTER the D5 clamp (Q1 correction on ordering; the
         // per-component box of a pure-air comp centers on its air corners, so projecting first
@@ -892,6 +923,7 @@ int cut_init(const CutInitDesc* desc, const void* conn4096, const void* gridEdge
 
     CK(cudaMalloc(&d_gridEdges,       (size_t)gecA   * sizeof(GridEdgeGpu2)));
     CK(cudaMalloc(&d_prevCorner,      (size_t)desc->cornerCount * sizeof(float3)));   // CCD tick snapshot
+    CK(cudaMalloc(&d_cutRestCorner,   (size_t)desc->cornerCount * sizeof(float3)));
     CK(cudaMalloc(&d_conn4096,        (size_t)4096   * sizeof(Conn4096Gpu)));
     CK(cudaMalloc(&d_voxelOccupied,   (size_t)vc     * sizeof(unsigned int)));
     CK(cudaMalloc(&d_voxelCutMask,    (size_t)vc     * sizeof(unsigned int)));
@@ -947,12 +979,17 @@ int cut_init(const CutInitDesc* desc, const void* conn4096, const void* gridEdge
     recon_set_cut_buffers(d_voxelCutMask, d_voxelOccupied, d_conn4096, d_cutFP, d_cutFPNormalF, d_cutFPNormal);
 
     g_toolSet = false; g_havePrevCorner = false;
+    g_cutRestMetricEnabled = false;
+    g_cutVoxelL = desc->voxelL;
+    g_cutVoxelSize = make_float3(desc->voxelL, desc->voxelL, desc->voxelL);
+    g_cutVoxelMaxL = desc->voxelL;
     g_emitNcut = make_float3(0.f, 1.f, 0.f);
     // v5.1 D10: sanitize tau (R1-m5: a stale-DLL/struct mismatch must degrade to tear-OFF, never a
     // garbage threshold). tau < 1 would tear edges at rest length; NaN fails the >= compare.
     {
-        float tau = g_cdesc.tearStretchRatio;
-        g_tearLen2 = (tau >= 1.0f && tau == tau) ? (tau * desc->voxelL) * (tau * desc->voxelL) : 0.f;
+        g_tearStretchRatio = g_cdesc.tearStretchRatio;
+        float tau = g_tearStretchRatio;
+        g_tearLen2 = (tau >= 1.0f && tau == tau) ? (tau * g_cutVoxelL) * (tau * g_cutVoxelL) : 0.f;
     }
 
     g_cut_ready = true;
@@ -975,6 +1012,30 @@ void cut_set_tool(const CutToolDesc* tool)
     g_toolSet = true;
 }
 
+int cut_set_rest_metric(const float* alignedRestPositions, float voxelSizeX, float voxelSizeY, float voxelSizeZ)
+{
+    if (!g_cut_ready || !alignedRestPositions ||
+        !(voxelSizeX > 0.f) || !(voxelSizeY > 0.f) || !(voxelSizeZ > 0.f) ||
+        voxelSizeX != voxelSizeX || voxelSizeY != voxelSizeY || voxelSizeZ != voxelSizeZ)
+        return -3050;
+    cudaError_t e = cudaMemcpy(d_cutRestCorner, alignedRestPositions,
+                               (size_t)g_cdesc.cornerCount * sizeof(float3), cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) return -(int)e;
+    g_cutVoxelSize = make_float3(voxelSizeX, voxelSizeY, voxelSizeZ);
+    g_cutVoxelMaxL = fmaxf(voxelSizeX, fmaxf(voxelSizeY, voxelSizeZ));
+    g_cutVoxelL = (voxelSizeX + voxelSizeY + voxelSizeZ) / 3.f;
+    g_cutRestMetricEnabled = true;
+    return 0;
+}
+
+void cut_clear_rest_metric()
+{
+    g_cutRestMetricEnabled = false;
+    g_cutVoxelL = g_cdesc.voxelL;
+    g_cutVoxelSize = make_float3(g_cdesc.voxelL, g_cdesc.voxelL, g_cdesc.voxelL);
+    g_cutVoxelMaxL = g_cdesc.voxelL;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Stage-6 detection host orchestration (task_plan.md Stage 6).
 //   cut_detect()       - per C# rod substep (rod moved, tissue frozen): SS2.1.3 world quad M-T.
@@ -994,8 +1055,9 @@ int cut_detect()
     t.ncut = mk3(g_tool.ncut); t.aabbMin = mk3(g_tool.aabbMin); t.aabbMax = mk3(g_tool.aabbMax);
     t.d = g_tool.d; t.valid = g_tool.valid;
 
-    k_DetectCutQuad<<<Gc(gec), 64>>>(gec, t, g_cdesc.voxelL, g_cdims, g_cdesc.cutPointCapacity,
-                                     d_cornerInside, c_cornerPos, d_gridEdges, d_voxelCutMask, d_voxelOccupied,
+    const float3* cutRest = g_cutRestMetricEnabled ? d_cutRestCorner : nullptr;
+    k_DetectCutQuad<<<Gc(gec), 64>>>(gec, t, g_cutVoxelMaxL, g_cdims, g_cdesc.cutPointCapacity,
+                                     d_cornerInside, c_cornerPos, d_gridEdges, cutRest, d_voxelCutMask, d_voxelOccupied,
                                      d_cutPoint, d_cutPointCounter, c_particleRot);
     k_SeverLinks<<<Gc(gec), 64>>>(gec, g_cdims, d_gridEdges, d_voxelCutMask, c_nbrIdx, c_bendPairs);
 
@@ -1024,14 +1086,15 @@ int cut_ribbon_tick()
     float3 S = mk3(g_tool.t2v2);        // current rod endpoints (CuttingTool: T2V2=S, T1V2=E)
     float3 E = mk3(g_tool.t1v2);
 
-    k_DetectCutCCD<<<Gc(gec), 64>>>(gec, S, E, g_emitNcut, g_tool.d, g_cdesc.voxelL, g_cdims,
+    const float3* cutRest = g_cutRestMetricEnabled ? d_cutRestCorner : nullptr;
+    k_DetectCutCCD<<<Gc(gec), 64>>>(gec, S, E, g_emitNcut, g_tool.d, g_cutVoxelMaxL, g_cdims,
                                     g_cdesc.cutPointCapacity, d_prevCorner, c_cornerPos,
-                                    d_gridEdges, c_nbrIdx, d_cornerInside, d_voxelCutMask, d_voxelOccupied,
+                                    d_gridEdges, cutRest, c_nbrIdx, d_cornerInside, d_voxelCutMask, d_voxelOccupied,
                                     d_cutPoint, d_cutPointCounter, c_particleRot);
     // v5.1 D10 tear law  - BEFORE k_SeverLinks so the same tick severs the newly marked tears.
     if (g_tearLen2 > 0.f)
-        k_TearOverstretch<<<Gc(gec), 64>>>(gec, g_tearLen2, g_cdims, g_cdesc.voxelL, g_tool.d,
-                                           d_gridEdges, c_nbrIdx, c_active, c_cornerPos,
+        k_TearOverstretch<<<Gc(gec), 64>>>(gec, g_tearStretchRatio, g_cdims, g_cutVoxelMaxL, g_tool.d,
+                                           d_gridEdges, c_nbrIdx, c_active, c_cornerPos, cutRest,
                                            d_voxelCutMask, d_voxelOccupied, d_cutPoint,
                                            d_cutPointCounter, g_cdesc.cutPointCapacity,
                                            c_particleRot, d_dbg);
@@ -1068,9 +1131,9 @@ int cut_fp_chain()
     k_ComputeComponentFP<<<Gc(vc), 64>>>(vc, g_cdims, d_voxelCutMask, d_voxelOccupied, d_conn4096,
                                          c_voxelIsectOffset, c_voxelIsectCount, c_isect, c_isectWorld,
                                          d_cutFPAccumCnt, d_cutFPAccumPos, d_cutFP,
-                                         c_voxelCorner, c_cornerPos, g_cdesc.voxelL,
+                                         c_voxelCorner, c_cornerPos, g_cutVoxelSize,
                                          recon_qef_iters(), d_cornerInside, d_cutNrmAccum);
-    k_InterpCutFP<<<Gc(slot), 64>>>(vc, g_cdesc.cutFPInterp, g_cdesc.voxelL,
+    k_InterpCutFP<<<Gc(slot), 64>>>(vc, g_cdesc.cutFPInterp, g_cutVoxelL,
                                     d_voxelCutMask, d_prevVoxelMask, d_cutFP, d_prevCutFP, d_dbg);
     // v4.1 P1a: roll the mask epoch AFTER InterpCutFP consumed the comparison (default stream is
     // ordered, so this D2D copy runs after the kernel).
@@ -1084,7 +1147,7 @@ int cut_build_triangles()
 {
     if (!g_cut_ready) return 0;
     k_BuildCutTriangles<<<Gc(g_cdesc.cornerCount), 64>>>(g_cdesc.cornerCount, g_cdesc.triCapacity, g_cdims,
-                                                         g_cdesc.voxelL,
+                                                         g_cutVoxelL,
                                                          d_voxelCutMask, d_voxelOccupied, d_conn4096, d_cutFP,
                                                          c_cornerPos, c_tri, c_triCounter, d_dbg);
     cudaError_t e = cudaGetLastError();
@@ -1098,7 +1161,7 @@ int cut_build_triangles()
 int cut_get_debug(unsigned int* out18, float* alphaOut)
 {
     if (!g_cut_ready || !out18) return -1;
-    int r = recon_debug_scan_tris(d_dbg, g_cdesc.voxelL);
+    int r = recon_debug_scan_tris(d_dbg, g_cutVoxelL);
     if (r != 0) return r;
     unsigned int dbg[16];
     if (cudaMemcpy(dbg, d_dbg, sizeof(dbg), cudaMemcpyDeviceToHost) != cudaSuccess) return -3310;
@@ -1128,7 +1191,11 @@ void cut_shutdown()
 {
     cudaFree(d_gridEdges);       d_gridEdges = nullptr;
     cudaFree(d_prevCorner);      d_prevCorner = nullptr;
+    cudaFree(d_cutRestCorner);   d_cutRestCorner = nullptr;
     g_toolSet = false; g_havePrevCorner = false; g_tearLen2 = 0.f;
+    g_cutRestMetricEnabled = false; g_cutVoxelL = 0.f;
+    g_cutVoxelSize = make_float3(0.f, 0.f, 0.f); g_cutVoxelMaxL = 0.f;
+    g_tearStretchRatio = 0.f;
     cudaFree(d_conn4096);        d_conn4096 = nullptr;
     cudaFree(d_voxelOccupied);   d_voxelOccupied = nullptr;
     cudaFree(d_voxelCutMask);    d_voxelCutMask = nullptr;

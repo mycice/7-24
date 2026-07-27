@@ -173,6 +173,8 @@ namespace ReconGridDC.Cuda
         [DllImport(DLL)] static extern int  LCS_Step(float dt);
         [DllImport(DLL)] static extern int  LCS_SetCornerPos(float[] positions);
         [DllImport(DLL)] static extern int  LCS_ComputeRotations();
+        [DllImport(DLL)] static extern int  LCS_SetCutRestMetric(float[] alignedRestPositions, float voxelSizeX, float voxelSizeY, float voxelSizeZ);
+        [DllImport(DLL)] static extern void LCS_ClearCutRestMetric();
         [DllImport(DLL)] static extern int  LCS_Finalize();
         [DllImport(DLL)] static extern int  LCS_GetSurfaceCounts(out int vertexCount, out int indexCount);
         [DllImport(DLL)] static extern int  LCS_GetSurface([Out] float[] outPos3, [Out] float[] outNrm3, [Out] int[] outIdx);
@@ -214,10 +216,14 @@ namespace ReconGridDC.Cuda
         byte[]    _gridActiveMask;
         bool      _externalGridDeformationActive;
         bool      _externalUploadUnsupported;
+        bool      _cutRestMetricActive;
+        bool      _cutRestMetricUnsupported;
 
         public bool IsInitialized => initialized && cutReady;
         public int GridCornerCount => _gridRestCorners != null ? _gridRestCorners.Length : 0;
         public bool ExternalGridDeformationActive => _externalGridDeformationActive;
+        public float GridVoxelLength => Lrt;
+        public bool CutRestMetricActive => _cutRestMetricActive;
 
         // Arrays are immutable after Start and are exposed only for Stage 3 embedding setup.
         public bool TryGetGridRestData(out Vector3[] corners, out byte[] activeMask)
@@ -232,6 +238,45 @@ namespace ReconGridDC.Cuda
             if (active && _externalUploadUnsupported)
                 return;
             _externalGridDeformationActive = active;
+        }
+
+        public bool ConfigureStage3CutRestMetric(float[] alignedRestPositions, Vector3 alignedVoxelSize)
+        {
+            if (!cutReady || _cutRestMetricUnsupported || alignedRestPositions == null ||
+                alignedRestPositions.Length != GridCornerCount * 3 ||
+                alignedVoxelSize.x <= 0f || alignedVoxelSize.y <= 0f || alignedVoxelSize.z <= 0f)
+                return false;
+
+            try
+            {
+                int rc = LCS_SetCutRestMetric(alignedRestPositions, alignedVoxelSize.x, alignedVoxelSize.y, alignedVoxelSize.z);
+                if (rc == 0)
+                {
+                    _cutRestMetricActive = true;
+                    float visualLength = (alignedVoxelSize.x + alignedVoxelSize.y + alignedVoxelSize.z) / 3f;
+                    float stepLength = Mathf.Min(alignedVoxelSize.x, Mathf.Min(alignedVoxelSize.y, alignedVoxelSize.z));
+                    if (_cutter != null) _cutter.SetCutMetricVoxelLengths(visualLength, stepLength);
+                    return true;
+                }
+                Debug.LogError($"[Stage3Coupling] LCS_SetCutRestMetric failed (rc={rc}).", this);
+            }
+            catch (System.EntryPointNotFoundException)
+            {
+                _cutRestMetricUnsupported = true;
+                Debug.LogError("[Stage3Coupling] The deployed LiverCudaSim.dll lacks the Stage 3 cutting metric API. " +
+                               "Close Unity and rebuild/deploy cuda_plugin.", this);
+            }
+            return false;
+        }
+
+        public void ClearStage3CutRestMetric()
+        {
+            if (_cutter != null) _cutter.ResetCutMetricVoxelLength();
+            if (!_cutRestMetricActive)
+                return;
+            try { LCS_ClearCutRestMetric(); }
+            catch (System.EntryPointNotFoundException) { _cutRestMetricUnsupported = true; }
+            _cutRestMetricActive = false;
         }
 
         /// <summary>

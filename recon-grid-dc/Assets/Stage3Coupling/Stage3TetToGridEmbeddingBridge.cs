@@ -47,6 +47,10 @@ namespace ReconGridDC.Stage3Coupling
         [Tooltip("Shows the coarse tetrahedral mesh used for collision and grasping. Disable this to present the aligned CUDA organ as the single visible organ.")]
         public bool showPhysicsProxy = false;
 
+        [Header("Cutting Scale Adaptation")]
+        [Tooltip("Makes CUDA cut-point reconstruction and cutting tolerances use the regular grid after it has been fitted to the tetrahedral organ. Choose this before entering Play; do not toggle after a cut has already been created.")]
+        public bool adaptCudaCuttingMetric = true;
+
         [Header("Readback")]
         [Tooltip("Stage 3 forces synchronous tetrahedron position readback while active. This makes the update order deterministic, but can reduce frame rate.")]
         public bool forceSynchronousTetReadback = true;
@@ -66,6 +70,12 @@ namespace ReconGridDC.Stage3Coupling
         [SerializeField] float maxGridDisplacement;
         [SerializeField] float maxMappedLocalDisplacement;
         [SerializeField] bool localTetDeformationApplied;
+        [SerializeField] float originalCutVoxelLength;
+        [SerializeField] Vector3 alignedRestEdgeLengths;
+        [SerializeField] float effectiveCutVoxelLength;
+        [SerializeField] float conservativeCutStepLength;
+        [SerializeField] float cutMetricScale = 1f;
+        [SerializeField] string cutMetricStatus = "Waiting for embedding.";
         [SerializeField] int lastUploadFrame = -1;
         [SerializeField] string lastStatus = "Waiting for Stage 1 tetra body and CUDA liver.";
 
@@ -246,7 +256,10 @@ namespace ReconGridDC.Stage3Coupling
         void DisableExternalMode()
         {
             if (cudaLiver != null)
+            {
                 cudaLiver.SetExternalGridDeformationActive(false);
+                cudaLiver.ClearStage3CutRestMetric();
+            }
         }
 
         void ConfigureRestAlignment(TetMeshData data)
@@ -268,6 +281,42 @@ namespace ReconGridDC.Stage3Coupling
             _alignedGridRestCorners = new Vector3[_gridRestCorners.Length];
             for (int c = 0; c < _gridRestCorners.Length; c++)
                 _alignedGridRestCorners[c] = GridToTetRest(_gridRestCorners[c]);
+
+            ConfigureCuttingMetric();
+        }
+
+        void ConfigureCuttingMetric()
+        {
+            originalCutVoxelLength = cudaLiver != null ? cudaLiver.GridVoxelLength : 0f;
+            alignedRestEdgeLengths = new Vector3(
+                originalCutVoxelLength * Mathf.Abs(_gridToTetScale.x),
+                originalCutVoxelLength * Mathf.Abs(_gridToTetScale.y),
+                originalCutVoxelLength * Mathf.Abs(_gridToTetScale.z));
+            effectiveCutVoxelLength = (alignedRestEdgeLengths.x + alignedRestEdgeLengths.y + alignedRestEdgeLengths.z) / 3f;
+            conservativeCutStepLength = Mathf.Min(alignedRestEdgeLengths.x,
+                Mathf.Min(alignedRestEdgeLengths.y, alignedRestEdgeLengths.z));
+            cutMetricScale = originalCutVoxelLength > 1e-6f ? effectiveCutVoxelLength / originalCutVoxelLength : 1f;
+
+            if (!adaptCudaCuttingMetric)
+            {
+                cudaLiver.ClearStage3CutRestMetric();
+                cutMetricStatus = "Disabled; original CUDA cutting metric is active.";
+                return;
+            }
+
+            var alignedRest = new float[_alignedGridRestCorners.Length * 3];
+            for (int c = 0; c < _alignedGridRestCorners.Length; c++)
+            {
+                Vector3 p = _alignedGridRestCorners[c];
+                alignedRest[3 * c] = p.x;
+                alignedRest[3 * c + 1] = p.y;
+                alignedRest[3 * c + 2] = p.z;
+            }
+
+            bool configured = cudaLiver.ConfigureStage3CutRestMetric(alignedRest, alignedRestEdgeLengths);
+            cutMetricStatus = configured
+                ? "Active: CUDA cutting uses anisotropic Stage 3 voxel extents and aligned rest edges."
+                : "Failed: original CUDA cutting metric remains active.";
         }
 
         void ApplyPresentation()

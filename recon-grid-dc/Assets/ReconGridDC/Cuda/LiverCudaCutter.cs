@@ -88,6 +88,8 @@ namespace ReconGridDC.Cuda
 
         CuttingTool _tool;
         float _voxelL;
+        float _cutMetricVoxelL;
+        float _cutStepVoxelL;
         float3 _origin;
         int3 _dims;
         bool _nativeReady;
@@ -106,6 +108,8 @@ namespace ReconGridDC.Cuda
         readonly System.Collections.Generic.HashSet<int> _sweptVox = new System.Collections.Generic.HashSet<int>();
 
         public bool NativeReady => _nativeReady;
+        public float OriginalVoxelLength => _voxelL;
+        public float EffectiveCutVoxelLength => _cutMetricVoxelL > 0f ? _cutMetricVoxelL : _voxelL;
         public bool InteractiveReady => enableCutting && cuttingRodTarget != null && _tool != null;
         public int GridEdgeCount { get; private set; }
         public int SweptVoxelCount => _sweptVox.Count;
@@ -173,6 +177,8 @@ namespace ReconGridDC.Cuda
             _nativeReady = true;
             _dims = dims;
             _voxelL = voxelL;
+            _cutMetricVoxelL = voxelL;
+            _cutStepVoxelL = voxelL;
             _origin = origin;
 
             Vector3 initialCenter = (Vector3)gridCenter + new Vector3(0f, voxelL * 0.5f, 0f);
@@ -193,6 +199,18 @@ namespace ReconGridDC.Cuda
             return 0;
         }
 
+        public void SetCutMetricVoxelLengths(float visualVoxelLength, float conservativeStepLength)
+        {
+            _cutMetricVoxelL = visualVoxelLength > 0f ? visualVoxelLength : _voxelL;
+            _cutStepVoxelL = conservativeStepLength > 0f ? conservativeStepLength : _cutMetricVoxelL;
+        }
+
+        public void ResetCutMetricVoxelLength()
+        {
+            _cutMetricVoxelL = _voxelL;
+            _cutStepVoxelL = _voxelL;
+        }
+
         public void Step(float rodSpanLength)
         {
             if (!InteractiveReady) return;
@@ -203,13 +221,13 @@ namespace ReconGridDC.Cuda
             {
                 float effRodLen = autoSizeRod ? Mathf.Max(rodLength, rodSpanLength) : rodLength;
                 cuttingRodTarget.Length = effRodLen;
-                cuttingRodTarget.Thickness = Mathf.Max(0.02f, rodThicknessDOverL * _voxelL);
+                cuttingRodTarget.Thickness = Mathf.Max(0.002f, rodThicknessDOverL * EffectiveCutVoxelLength);
             }
 
             _tool.SetThickness(cuttingRodTarget.Thickness);
             cuttingRodTarget.GetEndpoints(out Vector3 sNew, out Vector3 eNew);
             Vector3 s0 = _tool.S, e0 = _tool.E;
-            int n = RodMath.SubStepCount(s0, e0, sNew, eNew, _voxelL);
+            int n = RodMath.SubStepCount(s0, e0, sNew, eNew, _cutStepVoxelL);
             for (int i = 1; i <= n; i++)
             {
                 float ti = (float)i / n;

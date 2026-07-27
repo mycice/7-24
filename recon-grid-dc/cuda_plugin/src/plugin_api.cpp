@@ -83,6 +83,17 @@ LCS_API int LCS_ComputeRotations()
     return physics_compute_rotations();
 }
 
+LCS_API int LCS_SetCutRestMetric(const float* alignedRestPositions,
+                                float voxelSizeX, float voxelSizeY, float voxelSizeZ)
+{
+    return cut_set_rest_metric(alignedRestPositions, voxelSizeX, voxelSizeY, voxelSizeZ);
+}
+
+LCS_API void LCS_ClearCutRestMetric()
+{
+    cut_clear_rest_metric();
+}
+
 // ── Stage 3: cutting ───────────────────────────────────────────────────────────────────────────
 // Allocate + upload the cut buffers (Conn4096 LUT, gridEdges, occupancy). Call AFTER LCS_Init + LCS_InitPhysics.
 LCS_API int LCS_InitCut(const CutInitDesc* desc, const void* conn4096, const void* gridEdges, const int* voxelOccupied,

@@ -50,6 +50,10 @@ int  cut_init(const CutInitDesc* desc, const void* conn4096, const void* gridEdg
 // Set the current swept-plane geometry (call once per rod sub-step before cut_detect).
 void cut_set_tool(const CutToolDesc* tool);
 
+// Optional Stage 3 metric for a regular grid fitted anisotropically into a tetrahedral body.
+int  cut_set_rest_metric(const float* alignedRestPositions, float voxelSizeX, float voxelSizeY, float voxelSizeZ);
+void cut_clear_rest_metric();
+
 // DetectCut (Stage 6, paper SS2.1.3 Eq6-8 verbatim): Moller-Trumbore of the swept cutting plane
 // (2 WORLD triangles, prev+cur tool frames) against the CURRENT DEFORMED grid edges + SeverLinks.
 // Cut points are recorded on the undeformed edge (alongRest, SS2.1.2) and reconstructed via the
