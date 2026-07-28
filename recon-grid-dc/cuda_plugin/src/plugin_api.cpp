@@ -159,6 +159,41 @@ LCS_API int LCS_OrganGetStats(uint32_t handle, OrganContextStats* outStats)
 {
     return organ_context_get_stats(handle, outStats);
 }
+LCS_API int LCS_OrganXpbdInitialize(uint32_t handle, const float* initialPositions3,
+                                    int edgeColorCount, const int* edgeColorOffsets,
+                                    const int* edgeColorCounts, const int* edgeColorFlat,
+                                    int tetColorCount, const int* tetColorOffsets,
+                                    const int* tetColorCounts, const int* tetColorFlat,
+                                    int surfaceColorCount, const int* surfaceColorOffsets,
+                                    const int* surfaceColorCounts, const int* surfaceColorFlat)
+{
+    return organ_context_xpbd_initialize(handle, initialPositions3,
+                                         edgeColorCount, edgeColorOffsets, edgeColorCounts, edgeColorFlat,
+                                         tetColorCount, tetColorOffsets, tetColorCounts, tetColorFlat,
+                                         surfaceColorCount, surfaceColorOffsets, surfaceColorCounts, surfaceColorFlat);
+}
+LCS_API int LCS_OrganXpbdStep(uint32_t handle, float dt, const OrganContextXpbdParams* params)
+{
+    return organ_context_xpbd_step(handle, dt, params);
+}
+LCS_API int LCS_OrganXpbdGetPositions(uint32_t handle, float* outPositions3, int particleCount)
+{
+    return organ_context_xpbd_get_positions(handle, outPositions3, particleCount);
+}
+LCS_API int LCS_OrganXpbdComparePositions(uint32_t handle, const float* unityPositions3,
+                                          int particleCount, OrganContextComparisonStats* outStats)
+{
+    return organ_context_xpbd_compare_positions(handle, unityPositions3, particleCount, outStats);
+}
+LCS_API int LCS_OrganToolStep(uint32_t handle, float dt, const OrganContextToolCapsule* capsules,
+                              const OrganContextToolContactParams* params)
+{
+    return organ_context_tool_step(handle, dt, capsules, params);
+}
+LCS_API int LCS_OrganToolGetStats(uint32_t handle, OrganContextToolContactStats* outStats)
+{
+    return organ_context_tool_get_stats(handle, outStats);
+}
 
 // Free all device buffers.
 LCS_API void LCS_Shutdown()

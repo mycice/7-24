@@ -10,6 +10,7 @@ using System.IO;
 using UnityEngine;
 using ReconGridDC.Stage1TetPhysics.Core;
 using ReconGridDC.Stage1TetPhysics.Physics;
+using ReconGridDC.Stage1TetPhysics;
 
 namespace ReconGridDC.Stage2Grasping.Grasping
 {
@@ -192,6 +193,7 @@ namespace ReconGridDC.Stage2Grasping.Grasping
         public float CurrentAngle => _currentAngle;
         public bool HasControlInput { get; private set; }
         public bool WantsToolContact => HasControlInput || _wantClose || IsGrasping;
+        public bool WantsClosedGrasp => _wantClose && _currentAngle <= 25f;
 
         TetMeshData _data;
         XPBDSolverGPU _solver;
@@ -480,6 +482,9 @@ namespace ReconGridDC.Stage2Grasping.Grasping
 
         Vector3 _shaftTipLocal; // shaft tip/hinge end in scaled OBJ local space
 
+        public string CudaToolInputStatus { get; private set; } = "CUDA tool input has not been built yet.";
+        public int LastCudaToolCapsuleCount { get; private set; }
+
         public void UploadToolCollisionToGPU()
         {
             if (!_initialized || _solver == null) return;
@@ -637,6 +642,101 @@ namespace ReconGridDC.Stage2Grasping.Grasping
             _capsuleB[capsuleCount] = b;
             _capsuleR[capsuleCount] = Mathf.Max(0.0001f, radius);
             capsuleCount++;
+            return true;
+        }
+
+        // Reuses the exact jaw capsules that the legacy Unity Compute contact path uses.
+        // It only builds the small input packet; it never scans or modifies tet particles.
+        public bool TryBuildCudaToolInput(CudaToolCapsule[] destination, out int capsuleCount,
+            out Bounds jawBounds, out Vector3 frameCenter, out Vector3 axisU,
+            out Vector3 axisV, out Vector3 axisW)
+        {
+            capsuleCount = 0;
+            jawBounds = new Bounds(_toolPos, Vector3.zero);
+            frameCenter = _toolPos;
+            axisU = Vector3.right;
+            axisV = Vector3.up;
+            axisW = Vector3.forward;
+            LastCudaToolCapsuleCount = 0;
+            if (!_initialized)
+            {
+                CudaToolInputStatus = "GripperTool is not initialized yet.";
+                return false;
+            }
+            if (destination == null || destination.Length < MaxGripperCapsules)
+            {
+                CudaToolInputStatus = $"CUDA capsule destination is invalid (length={destination?.Length ?? 0}, required={MaxGripperCapsules}).";
+                return false;
+            }
+
+            Quaternion toolRot = Quaternion.Euler(0f, _toolRotY, 0f);
+            Quaternion upperRot = Quaternion.AngleAxis(_currentAngle, Vector3.right);
+            Quaternion lowerRot = Quaternion.AngleAxis(-_currentAngle, Vector3.right);
+            int upperAdded = AddJawCapsules(_upperJawLocalCapsules, true, upperRot, toolRot, ref capsuleCount);
+            int lowerAdded = AddJawCapsules(_lowerJawLocalCapsules, false, lowerRot, toolRot, ref capsuleCount);
+            if (includeShaftCollision)
+            {
+                Vector3 shaftA = toolRot * _shaftEndLocal + _toolPos;
+                Vector3 shaftB = toolRot * _shaftTipLocal + _toolPos;
+                AddCapsule(shaftA, shaftB, shaftRadius, ref capsuleCount);
+            }
+
+            Vector3 min = Vector3.positiveInfinity;
+            Vector3 max = Vector3.negativeInfinity;
+            int jawCount = upperAdded + lowerAdded;
+            float jawFriction = Mathf.Max(0f, jawContactFrictionMultiplier);
+            for (int i = 0; i < capsuleCount; ++i)
+            {
+                Vector3 prevA = _hasPrevCapsules && i < _lastCapsuleCount ? _lastCapsuleA[i] : _capsuleA[i];
+                Vector3 prevB = _hasPrevCapsules && i < _lastCapsuleCount ? _lastCapsuleB[i] : _capsuleB[i];
+                destination[i] = new CudaToolCapsule
+                {
+                    ax = _capsuleA[i].x, ay = _capsuleA[i].y, az = _capsuleA[i].z, radius = _capsuleR[i],
+                    bx = _capsuleB[i].x, by = _capsuleB[i].y, bz = _capsuleB[i].z,
+                    friction = i < jawCount ? jawFriction : 0f,
+                    prevAx = prevA.x, prevAy = prevA.y, prevAz = prevA.z,
+                    prevBx = prevB.x, prevBy = prevB.y, prevBz = prevB.z
+                };
+                float margin = collisionMargin + _capsuleR[i];
+                Vector3 pad = Vector3.one * margin;
+                min = Vector3.Min(min, Vector3.Min(_capsuleA[i], _capsuleB[i]) - pad);
+                max = Vector3.Max(max, Vector3.Max(_capsuleA[i], _capsuleB[i]) + pad);
+                _lastCapsuleA[i] = _capsuleA[i];
+                _lastCapsuleB[i] = _capsuleB[i];
+            }
+            _lastCapsuleCount = capsuleCount;
+            _hasPrevCapsules = true;
+            _prevToolPos = _toolPos;
+            if (capsuleCount == 0)
+            {
+                CudaToolInputStatus = $"No collision capsules were built (upper={upperAdded}, lower={lowerAdded}, shaft={includeShaftCollision}).";
+                return false;
+            }
+
+            // The CUDA path builds the same capsules as the legacy upload path. Keep the
+            // existing in-game diagnostics truthful even when legacy contact is disabled.
+            _dbgCapsuleCount = capsuleCount;
+            _dbgUpperCapsuleCount = upperAdded;
+            _dbgLowerCapsuleCount = lowerAdded;
+            _dbgBBoxMin = min;
+            _dbgBBoxMax = max;
+            for (int i = 0; i < capsuleCount; ++i)
+            {
+                _dbgCapsuleA[i] = _capsuleA[i];
+                _dbgCapsuleB[i] = _capsuleB[i];
+                _dbgCapsuleR[i] = _capsuleR[i];
+            }
+            LastCudaToolCapsuleCount = capsuleCount;
+
+            jawBounds = new Bounds((min + max) * 0.5f, max - min);
+            frameCenter = jawBounds.center;
+            axisW = (toolRot * (_pivotLocal - _tipLocal)).normalized;
+            Quaternion jawMountRot = Quaternion.AngleAxis(jawRollAngle, Vector3.forward);
+            axisU = Vector3.ProjectOnPlane(toolRot * (jawMountRot * Vector3.right), axisW).normalized;
+            if (axisU.sqrMagnitude < 1e-8f)
+                axisU = Vector3.ProjectOnPlane(toolRot * Vector3.up, axisW).normalized;
+            axisV = Vector3.Cross(axisW, axisU).normalized;
+            CudaToolInputStatus = $"Built {capsuleCount} CUDA capsules (upper={upperAdded}, lower={lowerAdded}, shaft={includeShaftCollision}).";
             return true;
         }
 

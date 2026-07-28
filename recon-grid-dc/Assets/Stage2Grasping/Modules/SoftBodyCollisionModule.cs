@@ -1,5 +1,6 @@
 using ReconGridDC.Stage1TetPhysics.Core;
 using ReconGridDC.Stage1TetPhysics.Physics;
+using ReconGridDC.Stage1TetPhysics;
 using UnityEngine;
 
 namespace ReconGridDC.Stage2Grasping.Modules
@@ -29,11 +30,13 @@ namespace ReconGridDC.Stage2Grasping.Modules
 
         TetMeshData _data;
         XPBDSolverGPU _solver;
+        CudaOrganContextBridge _cudaBridge;
 
         void Awake()
         {
             if (graspingModule == null)
                 graspingModule = GetComponent<SoftBodyGraspingModule>();
+            _cudaBridge = GetComponent<CudaOrganContextBridge>();
         }
 
         public void Initialize(TetMeshData data, XPBDSolverGPU solver)
@@ -65,6 +68,21 @@ namespace ReconGridDC.Stage2Grasping.Modules
             IsSolvingToolContact = false;
             if (_solver == null || _data == null)
                 return;
+
+            if (_cudaBridge != null && _cudaBridge.IsCudaToolContactDriverActive)
+            {
+                // Phase 3 is exclusive only after a valid CUDA packet has actually been
+                // accepted. Otherwise preserve the proven Stage-2 Unity contact path.
+                bool cudaPacketAccepted = graspingModule != null && graspingModule.IsActive &&
+                    _cudaBridge.SubmitCudaToolInput(graspingModule.gripperTool, this, Time.fixedDeltaTime);
+                if (cudaPacketAccepted)
+                {
+                    _solver.ToolContactEnabled = false;
+                    _solver.ClearToolCollisionParams();
+                    IsSolvingToolContact = true;
+                    return;
+                }
+            }
 
             _solver.UseToolContactCandidateCulling = useToolContactCandidateCulling;
             if (graspingModule == null || !graspingModule.IsActive)

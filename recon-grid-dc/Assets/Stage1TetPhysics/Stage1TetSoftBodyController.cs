@@ -105,21 +105,50 @@ namespace ReconGridDC.Stage1TetPhysics
             if (!_ready || !simulationEnabled || pausePhysics || _solver == null)
                 return;
 
+            CudaOrganContextBridge cudaBridge = GetComponent<CudaOrganContextBridge>();
+            if (cudaBridge != null && cudaBridge.IsCudaDriverActive)
+            {
+                // Submit the compact phase-3 gripper packet before selecting this fixed
+                // step's writer. If it fails, collision falls through to the legacy route.
+                if (cudaBridge.IsCudaToolContactDriverActive)
+                    BeforeSolverStep?.Invoke(_data, _solver, _visualizer);
+                if (cudaBridge.ShouldUseCudaDriverThisFixedStep)
+                {
+                    cudaBridge.StepCudaXpbd(Time.fixedDeltaTime);
+                    if (cudaBridge.PublishCudaPositions(_data))
+                    {
+                        _visualizer.Refresh();
+                        AfterSolverStep?.Invoke(_data, _solver, _visualizer);
+                    }
+                    UpdateGroundPlane();
+                    return;
+                }
+            }
+
             _solver.NumSubSteps = Mathf.Max(1, numSubSteps);
             _solver.EdgeCompliance = Mathf.Max(0f, edgeCompliance);
             _solver.Damping = Mathf.Clamp01(damping);
             _solver.Gravity = enableGravity ? new Vector3(0f, gravityY, 0f) : Vector3.zero;
             _solver.GroundY = groundY;
             BeforeSolverStep?.Invoke(_data, _solver, _visualizer);
+            // Comparison mode still advances its diagnostic CUDA mirror. A rejected
+            // phase-3 tool packet must not advance the CUDA driver behind legacy contact.
+            if (cudaBridge == null || !cudaBridge.IsCudaDriverActive)
+                cudaBridge?.StepCudaXpbd(Time.fixedDeltaTime);
             _solver.Step(Time.fixedDeltaTime);
 
-            if (useAsyncPositionReadback)
+            // Read-only CUDA validation must compare matching fixed-step positions. Normal
+            // runtime paths retain the existing asynchronous Unity readback behavior.
+            if (cudaBridge != null && cudaBridge.RequiresSynchronousUnityReadback)
+                _solver.ReadbackPositions(_data);
+            else if (useAsyncPositionReadback)
                 _solver.RequestPositionReadback(_data);
             else
                 _solver.ReadbackPositions(_data);
 
             _visualizer.Refresh();
             AfterSolverStep?.Invoke(_data, _solver, _visualizer);
+            cudaBridge?.CompareCudaWithUnity(_data);
             UpdateGroundPlane();
         }
 

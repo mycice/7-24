@@ -3,10 +3,21 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using ReconGridDC.Stage1TetPhysics.Core;
+using ReconGridDC.Stage2Grasping.Grasping;
+using ReconGridDC.Stage2Grasping.Modules;
 using UnityEngine;
 
 namespace ReconGridDC.Stage1TetPhysics
 {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CudaToolCapsule
+    {
+        public float ax, ay, az, radius;
+        public float bx, by, bz, friction;
+        public float prevAx, prevAy, prevAz, unused0;
+        public float prevBx, prevBy, prevBz, unused1;
+    }
+
     /// <summary>
     /// CUDA migration phase 1 only: owns a native, static-data mirror of this tetrahedral organ.
     /// The existing Unity XPBD solver remains the sole runtime driver until phase 2 explicitly
@@ -18,6 +29,14 @@ namespace ReconGridDC.Stage1TetPhysics
     public sealed class CudaOrganContextBridge : MonoBehaviour
     {
         const string Dll = "LiverCudaSim";
+
+        public enum CudaXpbdMode
+        {
+            Disabled,
+            ReadOnlyComparison,
+            CudaDriverIsolated,
+            CudaDriverWithTemporaryPublish
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         struct OrganContextInitDesc
@@ -50,6 +69,67 @@ namespace ReconGridDC.Stage1TetPhysics
             public float validationKernelMilliseconds;
             public ulong restPositionHash;
             public ulong topologyHash;
+            public ulong dynamicDeviceBytes;
+            public ulong xpbdStepCount;
+            public float lastXpbdMilliseconds;
+            public float totalXpbdMilliseconds;
+            public int lastNanCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct OrganContextXpbdParams
+        {
+            public int numSubSteps;
+            public int constraintIterations;
+            public float edgeCompliance;
+            public float youngsModulus;
+            public float poissonsRatio;
+            public float damping;
+            public float gravityX;
+            public float gravityY;
+            public float gravityZ;
+            public float groundY;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct OrganContextComparisonStatsNative
+        {
+            public int particleCount;
+            public int cudaNanCount;
+            public float maxError;
+            public float rmsError;
+            public float centroidError;
+            public float bboxMinError;
+            public float bboxMaxError;
+            public float bboxExtentError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct OrganContextToolContactParamsNative
+        {
+            public int capsuleCount, contactEnabled, keepContactActiveWhenIdle, useCandidateCulling;
+            public int contactIterations, couplingPasses, graspRequest, releaseRequest;
+            public float contactDistance, contactCompliance, tangentialFriction, tangentialDamping;
+            public float candidatePadding, graspHeight, graspCoreRadius, graspFormDuration;
+            public float graspBoundsMinX, graspBoundsMinY, graspBoundsMinZ;
+            public float graspBoundsMaxX, graspBoundsMaxY, graspBoundsMaxZ;
+            public float frameCenterX, frameCenterY, frameCenterZ;
+            public float axisUX, axisUY, axisUZ;
+            public float axisVX, axisVY, axisVZ;
+            public float axisWX, axisWY, axisWZ;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct OrganContextToolContactStatsNative
+        {
+            public int activeCandidates, contactCount;
+            public float maxContactDepth;
+            public int surfaceCandidateTriangles, surfaceContactTriangles;
+            public float surfaceMaxContactDepth;
+            public int graspedParticleCount;
+            public ulong dispatchCount, toolUploadBytes, toolUploadOperations;
+            public float lastToolMilliseconds, totalToolMilliseconds;
+            public int lastToolError;
         }
 
         [DllImport(Dll)] static extern int LCS_OrganCreate(out uint handle);
@@ -60,6 +140,19 @@ namespace ReconGridDC.Stage1TetPhysics
             float[] restVolumes, int[] tetActive, int[] surfaceTriangleIds3,
             int[] edgeConstraintIds2, float[] edgeRestLengths);
         [DllImport(Dll)] static extern int LCS_OrganGetStats(uint handle, out OrganContextStatsNative stats);
+        [DllImport(Dll)] static extern int LCS_OrganXpbdInitialize(
+            uint handle, float[] initialPositions3,
+            int edgeColorCount, int[] edgeColorOffsets, int[] edgeColorCounts, int[] edgeColorFlat,
+            int tetColorCount, int[] tetColorOffsets, int[] tetColorCounts, int[] tetColorFlat,
+            int surfaceColorCount, int[] surfaceColorOffsets, int[] surfaceColorCounts, int[] surfaceColorFlat);
+        [DllImport(Dll)] static extern int LCS_OrganXpbdStep(uint handle, float dt, ref OrganContextXpbdParams parameters);
+        [DllImport(Dll)] static extern int LCS_OrganXpbdComparePositions(
+            uint handle, float[] unityPositions3, int particleCount,
+            out OrganContextComparisonStatsNative comparison);
+        [DllImport(Dll)] static extern int LCS_OrganXpbdGetPositions(uint handle, float[] positions3, int particleCount);
+        [DllImport(Dll)] static extern int LCS_OrganToolStep(uint handle, float dt, CudaToolCapsule[] capsules,
+            ref OrganContextToolContactParamsNative parameters);
+        [DllImport(Dll)] static extern int LCS_OrganToolGetStats(uint handle, out OrganContextToolContactStatsNative stats);
 
         [Header("CUDA Migration Phase 1")]
         [Tooltip("Creates an isolated native CUDA organ context and uploads immutable tetrahedral data once. It does not drive XPBD, gripper contact, Tet-to-Grid, cutting, or rendering.")]
@@ -69,6 +162,22 @@ namespace ReconGridDC.Stage1TetPhysics
         [Tooltip("Requests a low-frequency native stats snapshot for Inspector diagnostics. This does not read back organ vertex arrays.")]
         public bool sampleNativeStats = true;
         [Min(0.1f)] public float statsSampleIntervalSeconds = 1f;
+
+        [Header("CUDA Migration Phase 2 - XPBD")]
+        [Tooltip("Enables the independent CUDA tetrahedral XPBD state inside this organ context. Disabled preserves the exact phase-1 behavior.")]
+        public bool enableCudaXpbd;
+        [Tooltip("Read Only Comparison: Unity XPBD remains the only writer. CUDA Driver Isolated: CUDA does not publish positions. CUDA Driver With Temporary Publish is the phase-3 visual verification path and reads positions back once per physics step for legacy rendering and Stage 3.")]
+        public CudaXpbdMode cudaXpbdMode = CudaXpbdMode.Disabled;
+        [Min(1)] [Tooltip("Constraint passes per CUDA XPBD substep. Keep at 1 to match the current Unity solver.")]
+        public int cudaConstraintIterations = 1;
+        [Min(0.05f)] [Tooltip("Minimum time between explicit CUDA-versus-Unity position comparisons. Comparison mode alone performs a complete CUDA position readback.")]
+        public float comparisonIntervalSeconds = 1f;
+
+        [Header("CUDA Migration Phase 3 - Tool Contact")]
+        [Tooltip("Disabled preserves the existing CPU grasp and Unity Compute contact route. CUDA Driver modes with this enabled use CUDA-only contact and grasp constraints.")]
+        public bool enableCudaToolContact;
+        [Tooltip("CUDA contact requires a CUDA driver mode. The temporary publish mode is intended only for visual phase-3 verification and is not the final zero-readback path.")]
+        public bool temporaryPublishCudaPositions = true;
 
         [Header("Diagnostics (runtime)")]
         [SerializeField] uint contextHandle;
@@ -87,10 +196,72 @@ namespace ReconGridDC.Stage1TetPhysics
         [SerializeField] string restPositionHash;
         [SerializeField] string topologyHash;
         [SerializeField] int runtimeStatsSamples;
+        [SerializeField] bool cudaXpbdReady;
+        [SerializeField] string cudaXpbdStatus = "CUDA XPBD is disabled.";
+        [SerializeField] int cudaEdgeColorCount;
+        [SerializeField] int cudaTetColorCount;
+        [SerializeField] ulong cudaDynamicDeviceBytes;
+        [SerializeField] ulong cudaXpbdStepCount;
+        [SerializeField] float cudaLastXpbdMilliseconds;
+        [SerializeField] float cudaTotalXpbdMilliseconds;
+        [SerializeField] int cudaNanCount;
+        [SerializeField] int comparisonSamples;
+        [SerializeField] int comparisonParticleCount;
+        [SerializeField] float positionMaxError;
+        [SerializeField] float positionRmsError;
+        [SerializeField] float centroidError;
+        [SerializeField] float bboxMinError;
+        [SerializeField] float bboxMaxError;
+        [SerializeField] float bboxExtentError;
+        [SerializeField] bool cudaToolContactActive;
+        [SerializeField] string cudaToolContactStatus = "CUDA tool contact is disabled.";
+        [SerializeField] int cudaToolActiveCandidates;
+        [SerializeField] int cudaToolContactCount;
+        [SerializeField] float cudaToolMaxContactDepth;
+        [SerializeField] int cudaToolSurfaceCandidateTriangles;
+        [SerializeField] int cudaToolSurfaceContactTriangles;
+        [SerializeField] float cudaToolSurfaceMaxContactDepth;
+        [SerializeField] int cudaToolGraspedParticleCount;
+        [SerializeField] ulong cudaToolDispatchCount;
+        [SerializeField] ulong cudaToolUploadBytes;
+        [SerializeField] ulong cudaToolUploadOperations;
+        [SerializeField] float cudaToolLastMilliseconds;
+        [SerializeField] float cudaToolTotalMilliseconds;
+        [SerializeField] int cudaToolLastError;
 
         Stage1TetSoftBodyController _softBody;
         float _nextStatsSampleTime;
+        float _nextToolStatsSampleTime;
+        float _nextComparisonTime;
         bool _createAttempted;
+        readonly CudaToolCapsule[] _toolCapsules = new CudaToolCapsule[12];
+        float[] _temporaryPositionReadback;
+
+        public bool IsCudaDriverActive =>
+            contextReady && cudaXpbdReady && enableCudaXpbd &&
+            (cudaXpbdMode == CudaXpbdMode.CudaDriverIsolated ||
+             cudaXpbdMode == CudaXpbdMode.CudaDriverWithTemporaryPublish);
+
+        public bool IsCudaToolContactDriverActive =>
+            IsCudaDriverActive && enableCudaToolContact;
+
+        public bool CudaToolContactActive => cudaToolContactActive;
+
+        // In phase 3, CUDA may become the writer only after SoftBodyCollisionModule has
+        // successfully submitted the gripper packet for this fixed step. This prevents a
+        // failed packet from silently replacing the established Unity collision route.
+        public bool ShouldUseCudaDriverThisFixedStep =>
+            IsCudaDriverActive && (!IsCudaToolContactDriverActive || cudaToolContactActive);
+
+        public bool RequiresTemporaryCudaPositionPublish =>
+            IsCudaToolContactDriverActive && temporaryPublishCudaPositions &&
+            cudaXpbdMode == CudaXpbdMode.CudaDriverWithTemporaryPublish;
+
+        // A comparison is meaningful only when Unity positions belong to the same fixed
+        // step as the CUDA state. This is deliberately limited to the diagnostic mode.
+        public bool RequiresSynchronousUnityReadback =>
+            contextReady && cudaXpbdReady && enableCudaXpbd &&
+            cudaXpbdMode == CudaXpbdMode.ReadOnlyComparison;
 
         void Awake()
         {
@@ -119,6 +290,11 @@ namespace ReconGridDC.Stage1TetPhysics
 
             _nextStatsSampleTime = Time.unscaledTime + Mathf.Max(0.1f, statsSampleIntervalSeconds);
             ReadStats(false);
+            if (IsCudaToolContactDriverActive && Time.unscaledTime >= _nextToolStatsSampleTime)
+            {
+                _nextToolStatsSampleTime = Time.unscaledTime + Mathf.Max(0.1f, statsSampleIntervalSeconds);
+                ReadToolStats();
+            }
         }
 
         void OnDisable() => DestroyContext();
@@ -171,7 +347,8 @@ namespace ReconGridDC.Stage1TetPhysics
                     damping = _softBody.damping
                 };
                 lastNativeError = LCS_OrganInitialize(contextHandle, ref desc,
-                    Flatten(data.RestPositions, data.NumParticles), data.TetIds, data.InvMass,
+                    Flatten(data.RestPositions, data.NumParticles), data.TetIds,
+                    BuildUnityEquivalentInverseMass(data, _softBody.density),
                     data.RestVolumes, tetActive, data.SurfaceTriIds, edgeIds, edgeLengths);
                 if (lastNativeError != 0)
                 {
@@ -181,7 +358,10 @@ namespace ReconGridDC.Stage1TetPhysics
                 }
 
                 contextReady = true;
-                status = "Static tetrahedral data uploaded. Legacy Unity XPBD remains the active runtime driver.";
+                InitializeCudaXpbd(data, edgeIds);
+                status = cudaXpbdReady
+                    ? "Static and CUDA XPBD data uploaded. Unity XPBD remains the active runtime driver unless CUDA Driver Isolated is selected."
+                    : "Static tetrahedral data uploaded. Legacy Unity XPBD remains the active runtime driver.";
                 ReadStats(true);
             }
             catch (Exception exception)
@@ -215,6 +395,11 @@ namespace ReconGridDC.Stage1TetPhysics
             validationKernelMilliseconds = stats.validationKernelMilliseconds;
             restPositionHash = ToHex(stats.restPositionHash);
             topologyHash = ToHex(stats.topologyHash);
+            cudaDynamicDeviceBytes = stats.dynamicDeviceBytes;
+            cudaXpbdStepCount = stats.xpbdStepCount;
+            cudaLastXpbdMilliseconds = stats.lastXpbdMilliseconds;
+            cudaTotalXpbdMilliseconds = stats.totalXpbdMilliseconds;
+            cudaNanCount = stats.lastNanCount;
             runtimeStatsSamples++;
 
             if (log && logContextDiagnostics)
@@ -236,6 +421,212 @@ namespace ReconGridDC.Stage1TetPhysics
                 Debug.LogWarning($"[CudaOrganContext] LCS_OrganDestroy({contextHandle}) returned {rc}.", this);
             contextHandle = 0;
             contextReady = false;
+            cudaXpbdReady = false;
+        }
+
+        void InitializeCudaXpbd(TetMeshData data, int[] edgeIds)
+        {
+            cudaXpbdReady = false;
+            if (!enableCudaXpbd || cudaXpbdMode == CudaXpbdMode.Disabled)
+            {
+                cudaXpbdStatus = "CUDA XPBD is disabled; phase-1 static context remains active.";
+                return;
+            }
+
+            try
+            {
+                BuildEdgeColorGroups(edgeIds, data.NumParticles,
+                    out int[] edgeOffsets, out int[] edgeCounts, out int[] edgeFlat);
+                BuildTetColorGroups(data,
+                    out int[] tetOffsets, out int[] tetCounts, out int[] tetFlat);
+                BuildSurfaceTriangleColorGroups(data,
+                    out int[] surfaceOffsets, out int[] surfaceCounts, out int[] surfaceFlat);
+                cudaEdgeColorCount = edgeCounts.Length;
+                cudaTetColorCount = tetCounts.Length;
+                lastNativeError = LCS_OrganXpbdInitialize(contextHandle,
+                    Flatten(data.Positions, data.NumParticles),
+                    edgeCounts.Length, edgeOffsets, edgeCounts, edgeFlat,
+                    tetCounts.Length, tetOffsets, tetCounts, tetFlat,
+                    surfaceCounts.Length, surfaceOffsets, surfaceCounts, surfaceFlat);
+                cudaXpbdReady = lastNativeError == 0;
+                cudaXpbdStatus = cudaXpbdReady
+                    ? "CUDA XPBD initialized. Read Only Comparison does not write the Unity organ. CUDA Driver Isolated does not publish positions; Temporary Publish is reserved for phase-3 visual verification."
+                    : $"LCS_OrganXpbdInitialize failed ({lastNativeError}). Unity XPBD remains active.";
+            }
+            catch (EntryPointNotFoundException)
+            {
+                cudaXpbdStatus = "The deployed LiverCudaSim.dll does not contain the phase-2 CUDA XPBD API. Rebuild and deploy the DLL.";
+            }
+            catch (Exception exception)
+            {
+                cudaXpbdStatus = $"CUDA XPBD setup failed: {exception.Message}";
+                Debug.LogError($"[CudaOrganContext] {cudaXpbdStatus}", this);
+            }
+        }
+
+        public void StepCudaXpbd(float dt)
+        {
+            if (!contextReady || !cudaXpbdReady || !enableCudaXpbd || cudaXpbdMode == CudaXpbdMode.Disabled)
+                return;
+
+            Vector3 gravity = _softBody.enableGravity
+                ? new Vector3(0f, _softBody.gravityY, 0f)
+                : Vector3.zero;
+            OrganContextXpbdParams parameters = new OrganContextXpbdParams
+            {
+                numSubSteps = Mathf.Max(1, _softBody.numSubSteps),
+                constraintIterations = Mathf.Max(1, cudaConstraintIterations),
+                edgeCompliance = Mathf.Max(0f, _softBody.edgeCompliance),
+                youngsModulus = Mathf.Max(1f, _softBody.youngsModulus),
+                poissonsRatio = Mathf.Clamp(_softBody.poissonsRatio, 0.01f, 0.499f),
+                damping = Mathf.Clamp01(_softBody.damping),
+                gravityX = gravity.x,
+                gravityY = gravity.y,
+                gravityZ = gravity.z,
+                groundY = _softBody.groundY
+            };
+            lastNativeError = LCS_OrganXpbdStep(contextHandle, dt, ref parameters);
+            if (lastNativeError != 0)
+            {
+                cudaXpbdStatus = $"LCS_OrganXpbdStep failed ({lastNativeError}). Unity XPBD remains available as the fallback.";
+                return;
+            }
+
+            if (cudaXpbdMode == CudaXpbdMode.CudaDriverIsolated)
+                cudaXpbdStatus = "CUDA Driver Isolated is active. No complete CUDA-to-CPU tet position readback is performed; legacy rendering, Stage 3, cutter, and gripper are intentionally not driven.";
+        }
+
+        // Returns true only when this fixed step has a valid CUDA contact packet. Callers
+        // must retain the legacy contact path when this is false.
+        public bool SubmitCudaToolInput(GripperTool gripper, SoftBodyCollisionModule settings, float dt)
+        {
+            cudaToolContactActive = false;
+            if (!IsCudaToolContactDriverActive || gripper == null || settings == null)
+            {
+                cudaToolContactStatus = "CUDA tool contact is unavailable because the driver, gripper, or collision settings are missing.";
+                return false;
+            }
+
+            if (!gripper.TryBuildCudaToolInput(_toolCapsules, out int capsuleCount, out Bounds bounds,
+                    out Vector3 center, out Vector3 axisU, out Vector3 axisV, out Vector3 axisW))
+            {
+                cudaToolContactStatus = $"CUDA tool input was not submitted: {gripper.CudaToolInputStatus} Legacy Unity contact remains active for this step.";
+                return false;
+            }
+
+            OrganContextToolContactParamsNative parameters = new OrganContextToolContactParamsNative
+            {
+                capsuleCount = capsuleCount,
+                contactEnabled = (settings.keepContactActiveWhenIdle || gripper.WantsToolContact) ? 1 : 0,
+                keepContactActiveWhenIdle = settings.keepContactActiveWhenIdle ? 1 : 0,
+                useCandidateCulling = settings.useToolContactCandidateCulling ? 1 : 0,
+                contactIterations = Mathf.Max(1, settings.toolContactIterations),
+                couplingPasses = Mathf.Max(1, settings.toolContactCouplingPasses),
+                graspRequest = gripper.WantsClosedGrasp ? 1 : 0,
+                releaseRequest = gripper.WantsClosedGrasp ? 0 : 1,
+                contactDistance = Mathf.Max(0f, settings.toolContactDistance),
+                contactCompliance = Mathf.Max(0f, settings.toolContactCompliance),
+                tangentialFriction = Mathf.Clamp01(settings.toolContactTangentialFriction),
+                tangentialDamping = Mathf.Clamp01(settings.toolContactTangentialDamping),
+                candidatePadding = Mathf.Max(0f, settings.toolContactCandidatePadding),
+                graspHeight = Mathf.Max(0f, gripper.gaussianHeight),
+                graspCoreRadius = Mathf.Clamp(gripper.gaussianHardCoreRadius, 0.1f, 1f),
+                graspFormDuration = Mathf.Max(0f, gripper.gaussianFormDuration),
+                graspBoundsMinX = bounds.min.x, graspBoundsMinY = bounds.min.y, graspBoundsMinZ = bounds.min.z,
+                graspBoundsMaxX = bounds.max.x, graspBoundsMaxY = bounds.max.y, graspBoundsMaxZ = bounds.max.z,
+                frameCenterX = center.x, frameCenterY = center.y, frameCenterZ = center.z,
+                axisUX = axisU.x, axisUY = axisU.y, axisUZ = axisU.z,
+                axisVX = axisV.x, axisVY = axisV.y, axisVZ = axisV.z,
+                axisWX = axisW.x, axisWY = axisW.y, axisWZ = axisW.z
+            };
+            lastNativeError = LCS_OrganToolStep(contextHandle, dt, _toolCapsules, ref parameters);
+            if (lastNativeError != 0)
+            {
+                cudaToolContactStatus = $"LCS_OrganToolStep failed ({lastNativeError}). Legacy Unity contact remains active for this step.";
+                return false;
+            }
+            cudaToolContactActive = true;
+            cudaToolContactStatus = $"CUDA tool packet uploaded ({capsuleCount} capsules). Contact and grasp constraints execute inside the following CUDA XPBD step.";
+            return true;
+        }
+
+        public bool PublishCudaPositions(TetMeshData data)
+        {
+            if (!RequiresTemporaryCudaPositionPublish || data == null)
+                return false;
+            int count = data.NumParticles;
+            if (_temporaryPositionReadback == null || _temporaryPositionReadback.Length != count * 3)
+                _temporaryPositionReadback = new float[count * 3];
+            lastNativeError = LCS_OrganXpbdGetPositions(contextHandle, _temporaryPositionReadback, count);
+            if (lastNativeError != 0)
+            {
+                cudaXpbdStatus = $"LCS_OrganXpbdGetPositions failed ({lastNativeError}).";
+                return false;
+            }
+            for (int i = 0; i < count; ++i)
+            {
+                Vector3 position = new Vector3(_temporaryPositionReadback[i * 3], _temporaryPositionReadback[i * 3 + 1], _temporaryPositionReadback[i * 3 + 2]);
+                data.Positions[i] = position;
+                data.PrevPositions[i] = position;
+                data.Velocities[i] = Vector3.zero;
+            }
+            cudaXpbdStatus = "CUDA XPBD and CUDA tool contact are active. Temporary Publish performs one full position readback per fixed step for phase-3 visual verification.";
+            return true;
+        }
+
+        void ReadToolStats()
+        {
+            lastNativeError = LCS_OrganToolGetStats(contextHandle, out OrganContextToolContactStatsNative tool);
+            if (lastNativeError != 0)
+            {
+                cudaToolContactStatus = $"LCS_OrganToolGetStats failed ({lastNativeError}).";
+                return;
+            }
+            cudaToolActiveCandidates = tool.activeCandidates;
+            cudaToolContactCount = tool.contactCount;
+            cudaToolMaxContactDepth = tool.maxContactDepth;
+            cudaToolSurfaceCandidateTriangles = tool.surfaceCandidateTriangles;
+            cudaToolSurfaceContactTriangles = tool.surfaceContactTriangles;
+            cudaToolSurfaceMaxContactDepth = tool.surfaceMaxContactDepth;
+            cudaToolGraspedParticleCount = tool.graspedParticleCount;
+            cudaToolDispatchCount = tool.dispatchCount;
+            cudaToolUploadBytes = tool.toolUploadBytes;
+            cudaToolUploadOperations = tool.toolUploadOperations;
+            cudaToolLastMilliseconds = tool.lastToolMilliseconds;
+            cudaToolTotalMilliseconds = tool.totalToolMilliseconds;
+            cudaToolLastError = tool.lastToolError;
+            cudaToolContactStatus = "CUDA tool diagnostics sampled. Contact and grasp constraints are resident in CudaOrganContext.";
+        }
+
+        public void CompareCudaWithUnity(TetMeshData data)
+        {
+            if (!contextReady || !cudaXpbdReady || !enableCudaXpbd ||
+                cudaXpbdMode != CudaXpbdMode.ReadOnlyComparison || data == null ||
+                Time.unscaledTime < _nextComparisonTime)
+                return;
+
+            _nextComparisonTime = Time.unscaledTime + Mathf.Max(0.05f, comparisonIntervalSeconds);
+            lastNativeError = LCS_OrganXpbdComparePositions(contextHandle,
+                Flatten(data.Positions, data.NumParticles), data.NumParticles,
+                out OrganContextComparisonStatsNative comparison);
+            if (lastNativeError != 0)
+            {
+                cudaXpbdStatus = $"LCS_OrganXpbdComparePositions failed ({lastNativeError}).";
+                return;
+            }
+
+            comparisonSamples++;
+            comparisonParticleCount = comparison.particleCount;
+            cudaNanCount = comparison.cudaNanCount;
+            positionMaxError = comparison.maxError;
+            positionRmsError = comparison.rmsError;
+            centroidError = comparison.centroidError;
+            bboxMinError = comparison.bboxMinError;
+            bboxMaxError = comparison.bboxMaxError;
+            bboxExtentError = comparison.bboxExtentError;
+            cudaXpbdStatus = comparison.cudaNanCount == 0
+                ? "Read Only Comparison is active. Unity XPBD is the sole writer; CUDA values are diagnostic only."
+                : $"Read Only Comparison detected {comparison.cudaNanCount} CUDA NaN particle(s).";
         }
 
         static int[] ConvertActiveFlags(bool[] flags, int count)
@@ -256,6 +647,38 @@ namespace ReconGridDC.Stage1TetPhysics
                 result[i * 3 + 1] = value.y;
                 result[i * 3 + 2] = value.z;
             }
+            return result;
+        }
+
+        static float[] BuildUnityEquivalentInverseMass(TetMeshData data, float density)
+        {
+            float[] mass = new float[data.NumParticles];
+            for (int tet = 0; tet < data.NumTets; tet++)
+            {
+                if (!data.TetActive[tet])
+                    continue;
+                float contribution = Mathf.Max(0f, density) * data.RestVolumes[tet] * 0.25f;
+                int baseIndex = tet * 4;
+                mass[data.TetIds[baseIndex]] += contribution;
+                mass[data.TetIds[baseIndex + 1]] += contribution;
+                mass[data.TetIds[baseIndex + 2]] += contribution;
+                mass[data.TetIds[baseIndex + 3]] += contribution;
+            }
+
+            float sum = 0f;
+            int count = 0;
+            for (int i = 0; i < data.NumParticles; i++)
+            {
+                if (data.InvMass[i] != 0f && mass[i] > 1e-12f)
+                {
+                    sum += mass[i];
+                    count++;
+                }
+            }
+            float massFloor = (count > 0 ? sum / count : 1f) * 0.1f;
+            float[] result = new float[data.NumParticles];
+            for (int i = 0; i < data.NumParticles; i++)
+                result[i] = data.InvMass[i] == 0f ? 0f : 1f / Mathf.Max(mass[i], massFloor);
             return result;
         }
 
@@ -284,6 +707,123 @@ namespace ReconGridDC.Stage1TetPhysics
             }
             edgeIds = ids.ToArray();
             edgeLengths = lengths.ToArray();
+        }
+
+        static void BuildTetColorGroups(TetMeshData data,
+            out int[] offsets, out int[] counts, out int[] flat)
+        {
+            List<int[]> groups = GraphColoring.Compute(
+                data.TetIds, data.NumTets, data.NumParticles, data.TetActive);
+            FlattenGroups(groups, out offsets, out counts, out flat);
+        }
+
+        static void BuildEdgeColorGroups(int[] edgeIds, int particleCount,
+            out int[] offsets, out int[] counts, out int[] flat)
+        {
+            int edgeCount = edgeIds.Length / 2;
+            int[] color = new int[edgeCount];
+            Array.Fill(color, -1);
+            var incident = new List<int>[particleCount];
+            for (int particle = 0; particle < particleCount; particle++)
+                incident[particle] = new List<int>(8);
+            for (int edge = 0; edge < edgeCount; edge++)
+            {
+                incident[edgeIds[edge * 2]].Add(edge);
+                incident[edgeIds[edge * 2 + 1]].Add(edge);
+            }
+
+            int maxColor = -1;
+            for (int edge = 0; edge < edgeCount; edge++)
+            {
+                var used = new HashSet<int>();
+                foreach (int neighbour in incident[edgeIds[edge * 2]])
+                    if (color[neighbour] >= 0) used.Add(color[neighbour]);
+                foreach (int neighbour in incident[edgeIds[edge * 2 + 1]])
+                    if (color[neighbour] >= 0) used.Add(color[neighbour]);
+                int assigned = 0;
+                while (used.Contains(assigned)) assigned++;
+                color[edge] = assigned;
+                maxColor = Mathf.Max(maxColor, assigned);
+            }
+
+            var groups = new List<int[]>(maxColor + 1);
+            for (int group = 0; group <= maxColor; group++)
+            {
+                var members = new List<int>();
+                for (int edge = 0; edge < edgeCount; edge++)
+                    if (color[edge] == group) members.Add(edge);
+                groups.Add(members.ToArray());
+            }
+            FlattenGroups(groups, out offsets, out counts, out flat);
+        }
+
+        // Triangles in one group never share a particle, so the CUDA contact kernel can
+        // update its three vertices without atomics or write races.
+        static void BuildSurfaceTriangleColorGroups(TetMeshData data,
+            out int[] offsets, out int[] counts, out int[] flat)
+        {
+            int triangleCount = data != null ? data.NumSurfaceTris : 0;
+            if (triangleCount <= 0 || data.SurfaceTriIds == null)
+            {
+                offsets = Array.Empty<int>();
+                counts = Array.Empty<int>();
+                flat = Array.Empty<int>();
+                return;
+            }
+
+            int[] color = new int[triangleCount];
+            Array.Fill(color, -1);
+            var incident = new List<int>[data.NumParticles];
+            for (int particle = 0; particle < incident.Length; particle++)
+                incident[particle] = new List<int>(8);
+            for (int triangle = 0; triangle < triangleCount; triangle++)
+            {
+                int baseIndex = triangle * 3;
+                incident[data.SurfaceTriIds[baseIndex]].Add(triangle);
+                incident[data.SurfaceTriIds[baseIndex + 1]].Add(triangle);
+                incident[data.SurfaceTriIds[baseIndex + 2]].Add(triangle);
+            }
+
+            int maxColor = -1;
+            for (int triangle = 0; triangle < triangleCount; triangle++)
+            {
+                var used = new HashSet<int>();
+                int baseIndex = triangle * 3;
+                for (int corner = 0; corner < 3; corner++)
+                    foreach (int neighbour in incident[data.SurfaceTriIds[baseIndex + corner]])
+                        if (color[neighbour] >= 0) used.Add(color[neighbour]);
+                int assigned = 0;
+                while (used.Contains(assigned)) assigned++;
+                color[triangle] = assigned;
+                maxColor = Mathf.Max(maxColor, assigned);
+            }
+
+            var groups = new List<int[]>(maxColor + 1);
+            for (int group = 0; group <= maxColor; group++)
+            {
+                var members = new List<int>();
+                for (int triangle = 0; triangle < triangleCount; triangle++)
+                    if (color[triangle] == group) members.Add(triangle);
+                groups.Add(members.ToArray());
+            }
+            FlattenGroups(groups, out offsets, out counts, out flat);
+        }
+
+        static void FlattenGroups(List<int[]> groups, out int[] offsets, out int[] counts, out int[] flat)
+        {
+            offsets = new int[groups.Count];
+            counts = new int[groups.Count];
+            int total = 0;
+            for (int group = 0; group < groups.Count; group++) total += groups[group].Length;
+            flat = new int[total];
+            int offset = 0;
+            for (int group = 0; group < groups.Count; group++)
+            {
+                offsets[group] = offset;
+                counts[group] = groups[group].Length;
+                Array.Copy(groups[group], 0, flat, offset, groups[group].Length);
+                offset += groups[group].Length;
+            }
         }
 
         static string ToHex(ulong value) => $"0x{value:X16}";
