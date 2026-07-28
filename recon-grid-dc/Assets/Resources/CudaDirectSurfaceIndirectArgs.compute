@@ -1,0 +1,13 @@
+#pragma kernel BuildIndirectArgs
+
+ByteAddressBuffer _CudaSurfaceVertexCount;
+RWStructuredBuffer<uint> _IndirectArgs;
+
+[numthreads(1, 1, 1)]
+void BuildIndirectArgs(uint3 id : SV_DispatchThreadID)
+{
+    _IndirectArgs[0] = _CudaSurfaceVertexCount.Load(0);
+    _IndirectArgs[1] = 1u;
+    _IndirectArgs[2] = 0u;
+    _IndirectArgs[3] = 0u;
+}

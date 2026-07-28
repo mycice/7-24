@@ -62,6 +62,8 @@ namespace ReconGridDC.Stage3Coupling
         [Header("Readback")]
         [Tooltip("Stage 3 forces synchronous tetrahedron position readback while active. This makes the update order deterministic, but can reduce frame rate.")]
         public bool forceSynchronousTetReadback = true;
+        [Tooltip("Default phase-4 path: evaluate the existing host-tet/barycentric map in CudaOrganContext. Falls back to the original CPU mapping when disabled or unavailable.")]
+        public bool preferCudaTetToGrid = true;
         [Tooltip("Logs mapping diagnostics whenever a new embedding is built.")]
         public bool logDiagnostics = true;
 
@@ -88,6 +90,7 @@ namespace ReconGridDC.Stage3Coupling
         [SerializeField] string gravitySafeCutStatus = "Waiting for embedding.";
         [SerializeField] int lastUploadFrame = -1;
         [SerializeField] string lastStatus = "Waiting for Stage 1 tetra body and CUDA liver.";
+        [SerializeField] bool cudaTetToGridActive;
 
         readonly Dictionary<Vector3Int, List<int>> _tetHash = new Dictionary<Vector3Int, List<int>>();
         readonly List<int> _candidateScratch = new List<int>();
@@ -167,12 +170,15 @@ namespace ReconGridDC.Stage3Coupling
             Unsubscribe();
             _subscribedController = tetSoftBody;
             _subscribedController.AfterSolverStep += OnTetSolverStep;
+            _subscribedController.AfterCudaSolverStep += OnCudaSolverStep;
         }
 
         void Unsubscribe()
         {
             if (_subscribedController != null)
                 _subscribedController.AfterSolverStep -= OnTetSolverStep;
+            if (_subscribedController != null)
+                _subscribedController.AfterCudaSolverStep -= OnCudaSolverStep;
             _subscribedController = null;
         }
 
@@ -189,6 +195,8 @@ namespace ReconGridDC.Stage3Coupling
                 lastStatus = "Showing the direct coarse tetrahedral physics organ; CUDA cutting display is paused.";
                 return;
             }
+            if (cudaTetToGridActive)
+                return;
             ApplyReadbackMode();
             UpdateGridPositions(data);
             if (cudaLiver.UploadExternalCornerPositions(_uploadPositions))
@@ -203,6 +211,30 @@ namespace ReconGridDC.Stage3Coupling
             {
                 cudaLiver.SetExternalGridDeformationActive(false);
                 lastStatus = "CUDA position upload failed; original CUDA grid physics remains active.";
+            }
+        }
+
+        void OnCudaSolverStep()
+        {
+            if (!synchronizationEnabled || !_embeddingReady || !cudaTetToGridActive || cudaLiver == null)
+                return;
+            if (organPresentation != OrganPresentationMode.DetailedCudaCuttableOrgan)
+            {
+                tetSoftBody.GetComponent<CudaOrganContextBridge>().SetGpuResidentTetToGridFrameActive(false);
+                return;
+            }
+            if (tetSoftBody.GetComponent<CudaOrganContextBridge>().UpdateCudaTetToGrid(enableLocalTetDeformation))
+            {
+                tetSoftBody.GetComponent<CudaOrganContextBridge>().SetGpuResidentTetToGridFrameActive(true);
+                cudaLiver.SetExternalGridDeformationActive(true);
+                lastUploadFrame = Time.frameCount;
+                lastStatus = "CUDA Tet-to-Grid updated the shared CUDA grid without tetrahedron or grid position readback.";
+            }
+            else
+            {
+                cudaTetToGridActive = false;
+                tetSoftBody.GetComponent<CudaOrganContextBridge>().SetGpuResidentTetToGridFrameActive(false);
+                lastStatus = "CUDA Tet-to-Grid update failed; CPU Stage 3 synchronization will be used on the next solver step.";
             }
         }
 
@@ -236,6 +268,7 @@ namespace ReconGridDC.Stage3Coupling
             ApplyPresentation();
             BuildSpatialHash(data);
             BuildCornerMappings(data);
+            ConfigureCudaTetToGrid();
             _embeddingReady = true;
             lastStatus = "Embedding ready. Waiting for the next tetrahedral physics step.";
 
@@ -246,6 +279,20 @@ namespace ReconGridDC.Stage3Coupling
                           $"projected active={projectedActiveCorners}, global fallback={fallbackActiveCorners}, inactive rest={inactiveRestCorners}, " +
                           $"hash cell={effectiveHostSearchCellSize:F4}.", this);
             }
+        }
+
+        void ConfigureCudaTetToGrid()
+        {
+            cudaTetToGridActive = false;
+            CudaOrganContextBridge bridge = tetSoftBody != null ? tetSoftBody.GetComponent<CudaOrganContextBridge>() : null;
+            if (!preferCudaTetToGrid || bridge == null || !bridge.CanUseCudaTetToGrid)
+                return;
+            cudaTetToGridActive = bridge.ConfigureCudaTetToGrid(_hostTetByCorner, _weightsByCorner,
+                _alignedGridRestCorners, _gridActiveMask, _tetRestCentroid);
+            bridge.SetGpuResidentTetToGridFrameActive(cudaTetToGridActive &&
+                                                       organPresentation == OrganPresentationMode.DetailedCudaCuttableOrgan);
+            if (cudaTetToGridActive)
+                RestoreReadbackMode();
         }
 
         void ApplyReadbackMode()
@@ -267,6 +314,12 @@ namespace ReconGridDC.Stage3Coupling
 
         void DisableExternalMode()
         {
+            if (tetSoftBody != null)
+            {
+                CudaOrganContextBridge bridge = tetSoftBody.GetComponent<CudaOrganContextBridge>();
+                if (bridge != null)
+                    bridge.SetGpuResidentTetToGridFrameActive(false);
+            }
             if (cudaLiver != null)
             {
                 cudaLiver.SetExternalGridDeformationActive(false);

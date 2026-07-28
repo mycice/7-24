@@ -53,6 +53,9 @@ namespace ReconGridDC.Stage1TetPhysics
         // Consumers that require the current CPU particle positions, such as the Stage 3
         // Tet-to-Grid bridge, run after a completed solver step and readback.
         public event Action<TetMeshData, XPBDSolverGPU, TetMeshVisualizer> AfterSolverStep;
+        // Phase 4 consumes the CUDA-resident tet state directly. No TetMeshData CPU positions
+        // are implied by this event.
+        public event Action AfterCudaSolverStep;
 
         TetMeshLoader _loader;
         TetMeshVisualizer _visualizer;
@@ -115,7 +118,10 @@ namespace ReconGridDC.Stage1TetPhysics
                 if (cudaBridge.ShouldUseCudaDriverThisFixedStep)
                 {
                     cudaBridge.StepCudaXpbd(Time.fixedDeltaTime);
-                    if (cudaBridge.PublishCudaPositions(_data))
+                    AfterCudaSolverStep?.Invoke();
+                    // Phase 4's CUDA Tet-to-Grid path has already consumed the CUDA tet state.
+                    // Do not read all particles back merely to drive the retired CPU bridge.
+                    if (!cudaBridge.ShouldSkipCpuPositionPublish && cudaBridge.PublishCudaPositions(_data))
                     {
                         _visualizer.Refresh();
                         AfterSolverStep?.Invoke(_data, _solver, _visualizer);

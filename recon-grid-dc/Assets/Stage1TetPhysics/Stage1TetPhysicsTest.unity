@@ -122,7 +122,7 @@ NavMeshSettings:
     debug:
       m_Flags: 0
   m_NavMeshData: {fileID: 0}
---- !u!1 &185592237
+--- !u!1 &666471924
 GameObject:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -130,8 +130,333 @@ GameObject:
   m_PrefabAsset: {fileID: 0}
   serializedVersion: 6
   m_Component:
-  - component: {fileID: 185592239}
-  - component: {fileID: 185592238}
+  - component: {fileID: 666471930}
+  - component: {fileID: 666471929}
+  - component: {fileID: 666471928}
+  - component: {fileID: 666471927}
+  - component: {fileID: 666471926}
+  - component: {fileID: 666471925}
+  - component: {fileID: 666471931}
+  m_Layer: 0
+  m_Name: Stage1 Tet Soft Body
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &666471925
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 666471924}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 24aafdb38858cf64abe0c97e95ea1a64, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  simulationEnabled: 1
+  tetMeshJson: Stage1TetPhysics/liver3_refined_1.json
+  density: 1050
+  meshScale: 1.5
+  initialOffset: {x: 0, y: 2.5, z: 0}
+  numSubSteps: 5
+  edgeCompliance: 0.00001
+  youngsModulus: 3000
+  poissonsRatio: 0.257
+  damping: 0.044
+  enableGravity: 1
+  gravityY: -9.81
+  groundY: -3
+  showGroundPlane: 1
+  groundColor: {r: 0.24, g: 0.34, b: 0.28, a: 1}
+  xpbdComputeShader: {fileID: 7200000, guid: e2b84108e34bbab4faa316a09e27cfa1, type: 3}
+  surfaceMaterial: {fileID: 0}
+  fallbackSurfaceColor: {r: 0.62, g: 0.18, b: 0.1, a: 1}
+  useAsyncPositionReadback: 1
+  pausePhysics: 0
+--- !u!114 &666471926
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 666471924}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 72aa8567796e7f248a6204cc3c14b6aa, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  meshLoader: {fileID: 666471927}
+  surfaceMaterial: {fileID: 0}
+  showWireframe: 0
+  smoothSharedPositionNormals: 1
+  normalMergeTolerance: 0.00075
+--- !u!114 &666471927
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 666471924}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: cfea069c541bf5f4b9bad81f82f6b99f, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  jsonFileName: Stage1TetPhysics/liver3_refined_1.json
+  autoLoad: 0
+  massDensity: 1050
+  meshScale: 1.5
+--- !u!23 &666471928
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 666471924}
+  m_Enabled: 1
+  m_CastShadows: 1
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 0}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &666471929
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 666471924}
+  m_Mesh: {fileID: 0}
+--- !u!4 &666471930
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 666471924}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_RootOrder: 2
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &666471931
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 666471924}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 331b5d56680bdaf4ea4e22ef12e30ff7, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  enableCudaOrganContext: 1
+  logContextDiagnostics: 1
+  sampleNativeStats: 1
+  statsSampleIntervalSeconds: 1
+  enableCudaXpbd: 1
+  cudaXpbdMode: 0
+  cudaConstraintIterations: 1
+  comparisonIntervalSeconds: 1
+  enableCudaToolContact: 0
+  temporaryPublishCudaPositions: 1
+  enableCudaTetToGrid: 1
+  contextHandle: 0
+  contextReady: 0
+  lastNativeError: 0
+  status: Waiting for tetrahedral organ initialization.
+  uploadedParticles: 0
+  uploadedTetrahedra: 0
+  uploadedSurfaceTriangles: 0
+  uploadedEdgeConstraints: 0
+  uploadedDeviceBytes: 0
+  initializationUploadBytes: 0
+  initializationUploadOperations: 0
+  initializationUploadMilliseconds: 0
+  validationKernelMilliseconds: 0
+  restPositionHash: 
+  topologyHash: 
+  runtimeStatsSamples: 0
+  cudaXpbdReady: 0
+  cudaXpbdStatus: CUDA XPBD is disabled.
+  cudaEdgeColorCount: 0
+  cudaTetColorCount: 0
+  cudaDynamicDeviceBytes: 0
+  cudaXpbdStepCount: 0
+  cudaLastXpbdMilliseconds: 0
+  cudaTotalXpbdMilliseconds: 0
+  cudaNanCount: 0
+  comparisonSamples: 0
+  comparisonParticleCount: 0
+  positionMaxError: 0
+  positionRmsError: 0
+  centroidError: 0
+  bboxMinError: 0
+  bboxMaxError: 0
+  bboxExtentError: 0
+  cudaToolContactActive: 0
+  cudaToolContactStatus: CUDA tool contact is disabled.
+  cudaToolActiveCandidates: 0
+  cudaToolContactCount: 0
+  cudaToolMaxContactDepth: 0
+  cudaToolSurfaceCandidateTriangles: 0
+  cudaToolSurfaceContactTriangles: 0
+  cudaToolSurfaceMaxContactDepth: 0
+  cudaToolGraspedParticleCount: 0
+  cudaToolDispatchCount: 0
+  cudaToolUploadBytes: 0
+  cudaToolUploadOperations: 0
+  cudaToolLastMilliseconds: 0
+  cudaToolTotalMilliseconds: 0
+  cudaToolLastError: 0
+  cudaTetToGridReady: 0
+  cudaTetToGridStatus: CUDA Tet-to-Grid is disabled.
+  cudaTetToGridMappedCorners: 0
+  cudaTetToGridFallbackCorners: 0
+  cudaTetToGridUploadBytes: 0
+  cudaTetToGridUpdateCount: 0
+  cudaTetToGridLastMilliseconds: 0
+  cudaTetToGridTotalMilliseconds: 0
+  cudaTetToGridLastError: 0
+  gpuResidentTetToGridFrameActive: 0
+--- !u!1 &1154184382
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1154184385}
+  - component: {fileID: 1154184384}
+  - component: {fileID: 1154184383}
+  m_Layer: 0
+  m_Name: Main Camera
+  m_TagString: MainCamera
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &1154184383
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1154184382}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 7bce7a59b1726724c88dc0fd21df5b46, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  moveSpeed: 4
+  lookSensitivity: 2.5
+  scrollSpeed: 4
+  enableKeyboardTranslation: 1
+--- !u!20 &1154184384
+Camera:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1154184382}
+  m_Enabled: 1
+  serializedVersion: 2
+  m_ClearFlags: 2
+  m_BackGroundColor: {r: 0.075, g: 0.09, b: 0.11, a: 1}
+  m_projectionMatrixMode: 1
+  m_GateFitMode: 2
+  m_FOVAxisMode: 0
+  m_SensorSize: {x: 36, y: 24}
+  m_LensShift: {x: 0, y: 0}
+  m_FocalLength: 50
+  m_NormalizedViewPortRect:
+    serializedVersion: 2
+    x: 0
+    y: 0
+    width: 1
+    height: 1
+  near clip plane: 0.3
+  far clip plane: 1000
+  field of view: 48
+  orthographic: 0
+  orthographic size: 5
+  m_Depth: 0
+  m_CullingMask:
+    serializedVersion: 2
+    m_Bits: 4294967295
+  m_RenderingPath: -1
+  m_TargetTexture: {fileID: 0}
+  m_TargetDisplay: 0
+  m_TargetEye: 3
+  m_HDR: 1
+  m_AllowMSAA: 1
+  m_AllowDynamicResolution: 0
+  m_ForceIntoRT: 0
+  m_OcclusionCulling: 1
+  m_StereoConvergence: 10
+  m_StereoSeparation: 0.022
+--- !u!4 &1154184385
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1154184382}
+  m_LocalRotation: {x: 0.12741293, y: -0.014084492, z: 0.0018094777, w: 0.99174815}
+  m_LocalPosition: {x: 0, y: 1.1, z: -8.5}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_RootOrder: 0
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &2079016075
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 2079016077}
+  - component: {fileID: 2079016076}
   m_Layer: 0
   m_Name: Directional Light
   m_TagString: Untagged
@@ -139,13 +464,13 @@ GameObject:
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
   m_IsActive: 1
---- !u!108 &185592238
+--- !u!108 &2079016076
 Light:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 185592237}
+  m_GameObject: {fileID: 2079016075}
   m_Enabled: 1
   serializedVersion: 10
   m_Type: 1
@@ -201,13 +526,13 @@ Light:
   m_UseViewFrustumForShadowCasterCull: 1
   m_ShadowRadius: 0
   m_ShadowAngle: 0
---- !u!4 &185592239
+--- !u!4 &2079016077
 Transform:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 185592237}
+  m_GameObject: {fileID: 2079016075}
   m_LocalRotation: {x: 0.37361234, y: -0.19996415, z: 0.08282786, w: 0.9019799}
   m_LocalPosition: {x: 0, y: 0, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
@@ -216,300 +541,3 @@ Transform:
   m_Father: {fileID: 0}
   m_RootOrder: 1
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!1 &1626336063
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 1626336066}
-  - component: {fileID: 1626336065}
-  - component: {fileID: 1626336064}
-  m_Layer: 0
-  m_Name: Main Camera
-  m_TagString: MainCamera
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 1
---- !u!114 &1626336064
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1626336063}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 7bce7a59b1726724c88dc0fd21df5b46, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  moveSpeed: 4
-  lookSensitivity: 2.5
-  scrollSpeed: 4
-  enableKeyboardTranslation: 1
---- !u!20 &1626336065
-Camera:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1626336063}
-  m_Enabled: 1
-  serializedVersion: 2
-  m_ClearFlags: 2
-  m_BackGroundColor: {r: 0.075, g: 0.09, b: 0.11, a: 1}
-  m_projectionMatrixMode: 1
-  m_GateFitMode: 2
-  m_FOVAxisMode: 0
-  m_SensorSize: {x: 36, y: 24}
-  m_LensShift: {x: 0, y: 0}
-  m_FocalLength: 50
-  m_NormalizedViewPortRect:
-    serializedVersion: 2
-    x: 0
-    y: 0
-    width: 1
-    height: 1
-  near clip plane: 0.3
-  far clip plane: 1000
-  field of view: 48
-  orthographic: 0
-  orthographic size: 5
-  m_Depth: 0
-  m_CullingMask:
-    serializedVersion: 2
-    m_Bits: 4294967295
-  m_RenderingPath: -1
-  m_TargetTexture: {fileID: 0}
-  m_TargetDisplay: 0
-  m_TargetEye: 3
-  m_HDR: 1
-  m_AllowMSAA: 1
-  m_AllowDynamicResolution: 0
-  m_ForceIntoRT: 0
-  m_OcclusionCulling: 1
-  m_StereoConvergence: 10
-  m_StereoSeparation: 0.022
---- !u!4 &1626336066
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1626336063}
-  m_LocalRotation: {x: 0.12741293, y: -0.014084492, z: 0.0018094777, w: 0.99174815}
-  m_LocalPosition: {x: 0, y: 1.1, z: -8.5}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 0}
-  m_RootOrder: 0
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!1 &1678929207
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 1678929213}
-  - component: {fileID: 1678929212}
-  - component: {fileID: 1678929211}
-  - component: {fileID: 1678929210}
-  - component: {fileID: 1678929209}
-  - component: {fileID: 1678929208}
-  - component: {fileID: 1678929214}
-  m_Layer: 0
-  m_Name: Stage1 Tet Soft Body
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 1
---- !u!114 &1678929208
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1678929207}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 24aafdb38858cf64abe0c97e95ea1a64, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  simulationEnabled: 1
-  tetMeshJson: Stage1TetPhysics/liver3_refined_1.json
-  density: 1050
-  meshScale: 1.5
-  initialOffset: {x: 0, y: 2.5, z: 0}
-  numSubSteps: 5
-  edgeCompliance: 0.00001
-  youngsModulus: 3000
-  poissonsRatio: 0.257
-  damping: 0.044
-  enableGravity: 1
-  gravityY: -9.81
-  groundY: -3
-  showGroundPlane: 1
-  groundColor: {r: 0.24, g: 0.34, b: 0.28, a: 1}
-  xpbdComputeShader: {fileID: 7200000, guid: e2b84108e34bbab4faa316a09e27cfa1, type: 3}
-  surfaceMaterial: {fileID: 0}
-  fallbackSurfaceColor: {r: 0.62, g: 0.18, b: 0.1, a: 1}
-  useAsyncPositionReadback: 1
-  pausePhysics: 0
---- !u!114 &1678929209
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1678929207}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 72aa8567796e7f248a6204cc3c14b6aa, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  meshLoader: {fileID: 1678929210}
-  surfaceMaterial: {fileID: 0}
-  showWireframe: 0
-  smoothSharedPositionNormals: 1
-  normalMergeTolerance: 0.00075
---- !u!114 &1678929210
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1678929207}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: cfea069c541bf5f4b9bad81f82f6b99f, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  jsonFileName: Stage1TetPhysics/liver3_refined_1.json
-  autoLoad: 0
-  massDensity: 1050
-  meshScale: 1.5
---- !u!23 &1678929211
-MeshRenderer:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1678929207}
-  m_Enabled: 1
-  m_CastShadows: 1
-  m_ReceiveShadows: 1
-  m_DynamicOccludee: 1
-  m_StaticShadowCaster: 0
-  m_MotionVectors: 1
-  m_LightProbeUsage: 1
-  m_ReflectionProbeUsage: 1
-  m_RayTracingMode: 2
-  m_RayTraceProcedural: 0
-  m_RenderingLayerMask: 1
-  m_RendererPriority: 0
-  m_Materials:
-  - {fileID: 0}
-  m_StaticBatchInfo:
-    firstSubMesh: 0
-    subMeshCount: 0
-  m_StaticBatchRoot: {fileID: 0}
-  m_ProbeAnchor: {fileID: 0}
-  m_LightProbeVolumeOverride: {fileID: 0}
-  m_ScaleInLightmap: 1
-  m_ReceiveGI: 1
-  m_PreserveUVs: 0
-  m_IgnoreNormalsForChartDetection: 0
-  m_ImportantGI: 0
-  m_StitchLightmapSeams: 1
-  m_SelectedEditorRenderState: 3
-  m_MinimumChartSize: 4
-  m_AutoUVMaxDistance: 0.5
-  m_AutoUVMaxAngle: 89
-  m_LightmapParameters: {fileID: 0}
-  m_SortingLayerID: 0
-  m_SortingLayer: 0
-  m_SortingOrder: 0
-  m_AdditionalVertexStreams: {fileID: 0}
---- !u!33 &1678929212
-MeshFilter:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1678929207}
-  m_Mesh: {fileID: 0}
---- !u!4 &1678929213
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1678929207}
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 0, z: 0}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 0}
-  m_RootOrder: 2
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &1678929214
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1678929207}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 331b5d56680bdaf4ea4e22ef12e30ff7, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  enableCudaOrganContext: 1
-  logContextDiagnostics: 1
-  sampleNativeStats: 1
-  statsSampleIntervalSeconds: 1
-  enableCudaXpbd: 1
-  cudaXpbdMode: 2
-  cudaConstraintIterations: 1
-  comparisonIntervalSeconds: 1
-  contextHandle: 0
-  contextReady: 0
-  lastNativeError: 0
-  status: Waiting for tetrahedral organ initialization.
-  uploadedParticles: 0
-  uploadedTetrahedra: 0
-  uploadedSurfaceTriangles: 0
-  uploadedEdgeConstraints: 0
-  uploadedDeviceBytes: 0
-  initializationUploadBytes: 0
-  initializationUploadOperations: 0
-  initializationUploadMilliseconds: 0
-  validationKernelMilliseconds: 0
-  restPositionHash: 
-  topologyHash: 
-  runtimeStatsSamples: 0
-  cudaXpbdReady: 0
-  cudaXpbdStatus: CUDA XPBD is disabled.
-  cudaEdgeColorCount: 0
-  cudaTetColorCount: 0
-  cudaDynamicDeviceBytes: 0
-  cudaXpbdStepCount: 0
-  cudaLastXpbdMilliseconds: 0
-  cudaTotalXpbdMilliseconds: 0
-  cudaNanCount: 0
-  comparisonSamples: 0
-  comparisonParticleCount: 0
-  positionMaxError: 0
-  positionRmsError: 0
-  centroidError: 0
-  bboxMinError: 0
-  bboxMaxError: 0
-  bboxExtentError: 0

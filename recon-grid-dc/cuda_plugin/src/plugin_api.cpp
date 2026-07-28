@@ -10,6 +10,7 @@
 #include "physics.h"
 #include "cut.h"
 #include "organ_context.h"
+#include "direct_surface_interop.h"
 
 #define LCS_API extern "C" __declspec(dllexport)
 
@@ -194,6 +195,30 @@ LCS_API int LCS_OrganToolGetStats(uint32_t handle, OrganContextToolContactStats*
 {
     return organ_context_tool_get_stats(handle, outStats);
 }
+LCS_API int LCS_OrganTetToGridConfigure(uint32_t handle, const OrganContextTetToGridDesc* desc,
+                                        const int* hostTetByCorner, const float* barycentricWeights4,
+                                        const float* alignedRestCorners3, const unsigned char* activeMask)
+{
+    return organ_context_tet_to_grid_configure(handle, desc, hostTetByCorner, barycentricWeights4,
+                                                alignedRestCorners3, activeMask);
+}
+LCS_API int LCS_OrganTetToGridUpdate(uint32_t handle, int applyLocalDeformation)
+{
+    return organ_context_tet_to_grid_update(handle, applyLocalDeformation);
+}
+LCS_API int LCS_OrganTetToGridGetStats(uint32_t handle, OrganContextTetToGridStats* outStats)
+{
+    return organ_context_tet_to_grid_get_stats(handle, outStats);
+}
+
+LCS_API int LCS_DirectSurfaceSetBuffers(void* positionBuffer, void* normalBuffer, void* auxBuffer,
+                                        void* vertexCountBuffer, int capacity)
+{
+    return direct_surface_set_buffers(positionBuffer, normalBuffer, auxBuffer, vertexCountBuffer, capacity);
+}
+LCS_API void LCS_DirectSurfaceRelease() { direct_surface_release(); }
+LCS_API void* LCS_GetDirectSurfaceRenderEventFunc() { return direct_surface_get_render_event(); }
+LCS_API int LCS_DirectSurfaceGetStats(DirectSurfaceStats* outStats) { return direct_surface_get_stats(outStats); }
 
 // Free all device buffers.
 LCS_API void LCS_Shutdown()

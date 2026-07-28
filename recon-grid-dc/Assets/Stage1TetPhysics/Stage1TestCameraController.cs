@@ -7,6 +7,9 @@ namespace ReconGridDC.Stage1TetPhysics
     {
         public float moveSpeed = 4f;
         public float lookSensitivity = 2.5f;
+        [Header("Camera Zoom")]
+        [Min(0.01f)]
+        [Tooltip("World-space distance moved by one mouse-wheel increment. Start around 0.25 and adjust for the current scene scale.")]
         public float scrollSpeed = 4f;
         [Tooltip("Allow WASD/arrow-key camera translation. Disable this in tool-control test scenes so those keys exclusively control the active tool.")]
         public bool enableKeyboardTranslation = true;
@@ -37,7 +40,8 @@ namespace ReconGridDC.Stage1TetPhysics
                 float speed = moveSpeed * (Input.GetKey(KeyCode.LeftShift) ? 2f : 1f);
                 transform.position += transform.TransformDirection(input) * speed * Time.unscaledDeltaTime;
             }
-            transform.position += transform.forward * Input.mouseScrollDelta.y * scrollSpeed * Time.unscaledDeltaTime;
+            // Scroll input is reported as a per-frame wheel delta; scrollSpeed is distance per wheel increment.
+            transform.position += transform.forward * Input.mouseScrollDelta.y * scrollSpeed;
         }
     }
 }

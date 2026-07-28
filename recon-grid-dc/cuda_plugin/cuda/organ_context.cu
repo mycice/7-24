@@ -1,5 +1,6 @@
 // organ_context.cu - per-organ GPU-resident data and phase-2 tetrahedral XPBD.
 #include "organ_context.h"
+#include "dc_recon.h"
 
 #include <cuda_runtime.h>
 #include <unordered_map>
@@ -63,6 +64,15 @@ namespace
         float* graspWeights = nullptr;
         unsigned int* toolCounters = nullptr;
         OrganContextToolContactStats toolStats{};
+        int* hostTetByCorner = nullptr;
+        float4* barycentricWeights = nullptr;
+        float3* alignedRestCorners = nullptr;
+        unsigned char* gridActiveMask = nullptr;
+        float3* currentCentroid = nullptr;
+        OrganContextTetToGridStats tetToGridStats{};
+        float3 tetRestCentroid = make_float3(0, 0, 0);
+        cudaEvent_t tetToGridStart = nullptr;
+        cudaEvent_t tetToGridEnd = nullptr;
         cudaEvent_t toolStart = nullptr;
         cudaEvent_t toolEnd = nullptr;
         cudaEvent_t uploadStart = nullptr;
@@ -82,9 +92,12 @@ namespace
             cudaFree(surfaceColorOffsets); cudaFree(surfaceColorCounts); cudaFree(surfaceColorFlat);
             cudaFree(toolCapsules); cudaFree(graspMask); cudaFree(graspFrameCoordinates);
             cudaFree(graspWeights); cudaFree(toolCounters);
+            cudaFree(hostTetByCorner); cudaFree(barycentricWeights); cudaFree(alignedRestCorners);
+            cudaFree(gridActiveMask); cudaFree(currentCentroid);
             cudaEventDestroy(uploadStart); cudaEventDestroy(uploadEnd);
             cudaEventDestroy(kernelStart); cudaEventDestroy(kernelEnd);
             cudaEventDestroy(toolStart); cudaEventDestroy(toolEnd);
+            cudaEventDestroy(tetToGridStart); cudaEventDestroy(tetToGridEnd);
         }
     };
 
@@ -141,6 +154,50 @@ namespace
     {
         int id = blockIdx.x * blockDim.x + threadIdx.x;
         if (id < count) atomicAdd(hashSink, static_cast<unsigned long long>(__float_as_uint(restPositions[id * 3])));
+    }
+
+    __global__ void SumCentroidKernel(const float3* positions, int count, float3* sum)
+    {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= count) return;
+        float3 p = positions[i];
+        atomicAdd(&sum->x, p.x / count);
+        atomicAdd(&sum->y, p.y / count);
+        atomicAdd(&sum->z, p.z / count);
+    }
+
+    __global__ void TetToGridKernel(const float3* positions, const float3* restPositions, const int* tetIds,
+                                    const int* hostTet, const float4* weights,
+                                    const float3* alignedRest, const unsigned char* active,
+                                    int cornerCount, float3 restCentroid, const float3* currentCentroid,
+                                    int applyLocalDeformation, float3* cornerPos)
+    {
+        int c = blockIdx.x * blockDim.x + threadIdx.x;
+        if (c >= cornerCount) return;
+        const float3 rest = alignedRest[c];
+        const int t = hostTet[c];
+        if (active[c] && t >= 0 && applyLocalDeformation)
+        {
+            const int base = t * 4;
+            const float4 w = weights[c];
+            const float3 p0 = positions[tetIds[base]];
+            const float3 p1 = positions[tetIds[base + 1]];
+            const float3 p2 = positions[tetIds[base + 2]];
+            const float3 p3 = positions[tetIds[base + 3]];
+            // The C# mapping was created from the same tet rest state. This is the full
+            // barycentric current position, expressed as a rest-relative displacement.
+            const float3 local = Add(Add(Mul(p0, w.x), Mul(p1, w.y)), Add(Mul(p2, w.z), Mul(p3, w.w)));
+            const float3 r0 = restPositions[tetIds[base]];
+            const float3 r1 = restPositions[tetIds[base + 1]];
+            const float3 r2 = restPositions[tetIds[base + 2]];
+            const float3 r3 = restPositions[tetIds[base + 3]];
+            const float3 restMapped = Add(Add(Mul(r0, w.x), Mul(r1, w.y)), Add(Mul(r2, w.z), Mul(r3, w.w)));
+            cornerPos[c] = Add(rest, Sub(local, restMapped));
+        }
+        else
+        {
+            cornerPos[c] = Add(rest, Sub(*currentCentroid, restCentroid));
+        }
     }
 
     __global__ void PrepareTetRestKernel(const float3* rest, const int* tetIds, const int* active,
@@ -572,7 +629,8 @@ int organ_context_create(uint32_t* outHandle)
     auto context=std::make_unique<CudaOrganContext>(); context->stats.handle=handle;
     if (cudaEventCreate(&context->uploadStart)!=cudaSuccess || cudaEventCreate(&context->uploadEnd)!=cudaSuccess ||
         cudaEventCreate(&context->kernelStart)!=cudaSuccess || cudaEventCreate(&context->kernelEnd)!=cudaSuccess ||
-        cudaEventCreate(&context->toolStart)!=cudaSuccess || cudaEventCreate(&context->toolEnd)!=cudaSuccess)
+        cudaEventCreate(&context->toolStart)!=cudaSuccess || cudaEventCreate(&context->toolEnd)!=cudaSuccess ||
+        cudaEventCreate(&context->tetToGridStart)!=cudaSuccess || cudaEventCreate(&context->tetToGridEnd)!=cudaSuccess)
         return ORGAN_CONTEXT_CUDA_FAILURE;
     g_contexts.emplace(handle,std::move(context)); *outHandle=handle; return ORGAN_CONTEXT_OK;
 }
@@ -776,6 +834,63 @@ int organ_context_tool_get_stats(uint32_t handle, OrganContextToolContactStats* 
     c->toolStats.graspedParticleCount=static_cast<int>(counters[3]);
     *outStats=c->toolStats;
     return ORGAN_CONTEXT_OK;
+}
+
+int organ_context_tet_to_grid_configure(uint32_t handle, const OrganContextTetToGridDesc* desc,
+                                        const int* hostTetByCorner, const float* barycentricWeights4,
+                                        const float* alignedRestCorners3, const unsigned char* activeMask)
+{
+    if (!desc || desc->cornerCount <= 0 || !hostTetByCorner || !barycentricWeights4 || !alignedRestCorners3 || !activeMask)
+        return ORGAN_CONTEXT_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(g_contextMutex); CudaOrganContext* c=FindContext(handle);
+    if (!c) return ORGAN_CONTEXT_INVALID_HANDLE; if (!c->xpbdInitialized) return ORGAN_CONTEXT_NOT_INITIALIZED;
+    if (desc->cornerCount != recon_corner_count()) return ORGAN_CONTEXT_INVALID_ARGUMENT;
+    if (c->tetToGridStats.configured) return ORGAN_CONTEXT_ALREADY_INITIALIZED;
+    const int count=desc->cornerCount;
+    if (!Upload(c->hostTetByCorner, hostTetByCorner, count, *c, true) ||
+        !Upload(c->barycentricWeights, reinterpret_cast<const float4*>(barycentricWeights4), count, *c, true) ||
+        !Upload(c->alignedRestCorners, reinterpret_cast<const float3*>(alignedRestCorners3), count, *c, true) ||
+        !Upload(c->gridActiveMask, activeMask, count, *c, true) || !Allocate(c->currentCentroid, 1, *c))
+        return ORGAN_CONTEXT_CUDA_FAILURE;
+    int mapped=0; for (int i=0;i<count;++i) if (activeMask[i] && hostTetByCorner[i]>=0) ++mapped;
+    c->tetToGridStats.configured=1; c->tetToGridStats.cornerCount=count; c->tetToGridStats.mappedCorners=mapped;
+    c->tetToGridStats.fallbackCorners=count-mapped;
+    c->tetToGridStats.uploadBytes=sizeof(int)*size_t(count)+sizeof(float4)*size_t(count)+sizeof(float3)*size_t(count)+sizeof(unsigned char)*size_t(count);
+    c->tetToGridStats.lastError=0;
+    c->tetRestCentroid=make_float3(desc->restCentroidX,desc->restCentroidY,desc->restCentroidZ);
+    return ORGAN_CONTEXT_OK;
+}
+
+int organ_context_tet_to_grid_update(uint32_t handle, int applyLocalDeformation)
+{
+    std::lock_guard<std::mutex> lock(g_contextMutex); CudaOrganContext* c=FindContext(handle);
+    if (!c) return ORGAN_CONTEXT_INVALID_HANDLE;
+    if (!c->xpbdInitialized || !c->tetToGridStats.configured) return ORGAN_CONTEXT_NOT_INITIALIZED;
+    float3* cornerPos=recon_corner_pos();
+    if (!cornerPos) return ORGAN_CONTEXT_NOT_INITIALIZED;
+    const int blocks=(c->stats.particleCount+kThreads-1)/kThreads;
+    cudaEventRecord(c->tetToGridStart);
+    if (!Check(cudaMemset(c->currentCentroid,0,sizeof(float3)),*c)) return ORGAN_CONTEXT_CUDA_FAILURE;
+    SumCentroidKernel<<<blocks,kThreads>>>(c->positions,c->stats.particleCount,c->currentCentroid);
+    const int cornerBlocks=(c->tetToGridStats.cornerCount+kThreads-1)/kThreads;
+    TetToGridKernel<<<cornerBlocks,kThreads>>>(c->positions,reinterpret_cast<float3*>(c->restPositions),c->tetIds,
+        c->hostTetByCorner,c->barycentricWeights,c->alignedRestCorners,c->gridActiveMask,c->tetToGridStats.cornerCount,
+        c->tetRestCentroid,c->currentCentroid,applyLocalDeformation ? 1 : 0,cornerPos);
+    cudaEventRecord(c->tetToGridEnd);
+    if (!Check(cudaPeekAtLastError(),*c)) return ORGAN_CONTEXT_CUDA_FAILURE;
+    if (cudaEventQuery(c->tetToGridEnd)==cudaSuccess)
+    {
+        cudaEventElapsedTime(&c->tetToGridStats.lastUpdateMilliseconds,c->tetToGridStart,c->tetToGridEnd);
+        c->tetToGridStats.totalUpdateMilliseconds+=c->tetToGridStats.lastUpdateMilliseconds;
+    }
+    ++c->tetToGridStats.updateCount; c->tetToGridStats.lastError=0; return ORGAN_CONTEXT_OK;
+}
+
+int organ_context_tet_to_grid_get_stats(uint32_t handle, OrganContextTetToGridStats* outStats)
+{
+    if (!outStats) return ORGAN_CONTEXT_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(g_contextMutex); CudaOrganContext* c=FindContext(handle);
+    if (!c) return ORGAN_CONTEXT_INVALID_HANDLE; *outStats=c->tetToGridStats; return ORGAN_CONTEXT_OK;
 }
 
 int organ_context_xpbd_get_positions(uint32_t handle, float* outPositions3, int particleCount)

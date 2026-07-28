@@ -84,6 +84,18 @@ namespace ReconGridDC.Cuda
         public bool useSmoothVisualRenderer = true;
         public bool hideRawCudaSurfaceWhenVisualActive = true;
 
+        [Header("CUDA Migration Phase 4 - GPU Direct Surface")]
+        [Tooltip("Default phase-4 rendering path. On Direct3D11, CUDA copies the reconstructed surface directly into Unity GPU buffers and normal frames skip full surface readback and Mesh.SetVertices/SetNormals. CPU Mesh remains the automatic fallback.")]
+        public bool preferGpuDirectSurface = true;
+        [Tooltip("Keeps the established CPU Mesh reconstruction available when Direct3D11 interop is unavailable or reports an error.")]
+        public bool allowCpuMeshFallback = true;
+        [Tooltip("Serialized to ensure the direct-surface shader is included in player builds.")]
+        public Shader cudaDirectSurfaceShader;
+
+        [Header("Cut Diagnostics")]
+        [Tooltip("Reads CUDA cut-debug counters every frame. Enable only while diagnosing cutting artifacts because this can synchronize CUDA with the CPU and reduce frame rate.")]
+        public bool enablePerFrameCutDebug;
+
         [Header("Surface membrane visualization")]
         [Tooltip("Draw a thin translucent layer on the live reconstructed outer surface. This is visualization only and does not change physics or collision behavior.")]
         public bool showSurfaceMembrane = true;
@@ -200,6 +212,7 @@ namespace ReconGridDC.Cuda
         Material  skyboxMat;
         MeshRenderer rawMeshRenderer;
         DcLiverVisualRenderer visualRenderer;
+        CudaDirectSurfaceRenderer directSurfaceRenderer;
         GameObject referenceGround;
         bool      referenceGroundCreated;
         bool      initialized, cutReady;
@@ -226,12 +239,21 @@ namespace ReconGridDC.Cuda
         bool      _cutRestMetricActive;
         bool      _cutRestMetricUnsupported;
         bool      _gravitySafeCutUnsupported;
+        bool      _gpuDirectSurfaceActive;
+        [SerializeField] bool gpuDirectSurfaceActive;
+        [SerializeField] string gpuDirectSurfaceStatus = "Waiting for CUDA initialization.";
+        [SerializeField] ulong gpuDirectSurfaceCopyBytes;
+        [SerializeField] ulong gpuDirectSurfaceDispatchCount;
+        [SerializeField] int gpuDirectSurfaceLastError;
+        [SerializeField] ulong cpuSurfaceReadbackBytes;
+        [SerializeField] bool manualSurfaceDiagnosticReadback;
 
         public bool IsInitialized => initialized && cutReady;
         public int GridCornerCount => _gridRestCorners != null ? _gridRestCorners.Length : 0;
         public bool ExternalGridDeformationActive => _externalGridDeformationActive;
         public float GridVoxelLength => Lrt;
         public bool CutRestMetricActive => _cutRestMetricActive;
+        public bool GpuDirectSurfaceActive => _gpuDirectSurfaceActive;
 
         // Arrays are immutable after Start and are exposed only for Stage 3 embedding setup.
         public bool TryGetGridRestData(out Vector3[] corners, out byte[] activeMask)
@@ -316,8 +338,9 @@ namespace ReconGridDC.Cuda
         public void SetPresentationVisible(bool visible)
         {
             presentationVisible = visible;
-            if (rawMeshRenderer != null)
-                rawMeshRenderer.enabled = visible;
+            if (directSurfaceRenderer != null)
+                directSurfaceRenderer.SetVisible(visible);
+            UpdateRawRendererVisibility();
             if (visualRenderer != null)
                 visualRenderer.SetVisible(visible);
         }
@@ -457,10 +480,14 @@ namespace ReconGridDC.Cuda
             // first uploaded mesh then already carries UV1.
             mat = CreateLiverMaterial();
             cutMat = CreateCutMaterial();
-            SetupSmoothVisualRenderer();
             LCS_Finalize();
-            AllocRenderArrays();
-            BuildOrUpdateMesh(firstTime: true);
+            SetupGpuDirectSurface();
+            if (!_gpuDirectSurfaceActive)
+            {
+                SetupSmoothVisualRenderer();
+                AllocRenderArrays();
+                BuildOrUpdateMesh(firstTime: true);
+            }
 
             // 7. Renderer + camera. LiverSurface (PhotorealisticLiver port) when enabled with all
             // textures assigned; else the legacy flat CudaSurface path (design §5: never a
@@ -485,7 +512,7 @@ namespace ReconGridDC.Cuda
         void Update()
         {
             UpdatePerformanceHud();
-            if (!initialized || !cutReady || mesh == null) return;
+            if (!initialized || !cutReady || (!_gpuDirectSurfaceActive && mesh == null)) return;
 
             // a. Either retain the original CUDA physics path or let Stage 3 provide the current
             // lattice positions. Running both would double-drive the same corner buffer.
@@ -515,10 +542,29 @@ namespace ReconGridDC.Cuda
             // v4.1 chain can fail with -3300/-3301 (dbg memset / epoch roll) — surface it.
             rc = LCS_Finalize();
             if (rc != 0 && (_stepErrThrottle++ % 120) == 0) Debug.LogError($"[LiverCuda] LCS_Finalize failed (rc={rc}).");
-            BuildOrUpdateMesh(firstTime: false);
-            SyncSurfaceMembraneSettings();
+            if (_gpuDirectSurfaceActive)
+            {
+                if (!directSurfaceRenderer.RequestDraw())
+                    DisableGpuDirectSurface("Direct surface render callback failed.");
+                else
+                    RefreshGpuDirectSurfaceDiagnostics();
+                if (manualSurfaceDiagnosticReadback)
+                {
+                    manualSurfaceDiagnosticReadback = false;
+                    EnsureCpuSurfaceFallback();
+                    BuildOrUpdateMesh(firstTime: false);
+                    gpuDirectSurfaceStatus = "One manual CPU surface diagnostic readback completed; GPU direct rendering remains active.";
+                }
+            }
+            if (!_gpuDirectSurfaceActive)
+            {
+                EnsureCpuSurfaceFallback();
+                BuildOrUpdateMesh(firstTime: false);
+                SyncSurfaceMembraneSettings();
+            }
             // d. Diagnostics. Auto gravity-motion log every ~1s; press P for a full split/gravity dump.
-            PollCutDebug();
+            if (enablePerFrameCutDebug)
+                PollCutDebug();
             if ((_diagFrame++ % 60) == 0) LogGravityMotion();
             if (Input.GetKeyDown(KeyCode.P)) DumpDiagnostics();
         }
@@ -933,6 +979,84 @@ namespace ReconGridDC.Cuda
             visualRenderer.Initialize(mat, cutMat, showSurfaceMembrane ? membraneMat : null);
         }
 
+        void SetupGpuDirectSurface()
+        {
+            _gpuDirectSurfaceActive = false;
+            gpuDirectSurfaceActive = false;
+            if (!preferGpuDirectSurface)
+            {
+                gpuDirectSurfaceStatus = "Disabled by LiverCudaManager Inspector switch.";
+                return;
+            }
+
+            Shader shader = cudaDirectSurfaceShader != null
+                ? cudaDirectSurfaceShader
+                : Shader.Find("ReconGridDC/CudaDirectSurface");
+            if (shader == null)
+            {
+                gpuDirectSurfaceStatus = "CudaDirectSurface shader is unavailable; using CPU Mesh fallback.";
+                return;
+            }
+
+            directSurfaceRenderer = GetComponent<CudaDirectSurfaceRenderer>();
+            if (directSurfaceRenderer == null)
+                directSurfaceRenderer = gameObject.AddComponent<CudaDirectSurfaceRenderer>();
+
+            Vector3 gridExtent = (Vector3)((float3)dimsRt * Lrt);
+            Bounds bounds = new Bounds((Vector3)gridCenterRt, gridExtent * 2f);
+            _gpuDirectSurfaceActive = directSurfaceRenderer.Configure(maxIdx, bounds, shader, liverColor);
+            gpuDirectSurfaceActive = _gpuDirectSurfaceActive;
+            gpuDirectSurfaceStatus = directSurfaceRenderer.Status;
+            if (_gpuDirectSurfaceActive)
+            {
+                // CPU visual renderer consumes managed surface arrays, so it is deliberately not
+                // initialized in the zero-readback path.
+                if (visualRenderer != null) visualRenderer.ClearVisuals();
+                Debug.Log("[LiverCuda] Phase 4 GPU direct surface enabled: normal frames skip LCS_GetSurface/GetSurfaceAux and Mesh.SetVertices/SetNormals.", this);
+            }
+            else if (!allowCpuMeshFallback)
+            {
+                Debug.LogError($"[LiverCuda] GPU direct surface unavailable and CPU fallback is disabled: {gpuDirectSurfaceStatus}", this);
+            }
+        }
+
+        void DisableGpuDirectSurface(string reason)
+        {
+            _gpuDirectSurfaceActive = false;
+            gpuDirectSurfaceActive = false;
+            gpuDirectSurfaceStatus = reason;
+            if (directSurfaceRenderer != null)
+                directSurfaceRenderer.Release();
+            if (!allowCpuMeshFallback)
+                Debug.LogError($"[LiverCuda] {reason} CPU Mesh fallback is disabled.", this);
+        }
+
+        void EnsureCpuSurfaceFallback()
+        {
+            if (mesh != null) return;
+            SetupSmoothVisualRenderer();
+            AllocRenderArrays();
+
+            // The Phase-4 direct path deliberately skips the legacy Mesh allocation.  If the
+            // direct renderer later falls back at runtime, BuildOrUpdateMesh(false) must still
+            // have a target Mesh before it performs the first CPU diagnostic/readback update.
+            mesh = new Mesh { indexFormat = IndexFormat.UInt32 };
+            mesh.MarkDynamic();
+            var meshFilter = GetComponent<MeshFilter>();
+            if (meshFilter == null) meshFilter = gameObject.AddComponent<MeshFilter>();
+            meshFilter.mesh = mesh;
+        }
+
+        void RefreshGpuDirectSurfaceDiagnostics()
+        {
+            if (directSurfaceRenderer == null) return;
+            gpuDirectSurfaceActive = directSurfaceRenderer.IsActive;
+            gpuDirectSurfaceStatus = directSurfaceRenderer.Status;
+            gpuDirectSurfaceCopyBytes = directSurfaceRenderer.GpuCopyBytes;
+            gpuDirectSurfaceDispatchCount = directSurfaceRenderer.DispatchCount;
+            gpuDirectSurfaceLastError = directSurfaceRenderer.LastNativeError;
+        }
+
         Material CreateSurfaceMembraneMaterial()
         {
             Shader sh = surfaceMembraneShader != null
@@ -966,7 +1090,7 @@ namespace ReconGridDC.Cuda
         void UpdateRawRendererVisibility()
         {
             if (rawMeshRenderer == null) return;
-            bool showVisual = !presentationVisible ||
+            bool showVisual = _gpuDirectSurfaceActive || !presentationVisible ||
                               (useSmoothVisualRenderer && hideRawCudaSurfaceWhenVisualActive &&
                                visualRenderer != null && visualRenderer.HasVisibleGeometry);
             rawMeshRenderer.enabled = !showVisual;
@@ -1039,6 +1163,7 @@ namespace ReconGridDC.Cuda
             if (N < 0) N = 0;
             if (N > maxIdx) N = maxIdx;
             if (LCS_GetSurface(pos, nrm, null) != 0) return;
+            cpuSurfaceReadbackBytes += (ulong)N * (ulong)(sizeof(float) * 6);
 
             // UV1 aux channel (render design §4.4): rest anchor + wall flag for the rest-position
             // triplanar shader. The material is created BEFORE the first build (S2-m4), so this
@@ -1062,6 +1187,7 @@ namespace ReconGridDC.Cuda
                     Debug.LogError("[LiverCuda] LCS_GetSurfaceAux missing — the deployed LiverCudaSim.dll is STALE. " +
                                    "Close Unity and copy cuda_plugin/build/Release/LiverCudaSim.dll to Assets/Plugins/x86_64.");
                 }
+                if (haveAux) cpuSurfaceReadbackBytes += (ulong)N * (ulong)(sizeof(float) * 4);
             }
 
             // Live bounds (design §4.4 / review A3-m1): fixed grid-sized bounds would frustum-cull
@@ -1318,6 +1444,7 @@ namespace ReconGridDC.Cuda
 
         void OnDestroy()
         {
+            if (directSurfaceRenderer != null) directSurfaceRenderer.Release();
             if (initialized) LCS_Shutdown();
             if (mesh != null) Destroy(mesh);
             if (mat  != null) Destroy(mat);

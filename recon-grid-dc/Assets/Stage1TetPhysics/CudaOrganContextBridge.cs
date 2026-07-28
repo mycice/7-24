@@ -132,6 +132,22 @@ namespace ReconGridDC.Stage1TetPhysics
             public int lastToolError;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct OrganContextTetToGridDescNative
+        {
+            public int cornerCount;
+            public float restCentroidX, restCentroidY, restCentroidZ;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct OrganContextTetToGridStatsNative
+        {
+            public int configured, cornerCount, mappedCorners, fallbackCorners;
+            public ulong uploadBytes, updateCount;
+            public float lastUpdateMilliseconds, totalUpdateMilliseconds;
+            public int lastError;
+        }
+
         [DllImport(Dll)] static extern int LCS_OrganCreate(out uint handle);
         [DllImport(Dll)] static extern int LCS_OrganDestroy(uint handle);
         [DllImport(Dll)] static extern int LCS_OrganInitialize(
@@ -153,6 +169,11 @@ namespace ReconGridDC.Stage1TetPhysics
         [DllImport(Dll)] static extern int LCS_OrganToolStep(uint handle, float dt, CudaToolCapsule[] capsules,
             ref OrganContextToolContactParamsNative parameters);
         [DllImport(Dll)] static extern int LCS_OrganToolGetStats(uint handle, out OrganContextToolContactStatsNative stats);
+        [DllImport(Dll)] static extern int LCS_OrganTetToGridConfigure(uint handle,
+            ref OrganContextTetToGridDescNative desc, int[] hostTetByCorner, float[] barycentricWeights4,
+            float[] alignedRestCorners3, byte[] activeMask);
+        [DllImport(Dll)] static extern int LCS_OrganTetToGridUpdate(uint handle, int applyLocalDeformation);
+        [DllImport(Dll)] static extern int LCS_OrganTetToGridGetStats(uint handle, out OrganContextTetToGridStatsNative stats);
 
         [Header("CUDA Migration Phase 1")]
         [Tooltip("Creates an isolated native CUDA organ context and uploads immutable tetrahedral data once. It does not drive XPBD, gripper contact, Tet-to-Grid, cutting, or rendering.")]
@@ -178,6 +199,10 @@ namespace ReconGridDC.Stage1TetPhysics
         public bool enableCudaToolContact;
         [Tooltip("CUDA contact requires a CUDA driver mode. The temporary publish mode is intended only for visual phase-3 verification and is not the final zero-readback path.")]
         public bool temporaryPublishCudaPositions = true;
+
+        [Header("CUDA Migration Phase 4 - Tet To Grid")]
+        [Tooltip("Uploads the already-built Stage 3 host-tet/barycentric embedding once and evaluates it on CUDA every fixed step. This removes the full tet-position readback and full grid-position upload from the CUDA driver path.")]
+        public bool enableCudaTetToGrid = true;
 
         [Header("Diagnostics (runtime)")]
         [SerializeField] uint contextHandle;
@@ -228,6 +253,16 @@ namespace ReconGridDC.Stage1TetPhysics
         [SerializeField] float cudaToolLastMilliseconds;
         [SerializeField] float cudaToolTotalMilliseconds;
         [SerializeField] int cudaToolLastError;
+        [SerializeField] bool cudaTetToGridReady;
+        [SerializeField] string cudaTetToGridStatus = "CUDA Tet-to-Grid is disabled.";
+        [SerializeField] int cudaTetToGridMappedCorners;
+        [SerializeField] int cudaTetToGridFallbackCorners;
+        [SerializeField] ulong cudaTetToGridUploadBytes;
+        [SerializeField] ulong cudaTetToGridUpdateCount;
+        [SerializeField] float cudaTetToGridLastMilliseconds;
+        [SerializeField] float cudaTetToGridTotalMilliseconds;
+        [SerializeField] int cudaTetToGridLastError;
+        [SerializeField] bool gpuResidentTetToGridFrameActive;
 
         Stage1TetSoftBodyController _softBody;
         float _nextStatsSampleTime;
@@ -246,6 +281,12 @@ namespace ReconGridDC.Stage1TetPhysics
             IsCudaDriverActive && enableCudaToolContact;
 
         public bool CudaToolContactActive => cudaToolContactActive;
+        public bool CanUseCudaTetToGrid => contextReady && cudaXpbdReady && enableCudaTetToGrid && IsCudaDriverActive;
+        // Set by the Stage 3 bridge only after its CUDA Tet-to-Grid mapping is configured for
+        // the detailed CUDA organ. This keeps the compatibility readback path available for
+        // every other presentation and fallback mode.
+        public bool ShouldSkipCpuPositionPublish =>
+            IsCudaDriverActive && cudaTetToGridReady && gpuResidentTetToGridFrameActive;
 
         // In phase 3, CUDA may become the writer only after SoftBodyCollisionModule has
         // successfully submitted the gripper packet for this fixed step. This prevents a
@@ -290,6 +331,8 @@ namespace ReconGridDC.Stage1TetPhysics
 
             _nextStatsSampleTime = Time.unscaledTime + Mathf.Max(0.1f, statsSampleIntervalSeconds);
             ReadStats(false);
+            if (cudaTetToGridReady)
+                ReadTetToGridStats();
             if (IsCudaToolContactDriverActive && Time.unscaledTime >= _nextToolStatsSampleTime)
             {
                 _nextToolStatsSampleTime = Time.unscaledTime + Mathf.Max(0.1f, statsSampleIntervalSeconds);
@@ -572,6 +615,89 @@ namespace ReconGridDC.Stage1TetPhysics
             }
             cudaXpbdStatus = "CUDA XPBD and CUDA tool contact are active. Temporary Publish performs one full position readback per fixed step for phase-3 visual verification.";
             return true;
+        }
+
+        public bool ConfigureCudaTetToGrid(int[] hostTetByCorner, Vector4[] weights, Vector3[] alignedRestCorners,
+                                           byte[] activeMask, Vector3 restCentroid)
+        {
+            cudaTetToGridReady = false;
+            gpuResidentTetToGridFrameActive = false;
+            if (!CanUseCudaTetToGrid || hostTetByCorner == null || weights == null || alignedRestCorners == null || activeMask == null ||
+                hostTetByCorner.Length == 0 || weights.Length != hostTetByCorner.Length ||
+                alignedRestCorners.Length != hostTetByCorner.Length || activeMask.Length != hostTetByCorner.Length)
+            {
+                cudaTetToGridStatus = "CUDA Tet-to-Grid requires a ready CUDA driver context and matching Stage 3 mapping arrays.";
+                return false;
+            }
+
+            int count = hostTetByCorner.Length;
+            float[] flatWeights = new float[count * 4];
+            float[] flatRest = new float[count * 3];
+            for (int i = 0; i < count; ++i)
+            {
+                Vector4 w = weights[i];
+                flatWeights[4 * i] = w.x; flatWeights[4 * i + 1] = w.y; flatWeights[4 * i + 2] = w.z; flatWeights[4 * i + 3] = w.w;
+                Vector3 p = alignedRestCorners[i];
+                flatRest[3 * i] = p.x; flatRest[3 * i + 1] = p.y; flatRest[3 * i + 2] = p.z;
+            }
+            OrganContextTetToGridDescNative desc = new OrganContextTetToGridDescNative
+            {
+                cornerCount = count,
+                restCentroidX = restCentroid.x, restCentroidY = restCentroid.y, restCentroidZ = restCentroid.z
+            };
+            try
+            {
+                lastNativeError = LCS_OrganTetToGridConfigure(contextHandle, ref desc, hostTetByCorner, flatWeights, flatRest, activeMask);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                cudaTetToGridStatus = "The deployed LiverCudaSim.dll predates the phase-4 Tet-to-Grid API.";
+                return false;
+            }
+            if (lastNativeError != 0)
+            {
+                cudaTetToGridStatus = $"LCS_OrganTetToGridConfigure failed ({lastNativeError}); Stage 3 CPU synchronization remains available.";
+                return false;
+            }
+            cudaTetToGridReady = true;
+            cudaTetToGridStatus = "CUDA Tet-to-Grid mapping uploaded once; dynamic corner positions remain on GPU.";
+            ReadTetToGridStats();
+            return true;
+        }
+
+        public void SetGpuResidentTetToGridFrameActive(bool active)
+        {
+            gpuResidentTetToGridFrameActive = active && cudaTetToGridReady && CanUseCudaTetToGrid;
+        }
+
+        public bool UpdateCudaTetToGrid(bool applyLocalDeformation)
+        {
+            if (!cudaTetToGridReady || !CanUseCudaTetToGrid)
+                return false;
+            lastNativeError = LCS_OrganTetToGridUpdate(contextHandle, applyLocalDeformation ? 1 : 0);
+            if (lastNativeError != 0)
+            {
+                cudaTetToGridStatus = $"LCS_OrganTetToGridUpdate failed ({lastNativeError}); Stage 3 CPU synchronization remains available.";
+                cudaTetToGridReady = false;
+                return false;
+            }
+            return true;
+        }
+
+        public void ReadTetToGridStats()
+        {
+            if (!contextReady || !enableCudaTetToGrid) return;
+            OrganContextTetToGridStatsNative stats;
+            try { lastNativeError = LCS_OrganTetToGridGetStats(contextHandle, out stats); }
+            catch (EntryPointNotFoundException) { return; }
+            if (lastNativeError != 0) { cudaTetToGridLastError = lastNativeError; return; }
+            cudaTetToGridMappedCorners = stats.mappedCorners;
+            cudaTetToGridFallbackCorners = stats.fallbackCorners;
+            cudaTetToGridUploadBytes = stats.uploadBytes;
+            cudaTetToGridUpdateCount = stats.updateCount;
+            cudaTetToGridLastMilliseconds = stats.lastUpdateMilliseconds;
+            cudaTetToGridTotalMilliseconds = stats.totalUpdateMilliseconds;
+            cudaTetToGridLastError = stats.lastError;
         }
 
         void ReadToolStats()

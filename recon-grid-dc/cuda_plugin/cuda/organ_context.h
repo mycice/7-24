@@ -134,6 +134,27 @@ struct OrganContextToolContactStats
     int lastToolError;
 };
 
+// Immutable Stage-3 embedding data is prepared by C# once, then evaluated fully on CUDA.
+// The grid itself remains owned by dc_recon/cut.cu; this context only writes its cornerPos.
+struct OrganContextTetToGridDesc
+{
+    int cornerCount;
+    float restCentroidX, restCentroidY, restCentroidZ;
+};
+
+struct OrganContextTetToGridStats
+{
+    int configured;
+    int cornerCount;
+    int mappedCorners;
+    int fallbackCorners;
+    uint64_t uploadBytes;
+    uint64_t updateCount;
+    float lastUpdateMilliseconds;
+    float totalUpdateMilliseconds;
+    int lastError;
+};
+
 int organ_context_create(uint32_t* outHandle);
 int organ_context_destroy(uint32_t handle);
 int organ_context_initialize(uint32_t handle,
@@ -162,3 +183,8 @@ int organ_context_xpbd_compare_positions(uint32_t handle, const float* unityPosi
 int organ_context_tool_step(uint32_t handle, float dt, const OrganContextToolCapsule* capsules,
                             const OrganContextToolContactParams* params);
 int organ_context_tool_get_stats(uint32_t handle, OrganContextToolContactStats* outStats);
+int organ_context_tet_to_grid_configure(uint32_t handle, const OrganContextTetToGridDesc* desc,
+                                        const int* hostTetByCorner, const float* barycentricWeights4,
+                                        const float* alignedRestCorners3, const unsigned char* activeMask);
+int organ_context_tet_to_grid_update(uint32_t handle, int applyLocalDeformation);
+int organ_context_tet_to_grid_get_stats(uint32_t handle, OrganContextTetToGridStats* outStats);
