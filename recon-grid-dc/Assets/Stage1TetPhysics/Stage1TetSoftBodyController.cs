@@ -117,7 +117,12 @@ namespace ReconGridDC.Stage1TetPhysics
                     BeforeSolverStep?.Invoke(_data, _solver, _visualizer);
                 if (cudaBridge.ShouldUseCudaDriverThisFixedStep)
                 {
-                    cudaBridge.StepCudaXpbd(Time.fixedDeltaTime);
+                    if (!cudaBridge.TryGetScheduledCudaXpbdDeltaTime(Time.fixedDeltaTime, out float cudaStepDeltaTime))
+                    {
+                        UpdateGroundPlane();
+                        return;
+                    }
+                    cudaBridge.StepCudaXpbd(cudaStepDeltaTime);
                     AfterCudaSolverStep?.Invoke();
                     // Phase 4's CUDA Tet-to-Grid path has already consumed the CUDA tet state.
                     // Do not read all particles back merely to drive the retired CPU bridge.

@@ -18,6 +18,13 @@ namespace ReconGridDC.Stage3Coupling
         public Stage3TetToGridEmbeddingBridge primaryCoupling;
         public Vector3 secondaryOffset = new Vector3(5f, 5f, 5f);
 
+        [Header("Dual Organ GPU Scheduling")]
+        public bool reduceIdleOrganGpuWork = true;
+        [Range(2, 12)] public int idleCudaXpbdStepInterval = 3;
+        [Range(2, 12)] public int idleSurfaceUpdateInterval = 3;
+        [Min(0f)] public float cuttingRodActivityPadding = 0.5f;
+        [Range(0, 10)] public int activeHoldFrames = 2;
+
         void Awake()
         {
             if (!enableSecondOrgan)
@@ -37,8 +44,12 @@ namespace ReconGridDC.Stage3Coupling
             secondaryTet.name = "Stage3 Tet Soft Body 2 (Physics Source)";
             secondaryTet.initialOffset = primaryTetSoftBody.initialOffset + secondaryOffset;
             secondaryTet.showGroundPlane = false;
+            CudaOrganContextBridge primaryContext = primaryTetSoftBody.GetComponent<CudaOrganContextBridge>();
             CudaOrganContextBridge secondaryContext = secondaryTet.GetComponent<CudaOrganContextBridge>();
             secondaryContext.pluginInstance = CudaPluginInstance.Secondary;
+            if (primaryContext != null)
+                primaryContext.ConfigureOrganToolBroadphase(true);
+            secondaryContext.ConfigureOrganToolBroadphase(true);
             Stage2TetGraspingBridge secondaryGrasping = secondaryTet.GetComponent<Stage2TetGraspingBridge>();
             if (secondaryGrasping != null)
                 secondaryGrasping.initializeGripperTool = false;
@@ -82,6 +93,24 @@ namespace ReconGridDC.Stage3Coupling
             secondaryCoupling.name = "Stage3 Tet-To-Grid Coupling 2";
             secondaryCoupling.tetSoftBody = secondaryTet;
             secondaryCoupling.cudaLiver = secondaryLiver;
+
+            if (reduceIdleOrganGpuWork && primaryContext != null && secondaryContext != null)
+            {
+                primaryCudaLiver.ConfigureAdaptiveGpuWorkScheduling(
+                    primaryContext,
+                    idleSurfaceUpdateInterval,
+                    cuttingRodActivityPadding,
+                    activeHoldFrames);
+                secondaryLiver.ConfigureAdaptiveGpuWorkScheduling(
+                    secondaryContext,
+                    idleSurfaceUpdateInterval,
+                    cuttingRodActivityPadding,
+                    activeHoldFrames);
+                primaryContext.ConfigureAdaptiveCudaXpbdScheduling(
+                    primaryCudaLiver, idleCudaXpbdStepInterval);
+                secondaryContext.ConfigureAdaptiveCudaXpbdScheduling(
+                    secondaryLiver, idleCudaXpbdStepInterval);
+            }
 
             StartCoroutine(ActivateSecondaryAfterPrimaryInitialization(secondaryLiver, secondaryCoupling));
         }

@@ -17,6 +17,19 @@ using ReconGridDC.Demo;      // LiverGrid, RodMath, OrbitCamera
 
 namespace ReconGridDC.Cuda
 {
+    public enum CudaOrganGpuWorkState
+    {
+        Active,
+        Idle
+    }
+
+    public interface ICudaOrganActivitySource
+    {
+        bool CudaToolBroadphaseOverlapping { get; }
+        bool CudaToolGraspLocked { get; }
+        bool IsWorldBoundsNearOrgan(Bounds worldBounds, float padding);
+    }
+
     [RequireComponent(typeof(LiverCudaCutter))]
     public sealed class LiverCudaManager : MonoBehaviour
     {
@@ -104,6 +117,13 @@ namespace ReconGridDC.Cuda
         [Tooltip("Allows the legacy full corner/adjacency diagnostic to run periodically. Keep disabled during normal performance tests; press P for one explicit diagnostic snapshot.")]
         public bool enableAutomaticFullStateDiagnostics;
         [Min(0.25f)] public float automaticDiagnosticIntervalSeconds = 1f;
+
+        [Header("CUDA Migration Phase 5 - Multi Organ Scheduling")]
+        [Tooltip("Allows the dual-organ bootstrap to reduce XPBD, Tet-to-Grid, cutting, reconstruction, and surface publication while this organ is not being interacted with.")]
+        public bool enableAdaptiveGpuWorkScheduling;
+        [Range(2, 12)] public int idleSurfaceUpdateInterval = 3;
+        [Min(0f)] public float cuttingRodActivityPadding = 0.5f;
+        [Range(0, 10)] public int activeHoldFrames = 2;
 
         [Header("Cut Diagnostics")]
         [Tooltip("Reads CUDA cut-debug counters every frame. Enable only while diagnosing cutting artifacts because this can synchronize CUDA with the CPU and reduce frame rate.")]
@@ -289,6 +309,13 @@ namespace ReconGridDC.Cuda
         bool      _cutRestMetricUnsupported;
         bool      _gravitySafeCutUnsupported;
         bool      _gpuDirectSurfaceActive;
+        ICudaOrganActivitySource _activitySource;
+        int       _lastGpuWorkActiveFrame = -1000;
+        int       _gpuWorkDecisionFrame = -1;
+        bool      _gpuWorkDecision = true;
+        bool      _cuttingRodSampleReady;
+        Vector3   _lastCuttingRodStart;
+        Vector3   _lastCuttingRodEnd;
         [SerializeField] bool gpuDirectSurfaceActive;
         [SerializeField] string gpuDirectSurfaceStatus = "Waiting for CUDA initialization.";
         [SerializeField] ulong gpuDirectSurfaceCopyBytes;
@@ -299,6 +326,13 @@ namespace ReconGridDC.Cuda
         [SerializeField] int fullStateDiagnosticReadbackCount;
         [SerializeField] bool normalPlayPathHasFullArrayReadback;
         [SerializeField] bool manualSurfaceDiagnosticReadback;
+        [Header("Adaptive GPU Work (runtime)")]
+        [SerializeField] CudaOrganGpuWorkState gpuWorkState = CudaOrganGpuWorkState.Active;
+        [SerializeField] bool gpuWorkToolActive;
+        [SerializeField] bool gpuWorkCuttingRodActive;
+        [SerializeField] int gpuWorkEffectiveInterval = 1;
+        [SerializeField] int gpuWorkPublishedFrame = -1;
+        [SerializeField] int gpuWorkSkippedFrames;
         [Header("GPU Surface Correctness Baseline (runtime)")]
         [SerializeField] int gpuSurfaceRawTriangleCount;
         [SerializeField] int gpuSurfaceValidTriangleCount;
@@ -327,6 +361,82 @@ namespace ReconGridDC.Cuda
         public float GridVoxelLength => Lrt;
         public bool CutRestMetricActive => _cutRestMetricActive;
         public bool GpuDirectSurfaceActive => _gpuDirectSurfaceActive;
+
+        public void ConfigureAdaptiveGpuWorkScheduling(
+            ICudaOrganActivitySource activitySource,
+            int idleUpdateInterval,
+            float rodPadding,
+            int holdFrames)
+        {
+            _activitySource = activitySource;
+            idleSurfaceUpdateInterval = Mathf.Clamp(idleUpdateInterval, 2, 12);
+            cuttingRodActivityPadding = Mathf.Max(0f, rodPadding);
+            activeHoldFrames = Mathf.Clamp(holdFrames, 0, 10);
+            enableAdaptiveGpuWorkScheduling = activitySource != null;
+            _lastGpuWorkActiveFrame = Time.frameCount;
+            _gpuWorkDecisionFrame = -1;
+            _cuttingRodSampleReady = false;
+        }
+
+        public bool IsAdaptiveGpuWorkActiveThisFrame()
+        {
+            ShouldPublishExpensiveGpuWorkThisFrame();
+            return gpuWorkState == CudaOrganGpuWorkState.Active;
+        }
+
+        public bool ShouldPublishExpensiveGpuWorkThisFrame()
+        {
+            if (_gpuWorkDecisionFrame == Time.frameCount)
+                return _gpuWorkDecision;
+
+            _gpuWorkDecisionFrame = Time.frameCount;
+            if (!enableAdaptiveGpuWorkScheduling || _activitySource == null)
+            {
+                gpuWorkState = CudaOrganGpuWorkState.Active;
+                gpuWorkToolActive = false;
+                gpuWorkCuttingRodActive = false;
+                gpuWorkEffectiveInterval = 1;
+                gpuWorkPublishedFrame = Time.frameCount;
+                return _gpuWorkDecision = true;
+            }
+
+            gpuWorkToolActive =
+                _activitySource.CudaToolBroadphaseOverlapping ||
+                _activitySource.CudaToolGraspLocked;
+            gpuWorkCuttingRodActive = IsMovingCuttingRodNearOrgan();
+            if (gpuWorkToolActive || gpuWorkCuttingRodActive)
+                _lastGpuWorkActiveFrame = Time.frameCount;
+
+            bool active = Time.frameCount - _lastGpuWorkActiveFrame <= activeHoldFrames;
+            gpuWorkState = active ? CudaOrganGpuWorkState.Active : CudaOrganGpuWorkState.Idle;
+            gpuWorkEffectiveInterval = active ? 1 : Mathf.Max(2, idleSurfaceUpdateInterval);
+            _gpuWorkDecision = active || Time.frameCount % gpuWorkEffectiveInterval == 0;
+            if (_gpuWorkDecision)
+                gpuWorkPublishedFrame = Time.frameCount;
+            return _gpuWorkDecision;
+        }
+
+        bool IsMovingCuttingRodNearOrgan()
+        {
+            if (_cutter == null || !_cutter.enableCutting || _cutter.cuttingRodTarget == null)
+                return false;
+
+            LiverCuttingRod rod = _cutter.cuttingRodTarget;
+            rod.GetEndpoints(out Vector3 start, out Vector3 end);
+            bool moved = !_cuttingRodSampleReady ||
+                         (start - _lastCuttingRodStart).sqrMagnitude > 1e-8f ||
+                         (end - _lastCuttingRodEnd).sqrMagnitude > 1e-8f;
+            _cuttingRodSampleReady = true;
+            _lastCuttingRodStart = start;
+            _lastCuttingRodEnd = end;
+            if (!moved)
+                return false;
+
+            Bounds rodBounds = new Bounds(start, Vector3.zero);
+            rodBounds.Encapsulate(end);
+            rodBounds.Expand(Mathf.Max(0.002f, rod.Thickness));
+            return _activitySource.IsWorldBoundsNearOrgan(rodBounds, cuttingRodActivityPadding);
+        }
 
         // Arrays are immutable after Start and are exposed only for Stage 3 embedding setup.
         public bool TryGetGridRestData(out Vector3[] corners, out byte[] activeMask)
@@ -604,6 +714,15 @@ namespace ReconGridDC.Cuda
             UpdatePerformanceHud();
             if (!initialized || !cutReady || (!_gpuDirectSurfaceActive && mesh == null)) return;
 
+            if (!ShouldPublishExpensiveGpuWorkThisFrame())
+            {
+                gpuWorkSkippedFrames++;
+                if (_gpuDirectSurfaceActive && !directSurfaceRenderer.RequestDraw(false))
+                    DisableGpuDirectSurface("Direct surface retained-frame render callback failed.");
+                RefreshTransferPolicyStatus();
+                return;
+            }
+
             // a. Either retain the original CUDA physics path or let Stage 3 provide the current
             // lattice positions. Running both would double-drive the same corner buffer.
             int rc;
@@ -634,7 +753,7 @@ namespace ReconGridDC.Cuda
             if (rc != 0 && (_stepErrThrottle++ % 120) == 0) Debug.LogError($"[LiverCuda] LCS_Finalize failed (rc={rc}).");
             if (_gpuDirectSurfaceActive)
             {
-                if (!directSurfaceRenderer.RequestDraw())
+                if (!directSurfaceRenderer.RequestDraw(true))
                     DisableGpuDirectSurface("Direct surface render callback failed.");
                 else
                     RefreshGpuDirectSurfaceDiagnostics();

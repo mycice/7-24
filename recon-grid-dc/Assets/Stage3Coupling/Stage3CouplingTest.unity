@@ -232,8 +232,8 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 2eedcc972dadfb3438f4f8d52947c90a, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
+  m_Name:
+  m_EditorClassIdentifier:
   synchronizationEnabled: 1
   tetSoftBody: {fileID: 1994098143}
   cudaLiver: {fileID: 1842413906}
@@ -540,6 +540,10 @@ MonoBehaviour:
   conservativeCutRodSpanMultiplier: 3
   enableAutomaticFullStateDiagnostics: 0
   automaticDiagnosticIntervalSeconds: 1
+  enableAdaptiveGpuWorkScheduling: 0
+  idleSurfaceUpdateInterval: 3
+  cuttingRodActivityPadding: 0.5
+  activeHoldFrames: 2
   enablePerFrameCutDebug: 0
   showSurfaceMembrane: 0
   surfaceMembraneShader: {fileID: 0}
@@ -589,6 +593,12 @@ MonoBehaviour:
   fullStateDiagnosticReadbackCount: 0
   normalPlayPathHasFullArrayReadback: 0
   manualSurfaceDiagnosticReadback: 0
+  gpuWorkState: 0
+  gpuWorkToolActive: 0
+  gpuWorkCuttingRodActive: 0
+  gpuWorkEffectiveInterval: 1
+  gpuWorkPublishedFrame: -1
+  gpuWorkSkippedFrames: 0
   gpuSurfaceRawTriangleCount: 0
   gpuSurfaceValidTriangleCount: 0
   gpuSurfaceRejectedInvalidTriangleCount: 0
@@ -841,7 +851,7 @@ MonoBehaviour:
   youngsModulus: 3000
   poissonsRatio: 0.257
   damping: 0.044
-  enableGravity: 0
+  enableGravity: 1
   gravityY: -9.81
   groundY: -3
   showGroundPlane: 1
@@ -1078,6 +1088,7 @@ MonoBehaviour:
   cudaToolBroadphaseOverlapping: 0
   cudaToolBroadphaseDisabled: 0
   cudaToolGraspLocked: 0
+  enableOrganToolBroadphase: 0
   cudaTetToGridReady: 0
   cudaTetToGridStatus: CUDA Tet-to-Grid is disabled.
   cudaTetToGridMappedCorners: 0
@@ -1088,6 +1099,9 @@ MonoBehaviour:
   cudaTetToGridTotalMilliseconds: 0
   cudaTetToGridLastError: 0
   gpuResidentTetToGridFrameActive: 0
+  cudaXpbdEffectiveStepInterval: 1
+  cudaXpbdSkippedFixedSteps: 0
+  cudaXpbdAccumulatedDeltaTime: 0
 --- !u!1 &2002044805
 GameObject:
   m_ObjectHideFlags: 0
@@ -1309,8 +1323,13 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: e21c55c8d47647d09dddb195a7ab2863, type: 3}
   m_Name:
   m_EditorClassIdentifier:
-  enableSecondOrgan: 1
+  enableSecondOrgan: 0
   primaryTetSoftBody: {fileID: 1994098143}
   primaryCudaLiver: {fileID: 1842413906}
   primaryCoupling: {fileID: 454799249}
   secondaryOffset: {x: 5, y: 5, z: 5}
+  reduceIdleOrganGpuWork: 1
+  idleCudaXpbdStepInterval: 3
+  idleSurfaceUpdateInterval: 3
+  cuttingRodActivityPadding: 0.5
+  activeHoldFrames: 2

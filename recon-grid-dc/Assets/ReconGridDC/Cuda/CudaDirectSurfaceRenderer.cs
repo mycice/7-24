@@ -204,13 +204,17 @@ namespace ReconGridDC.Cuda
 
         static IntPtr Native(GraphicsBuffer buffer) => buffer.GetNativeBufferPtr();
 
-        public bool RequestDraw()
+        public bool RequestDraw() => RequestDraw(true);
+
+        public bool RequestDraw(bool refreshNativeSurface)
         {
             if (!directSurfaceActive || !_visible || _outer == null || _cut == null || _renderEvent == IntPtr.Zero) return false;
             _drawCommands.Clear();
-            _drawCommands.IssuePluginEvent(_renderEvent, 0);
+            if (refreshNativeSurface)
+                _drawCommands.IssuePluginEvent(_renderEvent, 0);
             QueueDrawBatch(_outer); QueueDrawBatch(_cut);
-            ReadStats();
+            if (refreshNativeSurface)
+                ReadStats();
             if (lastNativeError == 0) return true;
             directSurfaceStatus = $"CUDA-D3D11 copy failed ({lastNativeError}).";
             directSurfaceActive = false; return false;

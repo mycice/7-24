@@ -223,6 +223,11 @@ namespace ReconGridDC.Stage3Coupling
                 tetSoftBody.GetComponent<CudaOrganContextBridge>().SetGpuResidentTetToGridFrameActive(false);
                 return;
             }
+            if (!cudaLiver.ShouldPublishExpensiveGpuWorkThisFrame())
+            {
+                lastStatus = "Idle GPU schedule: XPBD advanced while Tet-to-Grid and surface publication retained the previous GPU frame.";
+                return;
+            }
             if (tetSoftBody.GetComponent<CudaOrganContextBridge>().UpdateCudaTetToGrid(enableLocalTetDeformation))
             {
                 tetSoftBody.GetComponent<CudaOrganContextBridge>().SetGpuResidentTetToGridFrameActive(true);

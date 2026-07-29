@@ -27,7 +27,7 @@ namespace ReconGridDC.Stage1TetPhysics
     [DefaultExecutionOrder(250)]
     [DisallowMultipleComponent]
     [RequireComponent(typeof(Stage1TetSoftBodyController))]
-    public sealed class CudaOrganContextBridge : MonoBehaviour
+    public sealed class CudaOrganContextBridge : MonoBehaviour, ICudaOrganActivitySource
     {
         const string Dll = "LiverCudaSim";
         const string Dll2 = "LiverCudaSim2";
@@ -291,6 +291,7 @@ namespace ReconGridDC.Stage1TetPhysics
         [SerializeField] bool cudaToolBroadphaseOverlapping;
         [SerializeField] bool cudaToolBroadphaseDisabled;
         [SerializeField] bool cudaToolGraspLocked;
+        [SerializeField] bool enableOrganToolBroadphase;
         [SerializeField] bool cudaTetToGridReady;
         [SerializeField] string cudaTetToGridStatus = "CUDA Tet-to-Grid is disabled.";
         [SerializeField] int cudaTetToGridMappedCorners;
@@ -301,6 +302,10 @@ namespace ReconGridDC.Stage1TetPhysics
         [SerializeField] float cudaTetToGridTotalMilliseconds;
         [SerializeField] int cudaTetToGridLastError;
         [SerializeField] bool gpuResidentTetToGridFrameActive;
+        [Header("Adaptive CUDA XPBD (runtime)")]
+        [SerializeField] int cudaXpbdEffectiveStepInterval = 1;
+        [SerializeField] int cudaXpbdSkippedFixedSteps;
+        [SerializeField] float cudaXpbdAccumulatedDeltaTime;
 
         Stage1TetSoftBodyController _softBody;
         float _nextStatsSampleTime;
@@ -312,6 +317,9 @@ namespace ReconGridDC.Stage1TetPhysics
         Bounds _organRestBounds;
         bool _organRestBoundsReady;
         bool _cudaGraspMayBeActive;
+        LiverCudaManager _gpuWorkScheduler;
+        int _idleCudaXpbdStepInterval = 3;
+        int _idleCudaXpbdFixedStepCounter;
 
         public bool IsCudaDriverActive =>
             contextReady && cudaXpbdReady && enableCudaXpbd &&
@@ -322,12 +330,65 @@ namespace ReconGridDC.Stage1TetPhysics
             IsCudaDriverActive && enableCudaToolContact;
 
         public bool CudaToolContactActive => cudaToolContactActive;
+        public bool CudaToolBroadphaseOverlapping => cudaToolBroadphaseOverlapping;
+        public bool CudaToolGraspLocked => cudaToolGraspLocked;
         public bool CanUseCudaTetToGrid => contextReady && cudaXpbdReady && enableCudaTetToGrid && IsCudaDriverActive;
         // Set by the Stage 3 bridge only after its CUDA Tet-to-Grid mapping is configured for
         // the detailed CUDA organ. This keeps the compatibility readback path available for
         // every other presentation and fallback mode.
         public bool ShouldSkipCpuPositionPublish =>
             IsCudaDriverActive && cudaTetToGridReady && gpuResidentTetToGridFrameActive;
+
+        public void ConfigureAdaptiveCudaXpbdScheduling(LiverCudaManager scheduler, int idleStepInterval)
+        {
+            _gpuWorkScheduler = scheduler;
+            _idleCudaXpbdStepInterval = Mathf.Clamp(idleStepInterval, 2, 12);
+            _idleCudaXpbdFixedStepCounter = 0;
+            cudaXpbdAccumulatedDeltaTime = 0f;
+        }
+
+        public void ConfigureOrganToolBroadphase(bool enabled)
+        {
+            enableOrganToolBroadphase = enabled;
+            if (!enabled)
+            {
+                cudaToolBroadphaseOverlapping = true;
+                cudaToolBroadphaseDisabled = false;
+            }
+        }
+
+        public bool TryGetScheduledCudaXpbdDeltaTime(float fixedDeltaTime, out float scheduledDeltaTime)
+        {
+            scheduledDeltaTime = fixedDeltaTime;
+            if (_gpuWorkScheduler == null)
+            {
+                cudaXpbdEffectiveStepInterval = 1;
+                return true;
+            }
+
+            cudaXpbdAccumulatedDeltaTime += fixedDeltaTime;
+            if (_gpuWorkScheduler.IsAdaptiveGpuWorkActiveThisFrame())
+            {
+                cudaXpbdEffectiveStepInterval = 1;
+                _idleCudaXpbdFixedStepCounter = 0;
+                scheduledDeltaTime = cudaXpbdAccumulatedDeltaTime;
+                cudaXpbdAccumulatedDeltaTime = 0f;
+                return true;
+            }
+
+            cudaXpbdEffectiveStepInterval = _idleCudaXpbdStepInterval;
+            _idleCudaXpbdFixedStepCounter++;
+            if (_idleCudaXpbdFixedStepCounter < _idleCudaXpbdStepInterval)
+            {
+                cudaXpbdSkippedFixedSteps++;
+                return false;
+            }
+
+            _idleCudaXpbdFixedStepCounter = 0;
+            scheduledDeltaTime = cudaXpbdAccumulatedDeltaTime;
+            cudaXpbdAccumulatedDeltaTime = 0f;
+            return true;
+        }
 
         // In phase 3, CUDA may become the writer only after SoftBodyCollisionModule has
         // successfully submitted the gripper packet for this fixed step. This prevents a
@@ -625,7 +686,7 @@ namespace ReconGridDC.Stage1TetPhysics
                 axisWX = axisW.x, axisWY = axisW.y, axisWZ = axisW.z
             };
 
-            bool toolOverlapsOrgan = ToolBoundsOverlapOrgan(bounds, settings);
+            bool toolOverlapsOrgan = !enableOrganToolBroadphase || ToolBoundsOverlapOrgan(bounds, settings);
             bool keepLockedGraspActive = _cudaGraspMayBeActive && gripper.WantsClosedGrasp;
             bool releaseLockedGrasp = _cudaGraspMayBeActive && !gripper.WantsClosedGrasp;
             bool useDisabledPacket = !toolOverlapsOrgan && !keepLockedGraspActive;
@@ -686,6 +747,16 @@ namespace ReconGridDC.Stage1TetPhysics
                             Mathf.Max(0f, settings.toolContactDistance);
             expandedOrganBounds.Expand(2f * padding);
             return expandedOrganBounds.Intersects(toolBounds);
+        }
+
+        public bool IsWorldBoundsNearOrgan(Bounds worldBounds, float padding)
+        {
+            if (!_organRestBoundsReady)
+                return true;
+
+            Bounds expandedOrganBounds = _organRestBounds;
+            expandedOrganBounds.Expand(2f * Mathf.Max(0f, padding));
+            return expandedOrganBounds.Intersects(worldBounds);
         }
 
         public bool PublishCudaPositions(TetMeshData data)
