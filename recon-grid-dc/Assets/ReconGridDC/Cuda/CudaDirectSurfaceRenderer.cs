@@ -6,9 +6,8 @@ using UnityEngine.Rendering;
 namespace ReconGridDC.Cuda
 {
     /// <summary>
-    /// Owns the Unity D3D11 buffers used by the phase-4 CUDA direct surface path. CUDA copies
-    /// the already-expanded Dual Contouring soup into these buffers on Unity's render thread.
-    /// No surface vertices or normals are read back to managed memory during normal operation.
+    /// D3D11 buffers for the CUDA-resident Dual Contouring renderer. The native plugin writes
+    /// separate outer-surface and cut-wall batches, so cut walls cannot corrupt outer smoothing.
     /// </summary>
     [DisallowMultipleComponent]
     public sealed class CudaDirectSurfaceRenderer : MonoBehaviour
@@ -22,19 +21,28 @@ namespace ReconGridDC.Cuda
             public ulong gpuCopyBytes, dispatchCount;
             public int lastError, cudaDeviceOrdinal, registrationStage, cudaErrorCode;
             public int positionByteWidth, positionUsage, positionBindFlags, positionMiscFlags, positionStructureByteStride;
+            public int rawVertexCount, sourceVertexCountClamped, rawTriangleCount, validTriangleCount;
+            public int rejectedInvalidTriangleCount, rejectedDegenerateTriangleCount;
+            public int outerTriangleCount, cutWallTriangleCount, writtenVertexCount, capacityOverflow;
+            public int indexedVertexCount, indexedIndexCount, mergeEnabled;
+            public int outerIndexedVertexCount, outerIndexedIndexCount, cutWallIndexedVertexCount, cutWallIndexedIndexCount;
+            public int topologyDiagnosticReady, topologyDiagnosticOuterVertexSamples;
+            public int topologyDiagnosticUniqueOuterVertexEstimate, topologyDiagnosticError;
+            public ulong topologyDiagnosticSequence;
+            public int rawNoWallTriangleCount, rawAnyWallTriangleCount, rawMixedWallTriangleCount;
         }
 
         [DllImport(Dll)] static extern int LCS_DirectSurfaceSetBuffers(
-            IntPtr positionBuffer, IntPtr normalBuffer, IntPtr auxBuffer,
-            IntPtr vertexCountBuffer, int capacity);
+            IntPtr outerPositionBuffer, IntPtr outerNormalBuffer, IntPtr outerAuxBuffer, IntPtr outerIndexBuffer, IntPtr outerIndexCountBuffer,
+            IntPtr cutPositionBuffer, IntPtr cutNormalBuffer, IntPtr cutAuxBuffer, IntPtr cutIndexBuffer, IntPtr cutIndexCountBuffer, int capacity);
         [DllImport(Dll)] static extern void LCS_DirectSurfaceRelease();
         [DllImport(Dll)] static extern IntPtr LCS_GetDirectSurfaceRenderEventFunc();
         [DllImport(Dll)] static extern int LCS_DirectSurfaceGetStats(out DirectSurfaceStatsNative stats);
+        [DllImport(Dll)] static extern int LCS_DirectSurfaceRequestTopologyDiagnostic();
 
         [Header("CUDA Migration Phase 4 - GPU Direct Surface")]
-        [Tooltip("Draws the CUDA Dual Contouring output directly from D3D11 GPU buffers. This requires Direct3D11 and falls back to the CPU Mesh path when unavailable.")]
+        [Tooltip("Draws CUDA Dual Contouring output from D3D11 GPU buffers. Direct3D11 only.")]
         public bool enabledForManager = true;
-        [Tooltip("Adds this much grid extent around the fitted bounds so moving or cut pieces are not prematurely culled.")]
         [Min(1f)] public float boundsPaddingMultiplier = 3f;
 
         [Header("Diagnostics (runtime)")]
@@ -43,151 +51,155 @@ namespace ReconGridDC.Cuda
         [SerializeField] int surfaceCapacity;
         [SerializeField] bool d3d11Compatible;
         [SerializeField] int nativeRegistered;
-        [SerializeField] ulong gpuCopyBytes;
-        [SerializeField] ulong dispatchCount;
-        [SerializeField] int lastNativeError;
-        [SerializeField] int cudaDeviceOrdinal = -1;
-        [SerializeField] int registrationStage;
-        [SerializeField] int cudaRegistrationError;
-        [SerializeField] int positionBufferByteWidth;
-        [SerializeField] int positionBufferUsage;
-        [SerializeField] int positionBufferBindFlags;
-        [SerializeField] int positionBufferMiscFlags;
-        [SerializeField] int positionBufferStructureStride;
+        [SerializeField] ulong gpuCopyBytes, dispatchCount;
+        [SerializeField] int lastNativeError, cudaDeviceOrdinal = -1, registrationStage, cudaRegistrationError;
+        [SerializeField] int positionBufferByteWidth, positionBufferUsage, positionBufferBindFlags, positionBufferMiscFlags, positionBufferStructureStride;
+        [Header("GPU Surface Diagnostics (runtime)")]
+        [SerializeField] int rawVertexCount, sourceVertexCountClamped, rawTriangleCount, validTriangleCount;
+        [SerializeField] int rejectedInvalidTriangleCount, rejectedDegenerateTriangleCount, outerTriangleCount, cutWallTriangleCount;
+        [SerializeField] int outerIndexCount, cutWallIndexCount, writtenVertexCount;
+        [SerializeField] bool capacityOverflow;
+        [SerializeField] int indexedVertexCount, indexedIndexCount;
+        [SerializeField] int outerIndexedVertexCount, outerIndexedIndexCount, cutWallIndexedVertexCount, cutWallIndexedIndexCount;
+        [SerializeField] bool gpuVertexMergeActive;
+        [Tooltip("Set true once in Play Mode. Only scalar GPU diagnostic counters are read back.")]
+        [SerializeField] bool requestTopologyDiagnostic;
+        [SerializeField] bool topologyDiagnosticReady;
+        [SerializeField] ulong topologyDiagnosticSequence;
+        [SerializeField] int topologyDiagnosticOuterVertexSamples, topologyDiagnosticUniqueOuterVertexEstimate, topologyDiagnosticError;
+        [Header("Raw Wall-Tag Diagnostics (runtime)")]
+        [SerializeField] int rawNoWallTriangleCount, rawAnyWallTriangleCount, rawMixedWallTriangleCount;
 
-        GraphicsBuffer _positions;
-        GraphicsBuffer _normals;
-        GraphicsBuffer _aux;
-        GraphicsBuffer _vertexCount;
-        GraphicsBuffer _indirectArgs;
+        sealed class DrawBatch
+        {
+            public GraphicsBuffer positions, normals, aux, indices, indexCount, indirectArgs;
+            public Material material;
+        }
+
+        DrawBatch _outer, _cut;
         ComputeShader _indirectArgsShader;
         int _indirectArgsKernel = -1;
         CommandBuffer _drawCommands;
         Camera _drawCamera;
-        Material _material;
         Bounds _bounds;
         IntPtr _renderEvent;
-        bool _visible = true;
-        bool _nativeConfigured;
+        bool _visible = true, _nativeConfigured;
 
         public bool IsActive => directSurfaceActive;
         public string Status => directSurfaceStatus;
         public ulong GpuCopyBytes => gpuCopyBytes;
         public ulong DispatchCount => dispatchCount;
         public int LastNativeError => lastNativeError;
+        public int RawVertexCount => rawVertexCount;
+        public int SourceVertexCountClamped => sourceVertexCountClamped;
+        public int RawTriangleCount => rawTriangleCount;
+        public int ValidTriangleCount => validTriangleCount;
+        public int RejectedInvalidTriangleCount => rejectedInvalidTriangleCount;
+        public int RejectedDegenerateTriangleCount => rejectedDegenerateTriangleCount;
+        public int OuterTriangleCount => outerTriangleCount;
+        public int CutWallTriangleCount => cutWallTriangleCount;
+        public int OuterIndexCount => outerIndexCount;
+        public int CutWallIndexCount => cutWallIndexCount;
+        public int WrittenVertexCount => writtenVertexCount;
+        public bool CapacityOverflow => capacityOverflow;
+        public int IndexedVertexCount => indexedVertexCount;
+        public int IndexedIndexCount => indexedIndexCount;
+        public bool GpuVertexMergeActive => gpuVertexMergeActive;
+        public bool TopologyDiagnosticReady => topologyDiagnosticReady;
+        public ulong TopologyDiagnosticSequence => topologyDiagnosticSequence;
+        public int TopologyDiagnosticOuterVertexSamples => topologyDiagnosticOuterVertexSamples;
+        public int TopologyDiagnosticUniqueOuterVertexEstimate => topologyDiagnosticUniqueOuterVertexEstimate;
+        public int TopologyDiagnosticError => topologyDiagnosticError;
+        public int RawNoWallTriangleCount => rawNoWallTriangleCount;
+        public int RawAnyWallTriangleCount => rawAnyWallTriangleCount;
+        public int RawMixedWallTriangleCount => rawMixedWallTriangleCount;
 
-        public bool Configure(int capacity, Bounds bounds, Shader shader, Color color)
+        public bool Configure(int capacity, Bounds bounds, Shader shader, Material sourceMaterial,
+            Vector3 projectUvMin, Vector3 projectUvSize)
         {
             Release();
             surfaceCapacity = Mathf.Max(0, capacity);
-            _bounds = bounds;
-            _bounds.extents *= Mathf.Max(1f, boundsPaddingMultiplier);
+            _bounds = bounds; _bounds.extents *= Mathf.Max(1f, boundsPaddingMultiplier);
             d3d11Compatible = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11;
-            if (!enabledForManager)
-            {
-                directSurfaceStatus = "Disabled by Inspector.";
-                return false;
-            }
-            if (!d3d11Compatible)
-            {
-                directSurfaceStatus = $"GPU direct surface requires Direct3D11; active API is {SystemInfo.graphicsDeviceType}.";
-                return false;
-            }
-            if (surfaceCapacity <= 0 || shader == null)
-            {
-                directSurfaceStatus = "Invalid surface capacity or direct-surface shader.";
-                return false;
-            }
-
+            if (!enabledForManager) { directSurfaceStatus = "Disabled by Inspector."; return false; }
+            if (!d3d11Compatible) { directSurfaceStatus = $"GPU direct surface requires Direct3D11; active API is {SystemInfo.graphicsDeviceType}."; return false; }
+            if (surfaceCapacity <= 0 || shader == null) { directSurfaceStatus = "Invalid surface capacity or direct-surface shader."; return false; }
             try
             {
-                // On D3D11 Unity's Structured GraphicsBuffer is not accepted by
-                // cudaGraphicsD3D11RegisterResource. Raw buffers keep the same contiguous
-                // float layout for CUDA and are decoded by ByteAddressBuffer in the shader.
-                _positions = new GraphicsBuffer(GraphicsBuffer.Target.Raw, surfaceCapacity * 3, sizeof(float));
-                _normals = new GraphicsBuffer(GraphicsBuffer.Target.Raw, surfaceCapacity * 3, sizeof(float));
-                _aux = new GraphicsBuffer(GraphicsBuffer.Target.Raw, surfaceCapacity * 4, sizeof(float));
-                // CUDA writes the live vertex count to this Raw buffer. A Unity compute dispatch
-                // then transfers it to indirect args entirely on the GPU.
-                _vertexCount = new GraphicsBuffer(GraphicsBuffer.Target.Raw, 1, sizeof(uint));
-                _indirectArgs = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 4, sizeof(uint));
+                _outer = CreateBatch(shader, sourceMaterial, projectUvMin, projectUvSize, "Outer");
+                _cut = CreateBatch(shader, sourceMaterial, projectUvMin, projectUvSize, "CutWall");
                 _indirectArgsShader = Resources.Load<ComputeShader>("CudaDirectSurfaceIndirectArgs");
-                if (_indirectArgsShader == null)
-                {
-                    directSurfaceStatus = "CudaDirectSurfaceIndirectArgs.compute is missing from Assets/Resources.";
-                    Release();
-                    return false;
-                }
+                if (_indirectArgsShader == null) { directSurfaceStatus = "CudaDirectSurfaceIndirectArgs.compute is missing from Assets/Resources."; Release(); return false; }
                 _indirectArgsKernel = _indirectArgsShader.FindKernel("BuildIndirectArgs");
-                _indirectArgsShader.SetBuffer(_indirectArgsKernel, "_CudaSurfaceVertexCount", _vertexCount);
-                _indirectArgsShader.SetBuffer(_indirectArgsKernel, "_IndirectArgs", _indirectArgs);
+                BindIndirectArguments(_outer); BindIndirectArguments(_cut);
                 _drawCamera = Camera.main;
-                if (_drawCamera == null)
-                {
-                    directSurfaceStatus = "GPU direct surface requires a tagged Main Camera.";
-                    Release();
-                    return false;
-                }
-                _drawCommands = new CommandBuffer { name = "CUDA Direct Surface" };
+                if (_drawCamera == null) { directSurfaceStatus = "GPU direct surface requires a tagged Main Camera."; Release(); return false; }
+                _drawCommands = new CommandBuffer { name = "CUDA Direct Surface Batches" };
                 _drawCamera.AddCommandBuffer(CameraEvent.BeforeForwardAlpha, _drawCommands);
-                _material = new Material(shader) { name = "Runtime_CudaDirectSurface" };
-                _material.SetColor("_Color", color);
-                _material.SetBuffer("_CudaSurfacePositions", _positions);
-                _material.SetBuffer("_CudaSurfaceNormals", _normals);
-                _material.SetBuffer("_CudaSurfaceAux", _aux);
-                _material.SetBuffer("_CudaSurfaceVertexCount", _vertexCount);
-
-                int rc = LCS_DirectSurfaceSetBuffers(_positions.GetNativeBufferPtr(), _normals.GetNativeBufferPtr(),
-                    _aux.GetNativeBufferPtr(), _vertexCount.GetNativeBufferPtr(), surfaceCapacity);
-                if (rc != 0)
-                {
-                    lastNativeError = rc;
-                    directSurfaceStatus = $"LCS_DirectSurfaceSetBuffers failed ({rc}). CPU Mesh fallback remains active.";
-                    Release();
-                    return false;
-                }
-
-                _nativeConfigured = true;
-                _renderEvent = LCS_GetDirectSurfaceRenderEventFunc();
-                if (_renderEvent == IntPtr.Zero)
-                {
-                    directSurfaceStatus = "The deployed DLL did not return a direct-surface render event.";
-                    Release();
-                    return false;
-                }
-
+                int rc = LCS_DirectSurfaceSetBuffers(
+                    Native(_outer.positions), Native(_outer.normals), Native(_outer.aux), Native(_outer.indices), Native(_outer.indexCount),
+                    Native(_cut.positions), Native(_cut.normals), Native(_cut.aux), Native(_cut.indices), Native(_cut.indexCount), surfaceCapacity);
+                if (rc != 0) { lastNativeError = rc; directSurfaceStatus = $"LCS_DirectSurfaceSetBuffers failed ({rc}). CPU Mesh fallback remains active."; Release(); return false; }
+                _nativeConfigured = true; _renderEvent = LCS_GetDirectSurfaceRenderEventFunc();
+                if (_renderEvent == IntPtr.Zero) { directSurfaceStatus = "The deployed DLL did not return a direct-surface render event."; Release(); return false; }
                 directSurfaceActive = true;
-                directSurfaceStatus = "CUDA-D3D11 direct surface configured. Waiting for first render event.";
+                directSurfaceStatus = "CUDA-D3D11 direct surface configured with isolated outer and cut-wall batches.";
                 return true;
             }
-            catch (Exception exception)
-            {
-                directSurfaceStatus = $"GPU direct surface setup failed: {exception.Message}";
-                Release();
-                return false;
-            }
+            catch (Exception e) { directSurfaceStatus = $"GPU direct surface setup failed: {e.Message}"; Release(); return false; }
         }
+
+        DrawBatch CreateBatch(Shader shader, Material sourceMaterial, Vector3 projectUvMin,
+            Vector3 projectUvSize, string label)
+        {
+            var batch = new DrawBatch
+            {
+                positions = new GraphicsBuffer(GraphicsBuffer.Target.Raw, surfaceCapacity * 3, sizeof(float)),
+                normals = new GraphicsBuffer(GraphicsBuffer.Target.Raw, surfaceCapacity * 3, sizeof(float)),
+                aux = new GraphicsBuffer(GraphicsBuffer.Target.Raw, surfaceCapacity * 4, sizeof(float)),
+                indices = new GraphicsBuffer(GraphicsBuffer.Target.Raw, surfaceCapacity, sizeof(uint)),
+                indexCount = new GraphicsBuffer(GraphicsBuffer.Target.Raw, 1, sizeof(uint)),
+                indirectArgs = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 4, sizeof(uint)),
+                material = new Material(shader) { name = $"Runtime_CudaDirectSurface_{label}" }
+            };
+            if (sourceMaterial != null)
+                batch.material.CopyPropertiesFromMaterial(sourceMaterial);
+            batch.material.SetVector("_ProjectUvMin", projectUvMin);
+            batch.material.SetVector("_ProjectUvSize", projectUvSize);
+            batch.material.SetBuffer("_CudaSurfacePositions", batch.positions);
+            batch.material.SetBuffer("_CudaSurfaceNormals", batch.normals);
+            batch.material.SetBuffer("_CudaSurfaceAux", batch.aux);
+            batch.material.SetBuffer("_CudaSurfaceIndices", batch.indices);
+            batch.material.SetBuffer("_CudaSurfaceVertexCount", batch.indexCount);
+            return batch;
+        }
+
+        void BindIndirectArguments(DrawBatch batch)
+        {
+            _indirectArgsShader.SetBuffer(_indirectArgsKernel, "_CudaSurfaceVertexCount", batch.indexCount);
+            _indirectArgsShader.SetBuffer(_indirectArgsKernel, "_IndirectArgs", batch.indirectArgs);
+        }
+
+        static IntPtr Native(GraphicsBuffer buffer) => buffer.GetNativeBufferPtr();
 
         public bool RequestDraw()
         {
-            if (!directSurfaceActive || !_visible || _material == null || _vertexCount == null || _renderEvent == IntPtr.Zero)
-                return false;
-
-            // Keep the CUDA copy, GPU count conversion, and indirect draw in one render-thread
-            // command stream. Issuing them separately lets Unity run the compute pass before
-            // the native CUDA callback has written the current frame's count.
+            if (!directSurfaceActive || !_visible || _outer == null || _cut == null || _renderEvent == IntPtr.Zero) return false;
             _drawCommands.Clear();
             _drawCommands.IssuePluginEvent(_renderEvent, 0);
-            _drawCommands.DispatchCompute(_indirectArgsShader, _indirectArgsKernel, 1, 1, 1);
-            _drawCommands.DrawProceduralIndirect(Matrix4x4.identity, _material, 0, MeshTopology.Triangles, _indirectArgs);
+            QueueDrawBatch(_outer); QueueDrawBatch(_cut);
             ReadStats();
-            if (lastNativeError != 0)
-            {
-                directSurfaceStatus = $"CUDA-D3D11 copy failed ({lastNativeError}); use CPU Mesh fallback.";
-                directSurfaceActive = false;
-                return false;
-            }
-            return true;
+            if (lastNativeError == 0) return true;
+            directSurfaceStatus = $"CUDA-D3D11 copy failed ({lastNativeError}); use CPU Mesh fallback.";
+            directSurfaceActive = false; return false;
+        }
+
+        void QueueDrawBatch(DrawBatch batch)
+        {
+            _drawCommands.SetComputeBufferParam(_indirectArgsShader, _indirectArgsKernel, "_CudaSurfaceVertexCount", batch.indexCount);
+            _drawCommands.SetComputeBufferParam(_indirectArgsShader, _indirectArgsKernel, "_IndirectArgs", batch.indirectArgs);
+            _drawCommands.DispatchCompute(_indirectArgsShader, _indirectArgsKernel, 1, 1, 1);
+            _drawCommands.DrawProceduralIndirect(Matrix4x4.identity, batch.material, 0, MeshTopology.Triangles, batch.indirectArgs);
         }
 
         public void SetVisible(bool visible) => _visible = visible;
@@ -197,71 +209,63 @@ namespace ReconGridDC.Cuda
             if (!_nativeConfigured) return;
             try
             {
-                if (LCS_DirectSurfaceGetStats(out DirectSurfaceStatsNative stats) != 0) return;
-                nativeRegistered = stats.registered;
-                gpuCopyBytes = stats.gpuCopyBytes;
-                dispatchCount = stats.dispatchCount;
-                lastNativeError = stats.lastError;
-                cudaDeviceOrdinal = stats.cudaDeviceOrdinal;
-                registrationStage = stats.registrationStage;
-                cudaRegistrationError = stats.cudaErrorCode;
-                positionBufferByteWidth = stats.positionByteWidth;
-                positionBufferUsage = stats.positionUsage;
-                positionBufferBindFlags = stats.positionBindFlags;
-                positionBufferMiscFlags = stats.positionMiscFlags;
-                positionBufferStructureStride = stats.positionStructureByteStride;
-                if (lastNativeError == -4101)
-                    directSurfaceStatus = $"CUDA-D3D11 registration failed at {RegistrationStageName(registrationStage)} " +
-                                          $"(CUDA error {cudaRegistrationError}, device {cudaDeviceOrdinal}).";
+                if (LCS_DirectSurfaceGetStats(out var s) != 0) return;
+                nativeRegistered=s.registered; gpuCopyBytes=s.gpuCopyBytes; dispatchCount=s.dispatchCount; lastNativeError=s.lastError;
+                cudaDeviceOrdinal=s.cudaDeviceOrdinal; registrationStage=s.registrationStage; cudaRegistrationError=s.cudaErrorCode;
+                positionBufferByteWidth=s.positionByteWidth; positionBufferUsage=s.positionUsage; positionBufferBindFlags=s.positionBindFlags; positionBufferMiscFlags=s.positionMiscFlags; positionBufferStructureStride=s.positionStructureByteStride;
+                rawVertexCount=s.rawVertexCount; sourceVertexCountClamped=s.sourceVertexCountClamped; rawTriangleCount=s.rawTriangleCount; validTriangleCount=s.validTriangleCount;
+                rejectedInvalidTriangleCount=s.rejectedInvalidTriangleCount; rejectedDegenerateTriangleCount=s.rejectedDegenerateTriangleCount; outerTriangleCount=s.outerTriangleCount; cutWallTriangleCount=s.cutWallTriangleCount;
+                outerIndexCount=s.outerIndexedIndexCount; cutWallIndexCount=s.cutWallIndexedIndexCount; writtenVertexCount=s.writtenVertexCount; capacityOverflow=s.capacityOverflow!=0;
+                indexedVertexCount=s.indexedVertexCount; indexedIndexCount=s.indexedIndexCount; outerIndexedVertexCount=s.outerIndexedVertexCount; outerIndexedIndexCount=s.outerIndexedIndexCount;
+                cutWallIndexedVertexCount=s.cutWallIndexedVertexCount; cutWallIndexedIndexCount=s.cutWallIndexedIndexCount; gpuVertexMergeActive=s.mergeEnabled!=0;
+                topologyDiagnosticReady=s.topologyDiagnosticReady!=0; topologyDiagnosticSequence=s.topologyDiagnosticSequence; topologyDiagnosticOuterVertexSamples=s.topologyDiagnosticOuterVertexSamples;
+                topologyDiagnosticUniqueOuterVertexEstimate=s.topologyDiagnosticUniqueOuterVertexEstimate; topologyDiagnosticError=s.topologyDiagnosticError;
+                rawNoWallTriangleCount=s.rawNoWallTriangleCount; rawAnyWallTriangleCount=s.rawAnyWallTriangleCount; rawMixedWallTriangleCount=s.rawMixedWallTriangleCount;
+                if (lastNativeError == -4101) directSurfaceStatus = $"CUDA-D3D11 registration failed at {RegistrationStageName(registrationStage)} (CUDA error {cudaRegistrationError}, device {cudaDeviceOrdinal}).";
             }
-            catch (EntryPointNotFoundException)
+            catch (EntryPointNotFoundException) { lastNativeError=-1; directSurfaceStatus="The deployed DLL lacks the phase-4 dual-batch API."; directSurfaceActive=false; }
+        }
+
+        void Update()
+        {
+            if (!requestTopologyDiagnostic) return;
+            requestTopologyDiagnostic=false;
+            if (!_nativeConfigured || !directSurfaceActive) { directSurfaceStatus="GPU topology diagnostic was requested before CUDA direct surface became active."; return; }
+            try
             {
-                lastNativeError = -1;
-                directSurfaceStatus = "The deployed DLL lacks the phase-4 direct-surface API.";
-                directSurfaceActive = false;
+                int rc=LCS_DirectSurfaceRequestTopologyDiagnostic();
+                if(rc!=0) { topologyDiagnosticError=rc; directSurfaceStatus=$"LCS_DirectSurfaceRequestTopologyDiagnostic failed ({rc})."; }
+                else { topologyDiagnosticReady=false; directSurfaceStatus="GPU topology diagnostic requested; scalar results arrive after the next CUDA render event."; }
             }
+            catch (EntryPointNotFoundException) { topologyDiagnosticError=-1; directSurfaceStatus="The deployed DLL lacks the GPU surface diagnostics API. Rebuild and deploy LiverCudaSim.dll manually."; }
         }
 
         static string RegistrationStageName(int stage)
         {
-            switch (stage)
+            switch(stage)
             {
-                case 1: return "D3D11 device lookup";
-                case 2: return "CUDA device selection";
-                case 3: return "position buffer registration";
-                case 4: return "normal buffer registration";
-                case 5: return "aux buffer registration";
-                case 6: return "vertex-count buffer registration";
-                default: return "unknown registration stage";
+                case 1:return "D3D11 device lookup"; case 2:return "CUDA device selection"; case 3:return "outer position registration";
+                case 4:return "outer normal registration"; case 5:return "outer aux registration"; case 6:return "outer index registration";
+                case 7:return "outer index-count registration"; case 8:return "cut position registration"; case 9:return "cut normal registration";
+                case 10:return "cut aux registration"; case 11:return "cut index registration"; case 12:return "cut index-count registration"; default:return "unknown registration stage";
             }
         }
 
         public void Release()
         {
-            directSurfaceActive = false;
-            if (_nativeConfigured)
-            {
-                try { LCS_DirectSurfaceRelease(); }
-                catch (EntryPointNotFoundException) { }
-            }
-            _nativeConfigured = false;
-            _renderEvent = IntPtr.Zero;
-            _positions?.Release(); _positions = null;
-            _normals?.Release(); _normals = null;
-            _aux?.Release(); _aux = null;
-            _vertexCount?.Release(); _vertexCount = null;
-            _indirectArgs?.Release(); _indirectArgs = null;
-            if (_drawCamera != null && _drawCommands != null)
-                _drawCamera.RemoveCommandBuffer(CameraEvent.BeforeForwardAlpha, _drawCommands);
-            _drawCommands?.Release(); _drawCommands = null;
-            _drawCamera = null;
-            _indirectArgsShader = null;
-            _indirectArgsKernel = -1;
-            if (_material != null)
-            {
-                if (Application.isPlaying) Destroy(_material); else DestroyImmediate(_material);
-                _material = null;
-            }
+            directSurfaceActive=false;
+            if(_nativeConfigured) try { LCS_DirectSurfaceRelease(); } catch (EntryPointNotFoundException) { }
+            _nativeConfigured=false; _renderEvent=IntPtr.Zero;
+            ReleaseBatch(_outer); _outer=null; ReleaseBatch(_cut); _cut=null;
+            if(_drawCamera!=null && _drawCommands!=null) _drawCamera.RemoveCommandBuffer(CameraEvent.BeforeForwardAlpha,_drawCommands);
+            _drawCommands?.Release(); _drawCommands=null; _drawCamera=null; _indirectArgsShader=null; _indirectArgsKernel=-1;
+        }
+
+        static void ReleaseBatch(DrawBatch batch)
+        {
+            if(batch==null) return;
+            batch.positions?.Release(); batch.normals?.Release(); batch.aux?.Release(); batch.indices?.Release(); batch.indexCount?.Release(); batch.indirectArgs?.Release();
+            if(batch.material!=null) { if(Application.isPlaying) UnityEngine.Object.Destroy(batch.material); else UnityEngine.Object.DestroyImmediate(batch.material); }
         }
 
         void OnDisable() => Release();

@@ -94,7 +94,7 @@ static float       g_gravitySafeGap = 0.f;
 static float       g_gravityAlignmentExponent = 1.f;
 
 // ── Stage-6 host state ────────────────────────────────────────────────────────────────────────
-static bool   g_toolSet        = false;          // at least one cut_set_tool received
+static bool   g_toolSet        = false;          // at least one valid cutting sweep received
 static bool   g_havePrevCorner = false;          // d_prevCorner holds the previous tick's positions
 static float3 g_emitNcut  = { 0.f, 1.f, 0.f };   // last VALID world cut normal (for the ±D/2 side)
 static float  g_tearLen2  = 0.f;                 // (tau*L)^2, 0 = tear law disabled (v5.1 D10)
@@ -1012,7 +1012,10 @@ void cut_set_tool(const CutToolDesc* tool)
 {
     if (!tool) return;
     g_tool = *tool;
-    if (tool->valid != 0) g_emitNcut = mk3(tool->ncut);   // remember the last VALID world cut normal
+    // Invalid descriptors mean there is no lateral tool sweep this frame. They must not arm the
+    // post-cut tear law, otherwise gravity alone can turn an untouched liver into cut-wall debris.
+    if (tool->valid == 0) return;
+    g_emitNcut = mk3(tool->ncut);   // remember the last VALID world cut normal
     // Seed the CCD snapshot at ACTIVATION (review S1-m3): without this the first physics substep of
     // the next frame is consumed by the seed pass and its tissue motion is never CCD-checked.
     if (!g_toolSet && g_cut_ready && c_cornerPos != nullptr)
@@ -1074,7 +1077,7 @@ int cut_set_gravity_stabilization(int enabled, float gravityX, float gravityY, f
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 int cut_detect()
 {
-    if (!g_cut_ready || !g_toolSet) return 0;
+    if (!g_cut_ready || !g_toolSet || g_tool.valid == 0) return 0;
     int gec = g_cdesc.gridEdgeCount;
     if (gec <= 0) return 0;
 

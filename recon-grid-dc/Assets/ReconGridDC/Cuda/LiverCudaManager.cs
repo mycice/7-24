@@ -247,6 +247,27 @@ namespace ReconGridDC.Cuda
         [SerializeField] int gpuDirectSurfaceLastError;
         [SerializeField] ulong cpuSurfaceReadbackBytes;
         [SerializeField] bool manualSurfaceDiagnosticReadback;
+        [Header("GPU Surface Correctness Baseline (runtime)")]
+        [SerializeField] int gpuSurfaceRawTriangleCount;
+        [SerializeField] int gpuSurfaceValidTriangleCount;
+        [SerializeField] int gpuSurfaceRejectedInvalidTriangleCount;
+        [SerializeField] int gpuSurfaceRejectedDegenerateTriangleCount;
+        [SerializeField] int gpuSurfaceOuterTriangleCount;
+        [SerializeField] int gpuSurfaceCutWallTriangleCount;
+        [SerializeField] int gpuSurfaceOuterIndexCount;
+        [SerializeField] int gpuSurfaceCutWallIndexCount;
+        [SerializeField] int gpuSurfaceRawVertexCount;
+        [SerializeField] int gpuSurfaceSourceVertexCountClamped;
+        [SerializeField] int gpuSurfaceWrittenVertexCount;
+        [SerializeField] bool gpuSurfaceCapacityOverflow;
+        [SerializeField] int gpuSurfaceIndexedVertexCount;
+        [SerializeField] int gpuSurfaceIndexedIndexCount;
+        [SerializeField] bool gpuSurfaceVertexMergeActive;
+        [SerializeField] bool gpuSurfaceTopologyDiagnosticReady;
+        [SerializeField] ulong gpuSurfaceTopologyDiagnosticSequence;
+        [SerializeField] int gpuSurfaceTopologyOuterVertexSamples;
+        [SerializeField] int gpuSurfaceTopologyUniqueOuterVertexEstimate;
+        [SerializeField] int gpuSurfaceTopologyDiagnosticError;
 
         public bool IsInitialized => initialized && cutReady;
         public int GridCornerCount => _gridRestCorners != null ? _gridRestCorners.Length : 0;
@@ -1004,7 +1025,8 @@ namespace ReconGridDC.Cuda
 
             Vector3 gridExtent = (Vector3)((float3)dimsRt * Lrt);
             Bounds bounds = new Bounds((Vector3)gridCenterRt, gridExtent * 2f);
-            _gpuDirectSurfaceActive = directSurfaceRenderer.Configure(maxIdx, bounds, shader, liverColor);
+            _gpuDirectSurfaceActive = directSurfaceRenderer.Configure(
+                maxIdx, bounds, shader, mat, projectUvMinRt, projectUvSizeRt);
             gpuDirectSurfaceActive = _gpuDirectSurfaceActive;
             gpuDirectSurfaceStatus = directSurfaceRenderer.Status;
             if (_gpuDirectSurfaceActive)
@@ -1055,6 +1077,26 @@ namespace ReconGridDC.Cuda
             gpuDirectSurfaceCopyBytes = directSurfaceRenderer.GpuCopyBytes;
             gpuDirectSurfaceDispatchCount = directSurfaceRenderer.DispatchCount;
             gpuDirectSurfaceLastError = directSurfaceRenderer.LastNativeError;
+            gpuSurfaceRawTriangleCount = directSurfaceRenderer.RawTriangleCount;
+            gpuSurfaceValidTriangleCount = directSurfaceRenderer.ValidTriangleCount;
+            gpuSurfaceRejectedInvalidTriangleCount = directSurfaceRenderer.RejectedInvalidTriangleCount;
+            gpuSurfaceRejectedDegenerateTriangleCount = directSurfaceRenderer.RejectedDegenerateTriangleCount;
+            gpuSurfaceOuterTriangleCount = directSurfaceRenderer.OuterTriangleCount;
+            gpuSurfaceCutWallTriangleCount = directSurfaceRenderer.CutWallTriangleCount;
+            gpuSurfaceOuterIndexCount = directSurfaceRenderer.OuterIndexCount;
+            gpuSurfaceCutWallIndexCount = directSurfaceRenderer.CutWallIndexCount;
+            gpuSurfaceRawVertexCount = directSurfaceRenderer.RawVertexCount;
+            gpuSurfaceSourceVertexCountClamped = directSurfaceRenderer.SourceVertexCountClamped;
+            gpuSurfaceWrittenVertexCount = directSurfaceRenderer.WrittenVertexCount;
+            gpuSurfaceCapacityOverflow = directSurfaceRenderer.CapacityOverflow;
+            gpuSurfaceIndexedVertexCount = directSurfaceRenderer.IndexedVertexCount;
+            gpuSurfaceIndexedIndexCount = directSurfaceRenderer.IndexedIndexCount;
+            gpuSurfaceVertexMergeActive = directSurfaceRenderer.GpuVertexMergeActive;
+            gpuSurfaceTopologyDiagnosticReady = directSurfaceRenderer.TopologyDiagnosticReady;
+            gpuSurfaceTopologyDiagnosticSequence = directSurfaceRenderer.TopologyDiagnosticSequence;
+            gpuSurfaceTopologyOuterVertexSamples = directSurfaceRenderer.TopologyDiagnosticOuterVertexSamples;
+            gpuSurfaceTopologyUniqueOuterVertexEstimate = directSurfaceRenderer.TopologyDiagnosticUniqueOuterVertexEstimate;
+            gpuSurfaceTopologyDiagnosticError = directSurfaceRenderer.TopologyDiagnosticError;
         }
 
         Material CreateSurfaceMembraneMaterial()

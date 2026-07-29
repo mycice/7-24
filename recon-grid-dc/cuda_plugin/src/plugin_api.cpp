@@ -211,14 +211,20 @@ LCS_API int LCS_OrganTetToGridGetStats(uint32_t handle, OrganContextTetToGridSta
     return organ_context_tet_to_grid_get_stats(handle, outStats);
 }
 
-LCS_API int LCS_DirectSurfaceSetBuffers(void* positionBuffer, void* normalBuffer, void* auxBuffer,
-                                        void* vertexCountBuffer, int capacity)
+LCS_API int LCS_DirectSurfaceSetBuffers(void* outerPositionBuffer, void* outerNormalBuffer, void* outerAuxBuffer,
+                                        void* outerIndexBuffer, void* outerIndexCountBuffer,
+                                        void* cutPositionBuffer, void* cutNormalBuffer, void* cutAuxBuffer,
+                                        void* cutIndexBuffer, void* cutIndexCountBuffer, int capacity)
 {
-    return direct_surface_set_buffers(positionBuffer, normalBuffer, auxBuffer, vertexCountBuffer, capacity);
+    return direct_surface_set_buffers(outerPositionBuffer, outerNormalBuffer, outerAuxBuffer,
+                                      outerIndexBuffer, outerIndexCountBuffer,
+                                      cutPositionBuffer, cutNormalBuffer, cutAuxBuffer,
+                                      cutIndexBuffer, cutIndexCountBuffer, capacity);
 }
 LCS_API void LCS_DirectSurfaceRelease() { direct_surface_release(); }
 LCS_API void* LCS_GetDirectSurfaceRenderEventFunc() { return direct_surface_get_render_event(); }
 LCS_API int LCS_DirectSurfaceGetStats(DirectSurfaceStats* outStats) { return direct_surface_get_stats(outStats); }
+LCS_API int LCS_DirectSurfaceRequestTopologyDiagnostic() { return direct_surface_request_topology_diagnostic(); }
 
 // Free all device buffers.
 LCS_API void LCS_Shutdown()
