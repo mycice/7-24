@@ -21,6 +21,8 @@ namespace ReconGridDC.Cuda
         [Tooltip("Scene object that owns the visible cutting line. Drag this GameObject into inverseAPI/TargetObject.targetObject.")]
         public LiverCuttingRod cuttingRodTarget;
         public bool autoCreateCuttingRodTarget = true;
+        [Tooltip("Place the cutting rod at this organ's grid center during initialization. Disable this on additional organs that share the primary organ's rod.")]
+        public bool initializeCuttingRodPose = true;
         [Tooltip("When true, this cutter writes rodLength/thickness to the target every frame. Disable this when a model-driven tool, such as xiaogun_v1, owns its visual length.")]
         public bool driveCuttingRodShape = true;
         public float rodLength = 12f;
@@ -52,6 +54,8 @@ namespace ReconGridDC.Cuda
         public KeyCode pitchDownKey = KeyCode.DownArrow;
 
         const string DLL = "LiverCudaSim";
+        const string DLL2 = "LiverCudaSim2";
+        [HideInInspector] public CudaPluginInstance pluginInstance;
 
         [StructLayout(LayoutKind.Sequential)]
         struct CutInitDesc
@@ -85,6 +89,14 @@ namespace ReconGridDC.Cuda
         [DllImport(DLL)] static extern int LCS_InitCut(ref CutInitDesc desc, Conn4096Interop[] conn4096, GridEdge2Interop[] gridEdges, int[] voxelOccupied, int[] cornerInside);
         [DllImport(DLL)] static extern void LCS_SetTool(ref CutToolDesc tool);
         [DllImport(DLL)] static extern int LCS_DetectCut();
+        [DllImport(DLL2, EntryPoint = "LCS_InitCut")] static extern int LCS2_InitCut(ref CutInitDesc desc, Conn4096Interop[] conn4096, GridEdge2Interop[] gridEdges, int[] voxelOccupied, int[] cornerInside);
+        [DllImport(DLL2, EntryPoint = "LCS_SetTool")] static extern void LCS2_SetTool(ref CutToolDesc tool);
+        [DllImport(DLL2, EntryPoint = "LCS_DetectCut")] static extern int LCS2_DetectCut();
+
+        bool SecondaryPlugin => pluginInstance == CudaPluginInstance.Secondary;
+        int NativeInitCut(ref CutInitDesc d, Conn4096Interop[] c, GridEdge2Interop[] e, int[] o, int[] i) => SecondaryPlugin ? LCS2_InitCut(ref d,c,e,o,i) : LCS_InitCut(ref d,c,e,o,i);
+        void NativeSetTool(ref CutToolDesc t) { if (SecondaryPlugin) LCS2_SetTool(ref t); else LCS_SetTool(ref t); }
+        int NativeDetectCut() => SecondaryPlugin ? LCS2_DetectCut() : LCS_DetectCut();
 
         CuttingTool _tool;
         float _voxelL;
@@ -167,7 +179,7 @@ namespace ReconGridDC.Cuda
             var insideI = new int[grid.cornerCount];
             for (int ci = 0; ci < grid.cornerCount; ci++) insideI[ci] = grid.cornerInside[ci];
 
-            int rc = LCS_InitCut(ref cdesc, connI, geI, occI, insideI);
+            int rc = NativeInitCut(ref cdesc, connI, geI, occI, insideI);
             if (rc != 0)
             {
                 _nativeReady = false;
@@ -260,6 +272,26 @@ namespace ReconGridDC.Cuda
         {
             enableKeyboardControl = enabled;
             SynchronizeInputMode();
+        }
+
+        public LiverCuttingRod GetOrCreateCuttingRodTarget()
+        {
+            if (cuttingRodTarget != null || !autoCreateCuttingRodTarget)
+                return cuttingRodTarget;
+
+            var go = new GameObject("LiverCuttingRodTarget");
+            go.transform.SetParent(transform, false);
+            cuttingRodTarget = go.AddComponent<LiverCuttingRod>();
+            return cuttingRodTarget;
+        }
+
+        public void BindSharedCuttingRod(LiverCuttingRod sharedTarget)
+        {
+            cuttingRodTarget = sharedTarget;
+            autoCreateCuttingRodTarget = false;
+            initializeCuttingRodPose = false;
+            driveCuttingRodShape = false;
+            SetKeyboardControlEnabled(false);
         }
 
         void ApplyKeyboardControl()
@@ -395,12 +427,7 @@ namespace ReconGridDC.Cuda
         {
             if (!enableCutting) return;
 
-            if (cuttingRodTarget == null && autoCreateCuttingRodTarget)
-            {
-                var go = new GameObject("LiverCuttingRodTarget");
-                go.transform.SetParent(transform, false);
-                cuttingRodTarget = go.AddComponent<LiverCuttingRod>();
-            }
+            GetOrCreateCuttingRodTarget();
 
             if (cuttingRodTarget == null)
             {
@@ -414,7 +441,8 @@ namespace ReconGridDC.Cuda
                 cuttingRodTarget.Configure(initialLength, initialThickness);
             }
 
-            cuttingRodTarget.SetPose(initialCenter, initialAxis);
+            if (initializeCuttingRodPose)
+                cuttingRodTarget.SetPose(initialCenter, initialAxis);
         }
 
         CutToolDesc MakeToolDesc(CuttingTool t)
@@ -458,8 +486,8 @@ namespace ReconGridDC.Cuda
             var centerTool = MakeToolDesc(t);
             if (centerTool.valid == 0)
             {
-                LCS_SetTool(ref centerTool);
-                LCS_DetectCut();
+                NativeSetTool(ref centerTool);
+                NativeDetectCut();
                 return false;
             }
 
@@ -480,14 +508,14 @@ namespace ReconGridDC.Cuda
 
                         float u = ((float)i / (samples - 1) - 0.5f) * 2f;
                         var offsetTool = MakeToolDesc(t, offsetAxis * (u * radius));
-                        LCS_SetTool(ref offsetTool);
-                        LCS_DetectCut();
+                        NativeSetTool(ref offsetTool);
+                        NativeDetectCut();
                     }
                 }
             }
 
-            LCS_SetTool(ref centerTool);
-            LCS_DetectCut();
+            NativeSetTool(ref centerTool);
+            NativeDetectCut();
             return true;
         }
 

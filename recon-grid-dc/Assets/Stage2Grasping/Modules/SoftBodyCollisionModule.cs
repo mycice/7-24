@@ -17,6 +17,8 @@ namespace ReconGridDC.Stage2Grasping.Modules
         [Range(0f, 1f)] public float toolContactTangentialDamping = 0.5f;
         public bool useToolContactCandidateCulling = true;
         [Range(0f, 0.25f)] public float toolContactCandidatePadding = 0.06f;
+        [Tooltip("Extra world-space margin around this organ's rest bounds for the dual-organ CPU broad phase. Increase it if a strongly deformed organ stops receiving tool contact.")]
+        [Min(0f)] public float organBroadphasePadding = 0.5f;
         [Tooltip("Keep solving already-overlapping candidates after keyboard motion stops. This prevents the gripper from remaining inside the physical organ until elasticity slowly pulls it back out.")]
         public bool keepContactActiveWhenIdle = true;
 

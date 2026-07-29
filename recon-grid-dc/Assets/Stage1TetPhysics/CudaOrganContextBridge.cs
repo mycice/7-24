@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using ReconGridDC.Stage1TetPhysics.Core;
 using ReconGridDC.Stage2Grasping.Grasping;
 using ReconGridDC.Stage2Grasping.Modules;
+using ReconGridDC.Cuda;
 using UnityEngine;
 
 namespace ReconGridDC.Stage1TetPhysics
@@ -29,6 +30,11 @@ namespace ReconGridDC.Stage1TetPhysics
     public sealed class CudaOrganContextBridge : MonoBehaviour
     {
         const string Dll = "LiverCudaSim";
+        const string Dll2 = "LiverCudaSim2";
+
+        [Header("Multi-organ instance")]
+        [Tooltip("Secondary routes this organ context and its Tet-to-Grid writes to LiverCudaSim2.dll.")]
+        public CudaPluginInstance pluginInstance;
 
         public enum CudaXpbdMode
         {
@@ -175,6 +181,35 @@ namespace ReconGridDC.Stage1TetPhysics
         [DllImport(Dll)] static extern int LCS_OrganTetToGridUpdate(uint handle, int applyLocalDeformation);
         [DllImport(Dll)] static extern int LCS_OrganTetToGridGetStats(uint handle, out OrganContextTetToGridStatsNative stats);
 
+        [DllImport(Dll2, EntryPoint="LCS_OrganCreate")] static extern int LCS2_OrganCreate(out uint handle);
+        [DllImport(Dll2, EntryPoint="LCS_OrganDestroy")] static extern int LCS2_OrganDestroy(uint handle);
+        [DllImport(Dll2, EntryPoint="LCS_OrganInitialize")] static extern int LCS2_OrganInitialize(uint handle, ref OrganContextInitDesc desc, float[] restPositions3, int[] tetIds4, float[] inverseMass, float[] restVolumes, int[] tetActive, int[] surfaceTriangleIds3, int[] edgeConstraintIds2, float[] edgeRestLengths);
+        [DllImport(Dll2, EntryPoint="LCS_OrganGetStats")] static extern int LCS2_OrganGetStats(uint handle, out OrganContextStatsNative stats);
+        [DllImport(Dll2, EntryPoint="LCS_OrganXpbdInitialize")] static extern int LCS2_OrganXpbdInitialize(uint handle, float[] initialPositions3, int edgeColorCount, int[] edgeColorOffsets, int[] edgeColorCounts, int[] edgeColorFlat, int tetColorCount, int[] tetColorOffsets, int[] tetColorCounts, int[] tetColorFlat, int surfaceColorCount, int[] surfaceColorOffsets, int[] surfaceColorCounts, int[] surfaceColorFlat);
+        [DllImport(Dll2, EntryPoint="LCS_OrganXpbdStep")] static extern int LCS2_OrganXpbdStep(uint handle, float dt, ref OrganContextXpbdParams parameters);
+        [DllImport(Dll2, EntryPoint="LCS_OrganXpbdComparePositions")] static extern int LCS2_OrganXpbdComparePositions(uint handle, float[] positions, int count, out OrganContextComparisonStatsNative stats);
+        [DllImport(Dll2, EntryPoint="LCS_OrganXpbdGetPositions")] static extern int LCS2_OrganXpbdGetPositions(uint handle, float[] positions, int count);
+        [DllImport(Dll2, EntryPoint="LCS_OrganToolStep")] static extern int LCS2_OrganToolStep(uint handle, float dt, CudaToolCapsule[] capsules, ref OrganContextToolContactParamsNative parameters);
+        [DllImport(Dll2, EntryPoint="LCS_OrganToolGetStats")] static extern int LCS2_OrganToolGetStats(uint handle, out OrganContextToolContactStatsNative stats);
+        [DllImport(Dll2, EntryPoint="LCS_OrganTetToGridConfigure")] static extern int LCS2_OrganTetToGridConfigure(uint handle, ref OrganContextTetToGridDescNative desc, int[] hostTetByCorner, float[] weights, float[] corners, byte[] mask);
+        [DllImport(Dll2, EntryPoint="LCS_OrganTetToGridUpdate")] static extern int LCS2_OrganTetToGridUpdate(uint handle, int applyLocalDeformation);
+        [DllImport(Dll2, EntryPoint="LCS_OrganTetToGridGetStats")] static extern int LCS2_OrganTetToGridGetStats(uint handle, out OrganContextTetToGridStatsNative stats);
+
+        bool SecondaryPlugin => pluginInstance == CudaPluginInstance.Secondary;
+        int NativeOrganCreate(out uint h) { return SecondaryPlugin ? LCS2_OrganCreate(out h) : LCS_OrganCreate(out h); }
+        int NativeOrganDestroy(uint h) => SecondaryPlugin ? LCS2_OrganDestroy(h) : LCS_OrganDestroy(h);
+        int NativeOrganInitialize(uint h,ref OrganContextInitDesc d,float[] r,int[] t,float[] m,float[] v,int[] a,int[] s,int[] e,float[] l) => SecondaryPlugin ? LCS2_OrganInitialize(h,ref d,r,t,m,v,a,s,e,l) : LCS_OrganInitialize(h,ref d,r,t,m,v,a,s,e,l);
+        int NativeOrganGetStats(uint h,out OrganContextStatsNative s) { return SecondaryPlugin ? LCS2_OrganGetStats(h,out s) : LCS_OrganGetStats(h,out s); }
+        int NativeXpbdInitialize(uint h,float[] p,int ec,int[] eo,int[] en,int[] ef,int tc,int[] to,int[] tn,int[] tf,int sc,int[] so,int[] sn,int[] sf) => SecondaryPlugin ? LCS2_OrganXpbdInitialize(h,p,ec,eo,en,ef,tc,to,tn,tf,sc,so,sn,sf) : LCS_OrganXpbdInitialize(h,p,ec,eo,en,ef,tc,to,tn,tf,sc,so,sn,sf);
+        int NativeXpbdStep(uint h,float dt,ref OrganContextXpbdParams p) => SecondaryPlugin ? LCS2_OrganXpbdStep(h,dt,ref p) : LCS_OrganXpbdStep(h,dt,ref p);
+        int NativeXpbdCompare(uint h,float[] p,int c,out OrganContextComparisonStatsNative s) { return SecondaryPlugin ? LCS2_OrganXpbdComparePositions(h,p,c,out s) : LCS_OrganXpbdComparePositions(h,p,c,out s); }
+        int NativeXpbdGetPositions(uint h,float[] p,int c) => SecondaryPlugin ? LCS2_OrganXpbdGetPositions(h,p,c) : LCS_OrganXpbdGetPositions(h,p,c);
+        int NativeToolStep(uint h,float dt,CudaToolCapsule[] c,ref OrganContextToolContactParamsNative p) => SecondaryPlugin ? LCS2_OrganToolStep(h,dt,c,ref p) : LCS_OrganToolStep(h,dt,c,ref p);
+        int NativeToolGetStats(uint h,out OrganContextToolContactStatsNative s) { return SecondaryPlugin ? LCS2_OrganToolGetStats(h,out s) : LCS_OrganToolGetStats(h,out s); }
+        int NativeTetToGridConfigure(uint h,ref OrganContextTetToGridDescNative d,int[] t,float[] w,float[] c,byte[] m) => SecondaryPlugin ? LCS2_OrganTetToGridConfigure(h,ref d,t,w,c,m) : LCS_OrganTetToGridConfigure(h,ref d,t,w,c,m);
+        int NativeTetToGridUpdate(uint h,int a) => SecondaryPlugin ? LCS2_OrganTetToGridUpdate(h,a) : LCS_OrganTetToGridUpdate(h,a);
+        int NativeTetToGridGetStats(uint h,out OrganContextTetToGridStatsNative s) { return SecondaryPlugin ? LCS2_OrganTetToGridGetStats(h,out s) : LCS_OrganTetToGridGetStats(h,out s); }
+
         [Header("CUDA Migration Phase 1")]
         [Tooltip("Creates an isolated native CUDA organ context and uploads immutable tetrahedral data once. It does not drive XPBD, gripper contact, Tet-to-Grid, cutting, or rendering.")]
         public bool enableCudaOrganContext = true;
@@ -253,6 +288,9 @@ namespace ReconGridDC.Stage1TetPhysics
         [SerializeField] float cudaToolLastMilliseconds;
         [SerializeField] float cudaToolTotalMilliseconds;
         [SerializeField] int cudaToolLastError;
+        [SerializeField] bool cudaToolBroadphaseOverlapping;
+        [SerializeField] bool cudaToolBroadphaseDisabled;
+        [SerializeField] bool cudaToolGraspLocked;
         [SerializeField] bool cudaTetToGridReady;
         [SerializeField] string cudaTetToGridStatus = "CUDA Tet-to-Grid is disabled.";
         [SerializeField] int cudaTetToGridMappedCorners;
@@ -271,6 +309,9 @@ namespace ReconGridDC.Stage1TetPhysics
         bool _createAttempted;
         readonly CudaToolCapsule[] _toolCapsules = new CudaToolCapsule[12];
         float[] _temporaryPositionReadback;
+        Bounds _organRestBounds;
+        bool _organRestBoundsReady;
+        bool _cudaGraspMayBeActive;
 
         public bool IsCudaDriverActive =>
             contextReady && cudaXpbdReady && enableCudaXpbd &&
@@ -355,7 +396,7 @@ namespace ReconGridDC.Stage1TetPhysics
 
             try
             {
-                lastNativeError = LCS_OrganCreate(out contextHandle);
+                lastNativeError = NativeOrganCreate(out contextHandle);
             }
             catch (EntryPointNotFoundException)
             {
@@ -389,7 +430,7 @@ namespace ReconGridDC.Stage1TetPhysics
                     poissonsRatio = _softBody.poissonsRatio,
                     damping = _softBody.damping
                 };
-                lastNativeError = LCS_OrganInitialize(contextHandle, ref desc,
+                lastNativeError = NativeOrganInitialize(contextHandle, ref desc,
                     Flatten(data.RestPositions, data.NumParticles), data.TetIds,
                     BuildUnityEquivalentInverseMass(data, _softBody.density),
                     data.RestVolumes, tetActive, data.SurfaceTriIds, edgeIds, edgeLengths);
@@ -401,6 +442,7 @@ namespace ReconGridDC.Stage1TetPhysics
                 }
 
                 contextReady = true;
+                CacheOrganRestBounds(data);
                 InitializeCudaXpbd(data, edgeIds);
                 status = cudaXpbdReady
                     ? "Static and CUDA XPBD data uploaded. Unity XPBD remains the active runtime driver unless CUDA Driver Isolated is selected."
@@ -419,7 +461,7 @@ namespace ReconGridDC.Stage1TetPhysics
         {
             if (contextHandle == 0)
                 return;
-            lastNativeError = LCS_OrganGetStats(contextHandle, out OrganContextStatsNative stats);
+            lastNativeError = NativeOrganGetStats(contextHandle, out OrganContextStatsNative stats);
             if (lastNativeError != 0)
             {
                 contextReady = false;
@@ -459,7 +501,7 @@ namespace ReconGridDC.Stage1TetPhysics
         {
             if (contextHandle == 0)
                 return;
-            int rc = LCS_OrganDestroy(contextHandle);
+            int rc = NativeOrganDestroy(contextHandle);
             if (rc != 0 && logContextDiagnostics)
                 Debug.LogWarning($"[CudaOrganContext] LCS_OrganDestroy({contextHandle}) returned {rc}.", this);
             contextHandle = 0;
@@ -486,7 +528,7 @@ namespace ReconGridDC.Stage1TetPhysics
                     out int[] surfaceOffsets, out int[] surfaceCounts, out int[] surfaceFlat);
                 cudaEdgeColorCount = edgeCounts.Length;
                 cudaTetColorCount = tetCounts.Length;
-                lastNativeError = LCS_OrganXpbdInitialize(contextHandle,
+                lastNativeError = NativeXpbdInitialize(contextHandle,
                     Flatten(data.Positions, data.NumParticles),
                     edgeCounts.Length, edgeOffsets, edgeCounts, edgeFlat,
                     tetCounts.Length, tetOffsets, tetCounts, tetFlat,
@@ -528,7 +570,7 @@ namespace ReconGridDC.Stage1TetPhysics
                 gravityZ = gravity.z,
                 groundY = _softBody.groundY
             };
-            lastNativeError = LCS_OrganXpbdStep(contextHandle, dt, ref parameters);
+            lastNativeError = NativeXpbdStep(contextHandle, dt, ref parameters);
             if (lastNativeError != 0)
             {
                 cudaXpbdStatus = $"LCS_OrganXpbdStep failed ({lastNativeError}). Unity XPBD remains available as the fallback.";
@@ -582,15 +624,68 @@ namespace ReconGridDC.Stage1TetPhysics
                 axisVX = axisV.x, axisVY = axisV.y, axisVZ = axisV.z,
                 axisWX = axisW.x, axisWY = axisW.y, axisWZ = axisW.z
             };
-            lastNativeError = LCS_OrganToolStep(contextHandle, dt, _toolCapsules, ref parameters);
+
+            bool toolOverlapsOrgan = ToolBoundsOverlapOrgan(bounds, settings);
+            bool keepLockedGraspActive = _cudaGraspMayBeActive && gripper.WantsClosedGrasp;
+            bool releaseLockedGrasp = _cudaGraspMayBeActive && !gripper.WantsClosedGrasp;
+            bool useDisabledPacket = !toolOverlapsOrgan && !keepLockedGraspActive;
+            cudaToolBroadphaseOverlapping = toolOverlapsOrgan;
+            cudaToolBroadphaseDisabled = useDisabledPacket;
+            if (useDisabledPacket)
+            {
+                capsuleCount = 0;
+                parameters.capsuleCount = 0;
+                parameters.contactEnabled = 0;
+                parameters.graspRequest = 0;
+                parameters.releaseRequest = releaseLockedGrasp ? 1 : 0;
+            }
+
+            lastNativeError = NativeToolStep(contextHandle, dt, _toolCapsules, ref parameters);
             if (lastNativeError != 0)
             {
                 cudaToolContactStatus = $"LCS_OrganToolStep failed ({lastNativeError}). Legacy Unity contact remains active for this step.";
                 return false;
             }
             cudaToolContactActive = true;
-            cudaToolContactStatus = $"CUDA tool packet uploaded ({capsuleCount} capsules). Contact and grasp constraints execute inside the following CUDA XPBD step.";
+            if (!gripper.WantsClosedGrasp)
+                _cudaGraspMayBeActive = false;
+            else if (toolOverlapsOrgan)
+                _cudaGraspMayBeActive = true;
+            cudaToolGraspLocked = _cudaGraspMayBeActive;
+            cudaToolContactStatus = releaseLockedGrasp
+                ? "CUDA grasp released after the tool left this organ; contact is now disabled by the organ bounds broad phase."
+                : keepLockedGraspActive && !toolOverlapsOrgan
+                ? "CUDA grasp lock keeps this organ active outside its rest bounds until the gripper opens."
+                : useDisabledPacket
+                ? "CUDA tool contact disabled by the organ bounds broad phase; no capsule upload or contact iteration is needed for this organ."
+                : $"CUDA tool packet uploaded ({capsuleCount} capsules). Contact and grasp constraints execute inside the following CUDA XPBD step.";
             return true;
+        }
+
+        void CacheOrganRestBounds(TetMeshData data)
+        {
+            _organRestBoundsReady = false;
+            if (data == null || data.RestPositions == null || data.NumParticles <= 0)
+                return;
+
+            Bounds bounds = new Bounds(data.RestPositions[0], Vector3.zero);
+            for (int i = 1; i < data.NumParticles; ++i)
+                bounds.Encapsulate(data.RestPositions[i]);
+            _organRestBounds = bounds;
+            _organRestBoundsReady = true;
+        }
+
+        bool ToolBoundsOverlapOrgan(Bounds toolBounds, SoftBodyCollisionModule settings)
+        {
+            if (!_organRestBoundsReady)
+                return true;
+
+            Bounds expandedOrganBounds = _organRestBounds;
+            float padding = Mathf.Max(0f, settings.organBroadphasePadding) +
+                            Mathf.Max(0f, settings.toolContactCandidatePadding) +
+                            Mathf.Max(0f, settings.toolContactDistance);
+            expandedOrganBounds.Expand(2f * padding);
+            return expandedOrganBounds.Intersects(toolBounds);
         }
 
         public bool PublishCudaPositions(TetMeshData data)
@@ -600,7 +695,7 @@ namespace ReconGridDC.Stage1TetPhysics
             int count = data.NumParticles;
             if (_temporaryPositionReadback == null || _temporaryPositionReadback.Length != count * 3)
                 _temporaryPositionReadback = new float[count * 3];
-            lastNativeError = LCS_OrganXpbdGetPositions(contextHandle, _temporaryPositionReadback, count);
+            lastNativeError = NativeXpbdGetPositions(contextHandle, _temporaryPositionReadback, count);
             if (lastNativeError != 0)
             {
                 cudaXpbdStatus = $"LCS_OrganXpbdGetPositions failed ({lastNativeError}).";
@@ -647,7 +742,7 @@ namespace ReconGridDC.Stage1TetPhysics
             };
             try
             {
-                lastNativeError = LCS_OrganTetToGridConfigure(contextHandle, ref desc, hostTetByCorner, flatWeights, flatRest, activeMask);
+                lastNativeError = NativeTetToGridConfigure(contextHandle, ref desc, hostTetByCorner, flatWeights, flatRest, activeMask);
             }
             catch (EntryPointNotFoundException)
             {
@@ -674,7 +769,7 @@ namespace ReconGridDC.Stage1TetPhysics
         {
             if (!cudaTetToGridReady || !CanUseCudaTetToGrid)
                 return false;
-            lastNativeError = LCS_OrganTetToGridUpdate(contextHandle, applyLocalDeformation ? 1 : 0);
+            lastNativeError = NativeTetToGridUpdate(contextHandle, applyLocalDeformation ? 1 : 0);
             if (lastNativeError != 0)
             {
                 cudaTetToGridStatus = $"LCS_OrganTetToGridUpdate failed ({lastNativeError}); Stage 3 CPU synchronization remains available.";
@@ -688,7 +783,7 @@ namespace ReconGridDC.Stage1TetPhysics
         {
             if (!contextReady || !enableCudaTetToGrid) return;
             OrganContextTetToGridStatsNative stats;
-            try { lastNativeError = LCS_OrganTetToGridGetStats(contextHandle, out stats); }
+            try { lastNativeError = NativeTetToGridGetStats(contextHandle, out stats); }
             catch (EntryPointNotFoundException) { return; }
             if (lastNativeError != 0) { cudaTetToGridLastError = lastNativeError; return; }
             cudaTetToGridMappedCorners = stats.mappedCorners;
@@ -702,7 +797,7 @@ namespace ReconGridDC.Stage1TetPhysics
 
         void ReadToolStats()
         {
-            lastNativeError = LCS_OrganToolGetStats(contextHandle, out OrganContextToolContactStatsNative tool);
+            lastNativeError = NativeToolGetStats(contextHandle, out OrganContextToolContactStatsNative tool);
             if (lastNativeError != 0)
             {
                 cudaToolContactStatus = $"LCS_OrganToolGetStats failed ({lastNativeError}).";
@@ -732,7 +827,7 @@ namespace ReconGridDC.Stage1TetPhysics
                 return;
 
             _nextComparisonTime = Time.unscaledTime + Mathf.Max(0.05f, comparisonIntervalSeconds);
-            lastNativeError = LCS_OrganXpbdComparePositions(contextHandle,
+            lastNativeError = NativeXpbdCompare(contextHandle,
                 Flatten(data.Positions, data.NumParticles), data.NumParticles,
                 out OrganContextComparisonStatsNative comparison);
             if (lastNativeError != 0)

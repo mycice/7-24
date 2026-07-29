@@ -23,6 +23,12 @@ namespace ReconGridDC.Cuda
         [Header("Liver model (under StreamingAssets)")]
         public string mshFileName = "liver3_refined_1.msh";
 
+        [Header("Multi-organ instance")]
+        [Tooltip("Selects an isolated native plugin module. Secondary requires LiverCudaSim2.dll beside LiverCudaSim.dll.")]
+        public CudaPluginInstance pluginInstance;
+        [Tooltip("World-space translation applied to the complete CUDA grid, intersections, cutting origin, and render bounds.")]
+        public Vector3 initialWorldOffset;
+
         [Header("Grid fitting + smoothing")]
         public int targetLongAxisVoxels = 48;
         public int marginVoxels         = 2;
@@ -85,12 +91,19 @@ namespace ReconGridDC.Cuda
         public bool hideRawCudaSurfaceWhenVisualActive = true;
 
         [Header("CUDA Migration Phase 4 - GPU Direct Surface")]
-        [Tooltip("Default phase-4 rendering path. On Direct3D11, CUDA copies the reconstructed surface directly into Unity GPU buffers and normal frames skip full surface readback and Mesh.SetVertices/SetNormals. CPU Mesh remains the automatic fallback.")]
+        [Tooltip("Default GPU-resident rendering path. On Direct3D11, CUDA writes the reconstructed surface directly into Unity GPU buffers.")]
         public bool preferGpuDirectSurface = true;
-        [Tooltip("Keeps the established CPU Mesh reconstruction available when Direct3D11 interop is unavailable or reports an error.")]
-        public bool allowCpuMeshFallback = true;
+        [Tooltip("Explicit compatibility mode. When enabled, a Direct Surface failure starts continuous full-surface GPU-to-CPU readback. Keep disabled for phase-5 performance validation.")]
+        public bool allowCpuMeshFallback;
         [Tooltip("Serialized to ensure the direct-surface shader is included in player builds.")]
         public Shader cudaDirectSurfaceShader;
+
+        [Header("CUDA Migration Phase 5 - Single Organ Finalization")]
+        [Tooltip("Conservative cutting-rod coverage relative to the rest-grid longest axis. This replaces the former periodic full corner/adjacency readback used only to estimate deformed extent.")]
+        [Min(1f)] public float conservativeCutRodSpanMultiplier = 3f;
+        [Tooltip("Allows the legacy full corner/adjacency diagnostic to run periodically. Keep disabled during normal performance tests; press P for one explicit diagnostic snapshot.")]
+        public bool enableAutomaticFullStateDiagnostics;
+        [Min(0.25f)] public float automaticDiagnosticIntervalSeconds = 1f;
 
         [Header("Cut Diagnostics")]
         [Tooltip("Reads CUDA cut-debug counters every frame. Enable only while diagnosing cutting artifacts because this can synchronize CUDA with the CPU and reduce frame rate.")]
@@ -174,6 +187,7 @@ namespace ReconGridDC.Cuda
 
         // ── native plugin P/Invoke ────────────────────────────────────────────────────────────
         const string DLL = "LiverCudaSim";
+        const string DLL2 = "LiverCudaSim2";
 
         [StructLayout(LayoutKind.Sequential)]
         struct ReconInitDesc { public int voxelCount, cornerCount, isectCount, surfaceEdgeCount, triCapacity, dimsX, dimsY, dimsZ; public float L; public int qefIters; }
@@ -202,6 +216,41 @@ namespace ReconGridDC.Cuda
         [DllImport(DLL)] static extern int  LCS_GetCutDebug([Out] uint[] out18, out float alpha);  // [DEBUG-CUT] v4.1 P3
         [DllImport(DLL)] static extern int  LCS_GetSurfaceAux([Out] float[] outAux4);  // UV1: rest anchor + wall flag (render design §4.4)
         [DllImport(DLL)] static extern void LCS_Shutdown();
+
+        [DllImport(DLL2, EntryPoint = "LCS_Init")] static extern int LCS2_Init(ref ReconInitDesc desc, float[] cornerPos, int[] voxelCorner, int[] voxelIsectOffset, int[] voxelIsectCount, IsectInterop[] isect, GridEdgeInterop[] surfaceEdges);
+        [DllImport(DLL2, EntryPoint = "LCS_InitPhysics")] static extern int LCS2_InitPhysics(ref PhysicsInitDesc desc, float[] mass, int[] pinned, int[] active, float[] extForce, int[] nbrIdx, float[] restNbr, BendPairInterop[] bendPairs);
+        [DllImport(DLL2, EntryPoint = "LCS_Step")] static extern int LCS2_Step(float dt);
+        [DllImport(DLL2, EntryPoint = "LCS_SetCornerPos")] static extern int LCS2_SetCornerPos(float[] positions);
+        [DllImport(DLL2, EntryPoint = "LCS_ComputeRotations")] static extern int LCS2_ComputeRotations();
+        [DllImport(DLL2, EntryPoint = "LCS_SetCutRestMetric")] static extern int LCS2_SetCutRestMetric(float[] positions, float x, float y, float z);
+        [DllImport(DLL2, EntryPoint = "LCS_ClearCutRestMetric")] static extern void LCS2_ClearCutRestMetric();
+        [DllImport(DLL2, EntryPoint = "LCS_SetCutGravityStabilization")] static extern int LCS2_SetCutGravityStabilization(int enabled, float x, float y, float z, float gap, float exponent);
+        [DllImport(DLL2, EntryPoint = "LCS_Finalize")] static extern int LCS2_Finalize();
+        [DllImport(DLL2, EntryPoint = "LCS_GetSurfaceCounts")] static extern int LCS2_GetSurfaceCounts(out int vertexCount, out int indexCount);
+        [DllImport(DLL2, EntryPoint = "LCS_GetSurface")] static extern int LCS2_GetSurface([Out] float[] outPos3, [Out] float[] outNrm3, [Out] int[] outIdx);
+        [DllImport(DLL2, EntryPoint = "LCS_GetNbrIdx")] static extern int LCS2_GetNbrIdx([Out] int[] outNbr);
+        [DllImport(DLL2, EntryPoint = "LCS_GetCornerPos")] static extern int LCS2_GetCornerPos([Out] float[] outPos);
+        [DllImport(DLL2, EntryPoint = "LCS_GetCutDebug")] static extern int LCS2_GetCutDebug([Out] uint[] out18, out float alpha);
+        [DllImport(DLL2, EntryPoint = "LCS_GetSurfaceAux")] static extern int LCS2_GetSurfaceAux([Out] float[] outAux4);
+        [DllImport(DLL2, EntryPoint = "LCS_Shutdown")] static extern void LCS2_Shutdown();
+
+        bool SecondaryPlugin => pluginInstance == CudaPluginInstance.Secondary;
+        int NativeInit(ref ReconInitDesc d, float[] p, int[] vc, int[] o, int[] c, IsectInterop[] i, GridEdgeInterop[] e) => SecondaryPlugin ? LCS2_Init(ref d,p,vc,o,c,i,e) : LCS_Init(ref d,p,vc,o,c,i,e);
+        int NativeInitPhysics(ref PhysicsInitDesc d, float[] m, int[] p, int[] a, float[] f, int[] n, float[] r, BendPairInterop[] b) => SecondaryPlugin ? LCS2_InitPhysics(ref d,m,p,a,f,n,r,b) : LCS_InitPhysics(ref d,m,p,a,f,n,r,b);
+        int NativeStep(float dt) => SecondaryPlugin ? LCS2_Step(dt) : LCS_Step(dt);
+        int NativeSetCornerPos(float[] p) => SecondaryPlugin ? LCS2_SetCornerPos(p) : LCS_SetCornerPos(p);
+        int NativeComputeRotations() => SecondaryPlugin ? LCS2_ComputeRotations() : LCS_ComputeRotations();
+        int NativeSetCutRestMetric(float[] p,float x,float y,float z) => SecondaryPlugin ? LCS2_SetCutRestMetric(p,x,y,z) : LCS_SetCutRestMetric(p,x,y,z);
+        void NativeClearCutRestMetric() { if (SecondaryPlugin) LCS2_ClearCutRestMetric(); else LCS_ClearCutRestMetric(); }
+        int NativeSetCutGravityStabilization(int e,float x,float y,float z,float g,float a) => SecondaryPlugin ? LCS2_SetCutGravityStabilization(e,x,y,z,g,a) : LCS_SetCutGravityStabilization(e,x,y,z,g,a);
+        int NativeFinalize() => SecondaryPlugin ? LCS2_Finalize() : LCS_Finalize();
+        int NativeGetSurfaceCounts(out int v,out int i) { return SecondaryPlugin ? LCS2_GetSurfaceCounts(out v,out i) : LCS_GetSurfaceCounts(out v,out i); }
+        int NativeGetSurface(float[] p,float[] n,int[] i) => SecondaryPlugin ? LCS2_GetSurface(p,n,i) : LCS_GetSurface(p,n,i);
+        int NativeGetNbrIdx(int[] n) => SecondaryPlugin ? LCS2_GetNbrIdx(n) : LCS_GetNbrIdx(n);
+        int NativeGetCornerPos(float[] p) => SecondaryPlugin ? LCS2_GetCornerPos(p) : LCS_GetCornerPos(p);
+        int NativeGetCutDebug(uint[] d,out float a) { return SecondaryPlugin ? LCS2_GetCutDebug(d,out a) : LCS_GetCutDebug(d,out a); }
+        int NativeGetSurfaceAux(float[] a) => SecondaryPlugin ? LCS2_GetSurfaceAux(a) : LCS_GetSurfaceAux(a);
+        void NativeShutdown() { if (SecondaryPlugin) LCS2_Shutdown(); else LCS_Shutdown(); }
 
         // ── runtime ───────────────────────────────────────────────────────────────────────────
         Mesh      mesh;
@@ -246,6 +295,9 @@ namespace ReconGridDC.Cuda
         [SerializeField] ulong gpuDirectSurfaceDispatchCount;
         [SerializeField] int gpuDirectSurfaceLastError;
         [SerializeField] ulong cpuSurfaceReadbackBytes;
+        [SerializeField] ulong cpuFullStateDiagnosticReadbackBytes;
+        [SerializeField] int fullStateDiagnosticReadbackCount;
+        [SerializeField] bool normalPlayPathHasFullArrayReadback;
         [SerializeField] bool manualSurfaceDiagnosticReadback;
         [Header("GPU Surface Correctness Baseline (runtime)")]
         [SerializeField] int gpuSurfaceRawTriangleCount;
@@ -300,7 +352,7 @@ namespace ReconGridDC.Cuda
 
             try
             {
-                int rc = LCS_SetCutRestMetric(alignedRestPositions, alignedVoxelSize.x, alignedVoxelSize.y, alignedVoxelSize.z);
+                int rc = NativeSetCutRestMetric(alignedRestPositions, alignedVoxelSize.x, alignedVoxelSize.y, alignedVoxelSize.z);
                 if (rc == 0)
                 {
                     _cutRestMetricActive = true;
@@ -325,7 +377,7 @@ namespace ReconGridDC.Cuda
             if (_cutter != null) _cutter.ResetCutMetricVoxelLength();
             if (!_cutRestMetricActive)
                 return;
-            try { LCS_ClearCutRestMetric(); }
+            try { NativeClearCutRestMetric(); }
             catch (System.EntryPointNotFoundException) { _cutRestMetricUnsupported = true; }
             _cutRestMetricActive = false;
         }
@@ -336,7 +388,7 @@ namespace ReconGridDC.Cuda
                 return false;
             try
             {
-                int rc = LCS_SetCutGravityStabilization(enabled ? 1 : 0,
+                int rc = NativeSetCutGravityStabilization(enabled ? 1 : 0,
                     gravity.x, gravity.y, gravity.z, Mathf.Max(0f, gapWorld),
                     Mathf.Clamp(alignmentExponent, 0.5f, 4f));
                 if (rc == 0) return true;
@@ -374,7 +426,7 @@ namespace ReconGridDC.Cuda
 
             try
             {
-                int rc = LCS_SetCornerPos(positions);
+                int rc = NativeSetCornerPos(positions);
                 if (rc == 0)
                     return true;
                 Debug.LogError($"[Stage3Coupling] LCS_SetCornerPos failed (rc={rc}).", this);
@@ -400,7 +452,9 @@ namespace ReconGridDC.Cuda
         float[]   diagPos;          // readback buffer [3*cc]
         int[]     diagComp;         // union-find parent [cc]
         float     diagInitMeanY = float.NaN;
-        int       _diagFrame;
+        float     _nextAutomaticDiagnosticTime;
+        bool      _shutdownComplete;
+        bool      _nativeRuntimeStarted;
         string _hudCoverage = "";
         float _smoothedFrameSeconds;
         float _displayFps;
@@ -431,12 +485,19 @@ namespace ReconGridDC.Cuda
             MshMesh mshMesh = MshLoader.LoadMsh(path);
             MshSurface surf = MshLoader.ExtractBoundary(mshMesh);
             MshLoader.Bounds(mshMesh, out float3 bmin, out float3 bmax);
-            projectUvMinRt = (Vector3)bmin;
+            float3 worldOffset = (float3)initialWorldOffset;
+            projectUvMinRt = (Vector3)(bmin + worldOffset);
             projectUvSizeRt = (Vector3)(bmax - bmin);
             var meshLs = new MeshLevelSet(surf);
             GridFit.FitToBounds(bmin, bmax, targetLongAxisVoxels, marginVoxels, out dimsRt, out Lrt, out originRt);
             var ls = new SmoothedSdfGrid(meshLs, originRt, dimsRt, Lrt, bakeOversample, smoothIters);
             BackgroundGrid g = BackgroundGrid.Build(ls, dimsRt, Lrt, originRt);
+            if (math.lengthsq(worldOffset) > 0f)
+            {
+                for (int c = 0; c < g.cornerCount; c++) g.cornerPos[c] += worldOffset;
+                for (int i = 0; i < g.isect.Length; i++) g.isect[i].globalRest += worldOffset;
+                originRt += worldOffset;
+            }
             gridCenterRt = originRt + 0.5f * (float3)dimsRt * Lrt;
 
             _gridRestCorners = new Vector3[g.cornerCount];
@@ -466,8 +527,9 @@ namespace ReconGridDC.Cuda
             var seI = new GridEdgeInterop[Mathf.Max(1, g.surfaceEdges.Length)];
             for (int i = 0; i < g.surfaceEdges.Length; i++) { var se = g.surfaceEdges[i]; seI[i] = new GridEdgeInterop { axis=se.axis, bcX=se.baseCorner.x, bcY=se.baseCorner.y, bcZ=se.baseCorner.z, insideA=se.insideA }; }
             var rdesc = new ReconInitDesc { voxelCount=g.voxelCount, cornerCount=g.cornerCount, isectCount=g.isect.Length, surfaceEdgeCount=g.surfaceEdges.Length, triCapacity=triCapacity, dimsX=dimsRt.x, dimsY=dimsRt.y, dimsZ=dimsRt.z, L=Lrt, qefIters=qefIters };
-            int rc = LCS_Init(ref rdesc, cornerPos, g.voxelCorner, g.voxelIsectOffset, g.voxelIsectCount, isectI, seI);
-            if (rc != 0) { Debug.LogError($"[LiverCuda] LCS_Init failed (rc={rc}). Check the DLL / CUDA runtime."); return; }
+            _nativeRuntimeStarted = true;
+            int rc = NativeInit(ref rdesc, cornerPos, g.voxelCorner, g.voxelIsectOffset, g.voxelIsectCount, isectI, seI);
+            if (rc != 0) { FailInitialization($"[LiverCuda] LCS_Init failed (rc={rc}). Check the DLL / CUDA runtime."); return; }
             initialized = true;
 
             // 3. Physics.
@@ -481,19 +543,18 @@ namespace ReconGridDC.Cuda
             var bendI = new BendPairInterop[Mathf.Max(1, g.bendPairs.Length)];
             for (int i = 0; i < g.bendPairs.Length; i++) { var bp = g.bendPairs[i]; bendI[i] = new BendPairInterop { i=bp.i, j=bp.j, k=bp.k, theta0=bp.theta0, alive=bp.alive }; }
             var pdesc = new PhysicsInitDesc { cornerCount=cc, bendPairCount=g.bendPairs.Length, ks=ks, cs=cs_damp, kb=kb, cb=cb, hInit=solverHInit, hMax=solverHMax, maxSubsteps=maxSubstepsPerFrame, alpha=globalDamp };
-            rc = LCS_InitPhysics(ref pdesc, g.mass, pinnedInt, activeInt, extForce, g.nbrIdx, restNbr, bendI);
-            if (rc != 0) { Debug.LogError($"[LiverCuda] LCS_InitPhysics failed (rc={rc})."); return; }
+            rc = NativeInitPhysics(ref pdesc, g.mass, pinnedInt, activeInt, extForce, g.nbrIdx, restNbr, bendI);
+            if (rc != 0) { FailInitialization($"[LiverCuda] LCS_InitPhysics failed (rc={rc})."); return; }
 
             // Diagnostic buffers (press P in Play to dump connected-components + gravity-motion ground truth).
             diagCornerCount = cc;
             diagActive = g.cornerActive; diagPinned = g.pinned;
-            diagNbr = new int[6 * cc]; diagPos = new float[3 * cc]; diagComp = new int[cc];
             diagNbrInit = (int[])g.nbrIdx.Clone();   // snapshot the pre-cut graph for per-axis sever counting
             // 4. Cutter runtime.
             EnsureCutterComponent();
             _gridEdgeCountRt = g.gridEdges.Length;
             rc = _cutter.InitializeNative(g, dimsRt, Lrt, originRt, gridCenterRt, triCapacity, tearStretchRatio, anchorAxis);
-            if (rc != 0) { Debug.LogError($"[LiverCuda] LiverCudaCutter.InitializeNative failed (rc={rc})."); return; }
+            if (rc != 0) { FailInitialization($"[LiverCuda] LiverCudaCutter.InitializeNative failed (rc={rc})."); return; }
             cutReady = true;
 
             // 6. Initial cut-aware rebuild + Mesh. The material is created FIRST (stage-2 review
@@ -501,13 +562,19 @@ namespace ReconGridDC.Cuda
             // first uploaded mesh then already carries UV1.
             mat = CreateLiverMaterial();
             cutMat = CreateCutMaterial();
-            LCS_Finalize();
+            rc = NativeFinalize();
+            if (rc != 0) { FailInitialization($"[LiverCuda] Initial LCS_Finalize failed (rc={rc})."); return; }
             SetupGpuDirectSurface();
-            if (!_gpuDirectSurfaceActive)
+            if (!_gpuDirectSurfaceActive && allowCpuMeshFallback)
             {
                 SetupSmoothVisualRenderer();
                 AllocRenderArrays();
                 BuildOrUpdateMesh(firstTime: true);
+            }
+            else if (!_gpuDirectSurfaceActive)
+            {
+                FailInitialization($"[LiverCuda] GPU Direct Surface is required for the phase-5 single-organ path: {gpuDirectSurfaceStatus}");
+                return;
             }
 
             // 7. Renderer + camera. LiverSurface (PhotorealisticLiver port) when enabled with all
@@ -520,6 +587,7 @@ namespace ReconGridDC.Cuda
             ApplyReferenceLighting();
             ApplyReferenceSceneRendering();
             SetupCamera();
+            RefreshTransferPolicyStatus();
 
             Debug.Log($"[LiverCuda] Stage 3 OK — grid {dimsRt} L={Lrt:F3} | pinned={pinnedCount}.");
         }
@@ -528,6 +596,7 @@ namespace ReconGridDC.Cuda
         {
             if (_cutter == null) _cutter = GetComponent<LiverCudaCutter>();
             if (_cutter == null) _cutter = gameObject.AddComponent<LiverCudaCutter>();
+            _cutter.pluginInstance = pluginInstance;
         }
 
         void Update()
@@ -540,7 +609,7 @@ namespace ReconGridDC.Cuda
             int rc;
             if (_externalGridDeformationActive)
             {
-                try { rc = LCS_ComputeRotations(); }
+                try { rc = NativeComputeRotations(); }
                 catch (System.EntryPointNotFoundException)
                 {
                     _externalUploadUnsupported = true;
@@ -552,7 +621,7 @@ namespace ReconGridDC.Cuda
             }
             else
             {
-                rc = LCS_Step(physicsDt);
+                rc = NativeStep(physicsDt);
                 if (rc != 0) { if ((_stepErrThrottle++ % 120) == 0) Debug.LogError($"[LiverCuda] LCS_Step failed (rc={rc})."); return; }
             }
 
@@ -561,7 +630,7 @@ namespace ReconGridDC.Cuda
 
             // c. Rotations + cut-aware rebuild, then render. rc check (final review V1-m2): the
             // v4.1 chain can fail with -3300/-3301 (dbg memset / epoch roll) — surface it.
-            rc = LCS_Finalize();
+            rc = NativeFinalize();
             if (rc != 0 && (_stepErrThrottle++ % 120) == 0) Debug.LogError($"[LiverCuda] LCS_Finalize failed (rc={rc}).");
             if (_gpuDirectSurfaceActive)
             {
@@ -577,17 +646,47 @@ namespace ReconGridDC.Cuda
                     gpuDirectSurfaceStatus = "One manual CPU surface diagnostic readback completed; GPU direct rendering remains active.";
                 }
             }
-            if (!_gpuDirectSurfaceActive)
+            if (!_gpuDirectSurfaceActive && allowCpuMeshFallback)
             {
                 EnsureCpuSurfaceFallback();
                 BuildOrUpdateMesh(firstTime: false);
                 SyncSurfaceMembraneSettings();
             }
-            // d. Diagnostics. Auto gravity-motion log every ~1s; press P for a full split/gravity dump.
+            // d. Small scalar counters are optional. Complete corner/adjacency arrays are manual by
+            // default and never participate in the normal rendering or cutting path.
             if (enablePerFrameCutDebug)
                 PollCutDebug();
-            if ((_diagFrame++ % 60) == 0) LogGravityMotion();
+            if (enableAutomaticFullStateDiagnostics && Time.unscaledTime >= _nextAutomaticDiagnosticTime)
+            {
+                _nextAutomaticDiagnosticTime = Time.unscaledTime + Mathf.Max(0.25f, automaticDiagnosticIntervalSeconds);
+                LogGravityMotion();
+            }
             if (Input.GetKeyDown(KeyCode.P)) DumpDiagnostics();
+            RefreshTransferPolicyStatus();
+        }
+
+        void RefreshTransferPolicyStatus()
+        {
+            normalPlayPathHasFullArrayReadback = enableAutomaticFullStateDiagnostics ||
+                                                 (!_gpuDirectSurfaceActive && allowCpuMeshFallback);
+        }
+
+        void EnsureFullStateDiagnosticBuffers()
+        {
+            if (diagCornerCount <= 0) return;
+            if (diagNbr == null || diagNbr.Length != 6 * diagCornerCount) diagNbr = new int[6 * diagCornerCount];
+            if (diagPos == null || diagPos.Length != 3 * diagCornerCount) diagPos = new float[3 * diagCornerCount];
+            if (diagComp == null || diagComp.Length != diagCornerCount) diagComp = new int[diagCornerCount];
+        }
+
+        bool ReadFullStateDiagnosticSnapshot()
+        {
+            EnsureFullStateDiagnosticBuffers();
+            if (diagNbr == null || diagPos == null) return false;
+            if (NativeGetCornerPos(diagPos) != 0 || NativeGetNbrIdx(diagNbr) != 0) return false;
+            cpuFullStateDiagnosticReadbackBytes += (ulong)(diagPos.Length * sizeof(float) + diagNbr.Length * sizeof(int));
+            fullStateDiagnosticReadbackCount++;
+            return true;
         }
 
         void UpdatePerformanceHud()
@@ -614,7 +713,7 @@ namespace ReconGridDC.Cuda
         // freeze (all6/frozen), and counter starvation (raw vs capacity) — with the RUNTIME alpha.
         void PollCutDebug()
         {
-            if (LCS_GetCutDebug(_dbgFrame, out _dbgAlpha) != 0) return;
+            if (NativeGetCutDebug(_dbgFrame, out _dbgAlpha) != 0) return;
             foreach (int s in _dbgSumSlots) _dbgSum[s] += _dbgFrame[s];
             foreach (int s in _dbgMaxSlots) if (_dbgFrame[s] > _dbgMax[s]) _dbgMax[s] = _dbgFrame[s];
 
@@ -655,13 +754,13 @@ namespace ReconGridDC.Cuda
         // liver is effectively in a vacuum (no net fall). Answers Bug 3.
         void LogGravityMotion()
         {
-            if (diagPos == null || LCS_GetCornerPos(diagPos) != 0) return;
+            if (!ReadFullStateDiagnosticSnapshot()) return;
             // ANCHORED-COMPONENT extent (Bug-B fix): the rod span must track the tissue still hanging
             // from the anchor. Percentile trimming cannot exclude a SEVERED BIG piece (35% of corners
             // free-falling inflated the extent to 131.9 → an auto-sized rod would become absurd).
             // Union-find over the LIVE post-sever graph (~1 Hz, reuses the DumpDiagnostics buffers);
             // extent is measured over corners connected to ANY pinned corner only.
-            bool haveComp = diagNbr != null && LCS_GetNbrIdx(diagNbr) == 0;
+            bool haveComp = true;
             if (haveComp)
             {
                 for (int c = 0; c < diagCornerCount; c++) diagComp[c] = c;
@@ -714,8 +813,7 @@ namespace ReconGridDC.Cuda
         // Answers Bug 1: components==1 => cut did NOT disconnect; a component with 0 pinned => it should fall.
         void DumpDiagnostics()
         {
-            if (diagNbr == null || LCS_GetNbrIdx(diagNbr) != 0) { Debug.LogWarning("[Diag] nbrIdx readback failed."); return; }
-            if (diagPos == null || LCS_GetCornerPos(diagPos) != 0) { Debug.LogWarning("[Diag] cornerPos readback failed."); return; }
+            if (!ReadFullStateDiagnosticSnapshot()) { Debug.LogWarning("[Diag] full-state diagnostic readback failed."); return; }
             int cc = diagCornerCount;
 
             // Union-find over edges (c -> nbr) where BOTH endpoints are active and nbr>=0 (severed = -1).
@@ -840,7 +938,8 @@ namespace ReconGridDC.Cuda
         float _deformedMaxExt = -1f;   // deformed active-corner extent, cached by LogGravityMotion (~1 Hz)
         float RodSpanLength()
         {
-            float maxExt = Mathf.Max(dimsRt.x, Mathf.Max(dimsRt.y, dimsRt.z)) * Lrt;
+            float restMaxExt = Mathf.Max(dimsRt.x, Mathf.Max(dimsRt.y, dimsRt.z)) * Lrt;
+            float maxExt = restMaxExt * Mathf.Max(1f, conservativeCutRodSpanMultiplier);
             if (_deformedMaxExt > maxExt) maxExt = _deformedMaxExt;
             return maxExt + 2f * Lrt;
         }
@@ -1015,13 +1114,14 @@ namespace ReconGridDC.Cuda
                 : Shader.Find("ReconGridDC/CudaDirectSurface");
             if (shader == null)
             {
-                gpuDirectSurfaceStatus = "CudaDirectSurface shader is unavailable; using CPU Mesh fallback.";
+                gpuDirectSurfaceStatus = "CudaDirectSurface shader is unavailable.";
                 return;
             }
 
             directSurfaceRenderer = GetComponent<CudaDirectSurfaceRenderer>();
             if (directSurfaceRenderer == null)
                 directSurfaceRenderer = gameObject.AddComponent<CudaDirectSurfaceRenderer>();
+            directSurfaceRenderer.pluginInstance = pluginInstance;
 
             Vector3 gridExtent = (Vector3)((float3)dimsRt * Lrt);
             Bounds bounds = new Bounds((Vector3)gridCenterRt, gridExtent * 2f);
@@ -1050,7 +1150,12 @@ namespace ReconGridDC.Cuda
             if (directSurfaceRenderer != null)
                 directSurfaceRenderer.Release();
             if (!allowCpuMeshFallback)
+            {
                 Debug.LogError($"[LiverCuda] {reason} CPU Mesh fallback is disabled.", this);
+                initialized = false;
+                cutReady = false;
+            }
+            RefreshTransferPolicyStatus();
         }
 
         void EnsureCpuSurfaceFallback()
@@ -1201,10 +1306,10 @@ namespace ReconGridDC.Cuda
 
         void BuildOrUpdateMesh(bool firstTime)
         {
-            if (LCS_GetSurfaceCounts(out int N, out _) != 0) return;
+            if (NativeGetSurfaceCounts(out int N, out _) != 0) return;
             if (N < 0) N = 0;
             if (N > maxIdx) N = maxIdx;
-            if (LCS_GetSurface(pos, nrm, null) != 0) return;
+            if (NativeGetSurface(pos, nrm, null) != 0) return;
             cpuSurfaceReadbackBytes += (ulong)N * (ulong)(sizeof(float) * 6);
 
             // UV1 aux channel (render design §4.4): rest anchor + wall flag for the rest-position
@@ -1222,7 +1327,7 @@ namespace ReconGridDC.Cuda
             }
             if (haveAux)
             {
-                try { if (LCS_GetSurfaceAux(aux) != 0) haveAux = false; }
+                try { if (NativeGetSurfaceAux(aux) != 0) haveAux = false; }
                 catch (System.EntryPointNotFoundException)
                 {
                     _auxUnsupported = true; haveAux = false;
@@ -1484,10 +1589,33 @@ namespace ReconGridDC.Cuda
             orbit.target = (Vector3)gridCenterRt; orbit.distance = camDist;
         }
 
+        void FailInitialization(string message)
+        {
+            Debug.LogError(message, this);
+            ShutdownRuntime();
+        }
+
+        void ShutdownRuntime()
+        {
+            if (_shutdownComplete) return;
+            _shutdownComplete = true;
+            if (directSurfaceRenderer != null) directSurfaceRenderer.Release();
+            if (_nativeRuntimeStarted)
+            {
+                try { NativeShutdown(); }
+                catch (System.DllNotFoundException) { }
+                catch (System.EntryPointNotFoundException) { }
+            }
+            _nativeRuntimeStarted = false;
+            initialized = false;
+            cutReady = false;
+            _gpuDirectSurfaceActive = false;
+            gpuDirectSurfaceActive = false;
+        }
+
         void OnDestroy()
         {
-            if (directSurfaceRenderer != null) directSurfaceRenderer.Release();
-            if (initialized) LCS_Shutdown();
+            ShutdownRuntime();
             if (mesh != null) Destroy(mesh);
             if (mat  != null) Destroy(mat);
             if (cutMat != null) Destroy(cutMat);

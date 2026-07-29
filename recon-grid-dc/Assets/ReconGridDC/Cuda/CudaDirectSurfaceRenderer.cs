@@ -5,6 +5,12 @@ using UnityEngine.Rendering;
 
 namespace ReconGridDC.Cuda
 {
+    public enum CudaPluginInstance
+    {
+        Primary,
+        Secondary
+    }
+
     /// <summary>
     /// D3D11 buffers for the CUDA-resident Dual Contouring renderer. The native plugin writes
     /// separate outer-surface and cut-wall batches, so cut walls cannot corrupt outer smoothing.
@@ -13,6 +19,8 @@ namespace ReconGridDC.Cuda
     public sealed class CudaDirectSurfaceRenderer : MonoBehaviour
     {
         const string Dll = "LiverCudaSim";
+        const string Dll2 = "LiverCudaSim2";
+        [HideInInspector] public CudaPluginInstance pluginInstance;
 
         [StructLayout(LayoutKind.Sequential)]
         struct DirectSurfaceStatsNative
@@ -39,6 +47,20 @@ namespace ReconGridDC.Cuda
         [DllImport(Dll)] static extern IntPtr LCS_GetDirectSurfaceRenderEventFunc();
         [DllImport(Dll)] static extern int LCS_DirectSurfaceGetStats(out DirectSurfaceStatsNative stats);
         [DllImport(Dll)] static extern int LCS_DirectSurfaceRequestTopologyDiagnostic();
+        [DllImport(Dll2, EntryPoint = "LCS_DirectSurfaceSetBuffers")] static extern int LCS2_DirectSurfaceSetBuffers(
+            IntPtr outerPositionBuffer, IntPtr outerNormalBuffer, IntPtr outerAuxBuffer, IntPtr outerIndexBuffer, IntPtr outerIndexCountBuffer,
+            IntPtr cutPositionBuffer, IntPtr cutNormalBuffer, IntPtr cutAuxBuffer, IntPtr cutIndexBuffer, IntPtr cutIndexCountBuffer, int capacity);
+        [DllImport(Dll2, EntryPoint = "LCS_DirectSurfaceRelease")] static extern void LCS2_DirectSurfaceRelease();
+        [DllImport(Dll2, EntryPoint = "LCS_GetDirectSurfaceRenderEventFunc")] static extern IntPtr LCS2_GetDirectSurfaceRenderEventFunc();
+        [DllImport(Dll2, EntryPoint = "LCS_DirectSurfaceGetStats")] static extern int LCS2_DirectSurfaceGetStats(out DirectSurfaceStatsNative stats);
+        [DllImport(Dll2, EntryPoint = "LCS_DirectSurfaceRequestTopologyDiagnostic")] static extern int LCS2_DirectSurfaceRequestTopologyDiagnostic();
+
+        bool SecondaryPlugin => pluginInstance == CudaPluginInstance.Secondary;
+        int NativeSetBuffers(IntPtr op,IntPtr on,IntPtr oa,IntPtr oi,IntPtr oc,IntPtr cp,IntPtr cn,IntPtr ca,IntPtr ci,IntPtr cc,int capacity) => SecondaryPlugin ? LCS2_DirectSurfaceSetBuffers(op,on,oa,oi,oc,cp,cn,ca,ci,cc,capacity) : LCS_DirectSurfaceSetBuffers(op,on,oa,oi,oc,cp,cn,ca,ci,cc,capacity);
+        void NativeRelease() { if (SecondaryPlugin) LCS2_DirectSurfaceRelease(); else LCS_DirectSurfaceRelease(); }
+        IntPtr NativeRenderEvent() => SecondaryPlugin ? LCS2_GetDirectSurfaceRenderEventFunc() : LCS_GetDirectSurfaceRenderEventFunc();
+        int NativeGetStats(out DirectSurfaceStatsNative s) { return SecondaryPlugin ? LCS2_DirectSurfaceGetStats(out s) : LCS_DirectSurfaceGetStats(out s); }
+        int NativeRequestTopologyDiagnostic() => SecondaryPlugin ? LCS2_DirectSurfaceRequestTopologyDiagnostic() : LCS_DirectSurfaceRequestTopologyDiagnostic();
 
         [Header("CUDA Migration Phase 4 - GPU Direct Surface")]
         [Tooltip("Draws CUDA Dual Contouring output from D3D11 GPU buffers. Direct3D11 only.")]
@@ -136,11 +158,11 @@ namespace ReconGridDC.Cuda
                 if (_drawCamera == null) { directSurfaceStatus = "GPU direct surface requires a tagged Main Camera."; Release(); return false; }
                 _drawCommands = new CommandBuffer { name = "CUDA Direct Surface Batches" };
                 _drawCamera.AddCommandBuffer(CameraEvent.BeforeForwardAlpha, _drawCommands);
-                int rc = LCS_DirectSurfaceSetBuffers(
+                int rc = NativeSetBuffers(
                     Native(_outer.positions), Native(_outer.normals), Native(_outer.aux), Native(_outer.indices), Native(_outer.indexCount),
                     Native(_cut.positions), Native(_cut.normals), Native(_cut.aux), Native(_cut.indices), Native(_cut.indexCount), surfaceCapacity);
-                if (rc != 0) { lastNativeError = rc; directSurfaceStatus = $"LCS_DirectSurfaceSetBuffers failed ({rc}). CPU Mesh fallback remains active."; Release(); return false; }
-                _nativeConfigured = true; _renderEvent = LCS_GetDirectSurfaceRenderEventFunc();
+                if (rc != 0) { lastNativeError = rc; directSurfaceStatus = $"LCS_DirectSurfaceSetBuffers failed ({rc})."; Release(); return false; }
+                _nativeConfigured = true; _renderEvent = NativeRenderEvent();
                 if (_renderEvent == IntPtr.Zero) { directSurfaceStatus = "The deployed DLL did not return a direct-surface render event."; Release(); return false; }
                 directSurfaceActive = true;
                 directSurfaceStatus = "CUDA-D3D11 direct surface configured with isolated outer and cut-wall batches.";
@@ -190,7 +212,7 @@ namespace ReconGridDC.Cuda
             QueueDrawBatch(_outer); QueueDrawBatch(_cut);
             ReadStats();
             if (lastNativeError == 0) return true;
-            directSurfaceStatus = $"CUDA-D3D11 copy failed ({lastNativeError}); use CPU Mesh fallback.";
+            directSurfaceStatus = $"CUDA-D3D11 copy failed ({lastNativeError}).";
             directSurfaceActive = false; return false;
         }
 
@@ -209,7 +231,7 @@ namespace ReconGridDC.Cuda
             if (!_nativeConfigured) return;
             try
             {
-                if (LCS_DirectSurfaceGetStats(out var s) != 0) return;
+                if (NativeGetStats(out var s) != 0) return;
                 nativeRegistered=s.registered; gpuCopyBytes=s.gpuCopyBytes; dispatchCount=s.dispatchCount; lastNativeError=s.lastError;
                 cudaDeviceOrdinal=s.cudaDeviceOrdinal; registrationStage=s.registrationStage; cudaRegistrationError=s.cudaErrorCode;
                 positionBufferByteWidth=s.positionByteWidth; positionBufferUsage=s.positionUsage; positionBufferBindFlags=s.positionBindFlags; positionBufferMiscFlags=s.positionMiscFlags; positionBufferStructureStride=s.positionStructureByteStride;
@@ -233,7 +255,7 @@ namespace ReconGridDC.Cuda
             if (!_nativeConfigured || !directSurfaceActive) { directSurfaceStatus="GPU topology diagnostic was requested before CUDA direct surface became active."; return; }
             try
             {
-                int rc=LCS_DirectSurfaceRequestTopologyDiagnostic();
+                int rc=NativeRequestTopologyDiagnostic();
                 if(rc!=0) { topologyDiagnosticError=rc; directSurfaceStatus=$"LCS_DirectSurfaceRequestTopologyDiagnostic failed ({rc})."; }
                 else { topologyDiagnosticReady=false; directSurfaceStatus="GPU topology diagnostic requested; scalar results arrive after the next CUDA render event."; }
             }
@@ -254,7 +276,7 @@ namespace ReconGridDC.Cuda
         public void Release()
         {
             directSurfaceActive=false;
-            if(_nativeConfigured) try { LCS_DirectSurfaceRelease(); } catch (EntryPointNotFoundException) { }
+            if(_nativeConfigured) try { NativeRelease(); } catch (EntryPointNotFoundException) { }
             _nativeConfigured=false; _renderEvent=IntPtr.Zero;
             ReleaseBatch(_outer); _outer=null; ReleaseBatch(_cut); _cut=null;
             if(_drawCamera!=null && _drawCommands!=null) _drawCamera.RemoveCommandBuffer(CameraEvent.BeforeForwardAlpha,_drawCommands);

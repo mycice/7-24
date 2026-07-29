@@ -16,6 +16,9 @@ namespace ReconGridDC.Stage2Grasping
         [Tooltip("Enables only the isolated gripper-to-tetrahedral-organ prototype.")]
         public bool stage2Enabled = true;
 
+        [Tooltip("Initialize and own the assigned GripperTool. Disable this for an additional organ that only shares the primary organ's gripper input.")]
+        public bool initializeGripperTool = true;
+
         public Stage1TetSoftBodyController softBodyController;
         public SoftBodyCollisionModule collisionModule;
         public SoftBodyGraspingModule graspingModule;
@@ -39,7 +42,8 @@ namespace ReconGridDC.Stage2Grasping
         {
             collisionModule.graspingModule = graspingModule;
             collisionModule.Initialize(data, solver);
-            graspingModule.Initialize(data, solver, visualizer);
+            if (initializeGripperTool)
+                graspingModule.Initialize(data, solver, visualizer);
             softBodyController.BeforeSolverStep += PrepareSolverStep;
             _initialized = true;
         }
