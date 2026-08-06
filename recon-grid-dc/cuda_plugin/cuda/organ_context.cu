@@ -55,6 +55,7 @@ namespace
         int xpbdInitialized = 0;
         OrganContextToolCapsule* toolCapsules = nullptr;
         OrganContextToolContactParams toolParams{};
+        OrganContextToolContactParams graspCaptureParams{};
         int toolCapsuleCount = 0;
         int toolConfigured = 0;
         int toolGraspActive = 0;
@@ -516,10 +517,24 @@ namespace
         const float halfV = fmaxf((params.graspBoundsMaxZ - params.graspBoundsMinZ) * 0.5f, 1e-4f);
         const float radius = sqrtf((coordinate.x / halfU) * (coordinate.x / halfU) +
                                    (coordinate.y / halfV) * (coordinate.y / halfV));
-        if (radius > fminf(fmaxf(params.graspCoreRadius, 0.1f), 1.0f)) return;
+        const float coreRadius = fminf(fmaxf(params.graspCoreRadius, 0.1f), 1.0f);
+        const float influenceRadius = fminf(fmaxf(params.graspInfluenceRadius, coreRadius), 1.0f);
+        if (radius > influenceRadius) return;
+
+        float weight = 1.0f;
+        if (radius > coreRadius && influenceRadius > coreRadius + 1e-5f)
+        {
+            const float sigma = fmaxf(params.graspGaussianWidth, 0.05f);
+            const float distanceFromCore = radius - coreRadius;
+            const float edgeDistance = influenceRadius - coreRadius;
+            const float gaussian = expf(-0.5f * distanceFromCore * distanceFromCore / (sigma * sigma));
+            const float edgeGaussian = expf(-0.5f * edgeDistance * edgeDistance / (sigma * sigma));
+            weight = fminf(fmaxf((gaussian - edgeGaussian) /
+                fmaxf(1.0f - edgeGaussian, 1e-5f), 0.0f), 1.0f);
+        }
         graspMask[i] = 1;
         frameCoordinates[i] = coordinate;
-        weights[i] = expf(-0.5f * radius * radius / 0.25f);
+        weights[i] = weight;
     }
 
     __global__ void ReleaseGraspKernel(float3* velocities, int count, unsigned char* graspMask)
@@ -533,7 +548,9 @@ namespace
     __global__ void SolveGraspKernel(float3* positions, float3* previousPositions, float3* velocities,
                                      const float* inverseMass, int count, const unsigned char* graspMask,
                                      const float3* frameCoordinates, const float* weights,
-                                     OrganContextToolContactParams params, float blend)
+                                     OrganContextToolContactParams params,
+                                     OrganContextToolContactParams captureParams,
+                                     float blend, float dt)
     {
         const int i = blockIdx.x * blockDim.x + threadIdx.x;
         if (i >= count || !graspMask[i] || inverseMass[i] == 0.0f) return;
@@ -541,13 +558,36 @@ namespace
         const float3 u = make_float3(params.axisUX, params.axisUY, params.axisUZ);
         const float3 v = make_float3(params.axisVX, params.axisVY, params.axisVZ);
         const float3 w = make_float3(params.axisWX, params.axisWY, params.axisWZ);
+        const float3 captureCenter = make_float3(
+            captureParams.frameCenterX, captureParams.frameCenterY, captureParams.frameCenterZ);
+        const float3 captureU = make_float3(
+            captureParams.axisUX, captureParams.axisUY, captureParams.axisUZ);
+        const float3 captureV = make_float3(
+            captureParams.axisVX, captureParams.axisVY, captureParams.axisVZ);
+        const float3 captureW = make_float3(
+            captureParams.axisWX, captureParams.axisWY, captureParams.axisWZ);
         const float3 c = frameCoordinates[i];
         const float smooth = blend * blend * (3.0f - 2.0f * blend);
-        const float3 target = Add(Add(Add(center, Mul(u, c.x)), Mul(v, c.y)),
-                                  Mul(w, c.z + fmaxf(params.graspHeight, 0.0f) * weights[i] * smooth));
-        positions[i] = target;
-        previousPositions[i] = target;
-        velocities[i] = make_float3(0, 0, 0);
+        const float weight = fminf(fmaxf(weights[i], 0.0f), 1.0f);
+        const float3 captureTarget = Add(Add(Add(captureCenter, Mul(captureU, c.x)), Mul(captureV, c.y)),
+                                         Mul(captureW, c.z));
+        const float3 rigidTarget = Add(Add(Add(center, Mul(u, c.x)), Mul(v, c.y)), Mul(w, c.z));
+        const float3 weightedMotionTarget = Add(captureTarget, Mul(Sub(rigidTarget, captureTarget), weight));
+        const float3 target = Add(weightedMotionTarget,
+            Mul(w, fmaxf(params.graspHeight, 0.0f) * weight * smooth));
+        if (weight >= 0.9999f)
+        {
+            positions[i] = target;
+            previousPositions[i] = target;
+            velocities[i] = make_float3(0, 0, 0);
+            return;
+        }
+
+        const float follow = weight * smooth *
+            (1.0f - expf(-fmaxf(params.graspSoftFollowRate, 0.1f) * dt));
+        const float3 correction = Mul(Sub(target, positions[i]), follow);
+        positions[i] = Add(positions[i], correction);
+        previousPositions[i] = Add(previousPositions[i], correction);
     }
 
     __global__ void ToolContactKernel(float3* positions, float3* previousPositions, const float* inverseMass,
@@ -760,7 +800,8 @@ int organ_context_xpbd_step(uint32_t handle, float dt, const OrganContextXpbdPar
             c->toolGraspBlend = c->toolParams.graspFormDuration > 0.0f
                 ? fminf(1.0f, c->toolGraspBlend + h / c->toolParams.graspFormDuration) : 1.0f;
             SolveGraspKernel<<<particleBlocks,kThreads>>>(c->positions,c->previousPositions,c->velocities,c->inverseMass,
-                c->stats.particleCount,c->graspMask,c->graspFrameCoordinates,c->graspWeights,c->toolParams,c->toolGraspBlend);
+                c->stats.particleCount,c->graspMask,c->graspFrameCoordinates,c->graspWeights,
+                c->toolParams,c->graspCaptureParams,c->toolGraspBlend,h);
         }
         GroundKernel<<<particleBlocks,kThreads>>>(c->positions,c->previousPositions,c->stats.particleCount,p->groundY);
         PostSolveKernel<<<particleBlocks,kThreads>>>(c->positions,c->previousPositions,c->velocities,c->inverseMass,c->stats.particleCount,1.0f/h,fminf(fmaxf(p->damping,0.0f),1.0f));
@@ -799,6 +840,7 @@ int organ_context_tool_step(uint32_t handle, float dt, const OrganContextToolCap
     {
         CaptureGraspKernel<<<blocks,kThreads>>>(c->positions,c->stats.particleCount,c->graspMask,
             c->graspFrameCoordinates,c->graspWeights,*params);
+        c->graspCaptureParams=*params;
         c->toolGraspActive=1;
         c->toolGraspBlend=0.0f;
     }

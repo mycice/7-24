@@ -115,6 +115,8 @@ struct OrganContextToolContactParams
     float axisUX, axisUY, axisUZ;
     float axisVX, axisVY, axisVZ;
     float axisWX, axisWY, axisWZ;
+    // Appended to preserve all legacy field offsets until Unity replaces the DLL.
+    float graspGaussianWidth, graspInfluenceRadius, graspSoftFollowRate;
 };
 
 struct OrganContextToolContactStats

@@ -232,8 +232,8 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 2eedcc972dadfb3438f4f8d52947c90a, type: 3}
-  m_Name:
-  m_EditorClassIdentifier:
+  m_Name: 
+  m_EditorClassIdentifier: 
   synchronizationEnabled: 1
   tetSoftBody: {fileID: 1994098143}
   cudaLiver: {fileID: 1842413906}
@@ -773,9 +773,11 @@ MonoBehaviour:
   jawContactFrictionMultiplier: 1000
   maxOpenAngle: 50
   openCloseSpeed: 60
-  gaussianHeight: 0.02
-  gaussianWidth: 0.5
-  gaussianHardCoreRadius: 0.55
+  gaussianHeight: 0.005
+  gaussianWidth: 0.3
+  gaussianHardCoreRadius: 0.5
+  gaussianInfluenceRadius: 0.65
+  gaussianSoftFollowRate: 14
   gaussianFormDuration: 0.15
   captureRetryPhysicsSteps: 5
   moveSpeed: 0.3
@@ -851,7 +853,7 @@ MonoBehaviour:
   youngsModulus: 3000
   poissonsRatio: 0.257
   damping: 0.044
-  enableGravity: 1
+  enableGravity: 0
   gravityY: -9.81
   groundY: -3
   showGroundPlane: 1
@@ -1321,8 +1323,8 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: e21c55c8d47647d09dddb195a7ab2863, type: 3}
-  m_Name:
-  m_EditorClassIdentifier:
+  m_Name: 
+  m_EditorClassIdentifier: 
   enableSecondOrgan: 0
   primaryTetSoftBody: {fileID: 1994098143}
   primaryCudaLiver: {fileID: 1842413906}

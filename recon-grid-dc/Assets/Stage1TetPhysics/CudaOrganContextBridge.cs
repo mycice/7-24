@@ -123,6 +123,7 @@ namespace ReconGridDC.Stage1TetPhysics
             public float axisUX, axisUY, axisUZ;
             public float axisVX, axisVY, axisVZ;
             public float axisWX, axisWY, axisWZ;
+            public float graspGaussianWidth, graspInfluenceRadius, graspSoftFollowRate;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -678,6 +679,11 @@ namespace ReconGridDC.Stage1TetPhysics
                 graspHeight = Mathf.Max(0f, gripper.gaussianHeight),
                 graspCoreRadius = Mathf.Clamp(gripper.gaussianHardCoreRadius, 0.1f, 1f),
                 graspFormDuration = Mathf.Max(0f, gripper.gaussianFormDuration),
+                graspGaussianWidth = Mathf.Clamp(gripper.gaussianWidth, 0.05f, 1f),
+                graspInfluenceRadius = Mathf.Clamp(
+                    gripper.gaussianInfluenceRadius,
+                    Mathf.Clamp(gripper.gaussianHardCoreRadius, 0.1f, 1f), 1f),
+                graspSoftFollowRate = Mathf.Max(0.1f, gripper.gaussianSoftFollowRate),
                 graspBoundsMinX = bounds.min.x, graspBoundsMinY = bounds.min.y, graspBoundsMinZ = bounds.min.z,
                 graspBoundsMaxX = bounds.max.x, graspBoundsMaxY = bounds.max.y, graspBoundsMaxZ = bounds.max.z,
                 frameCenterX = center.x, frameCenterY = center.y, frameCenterZ = center.z,

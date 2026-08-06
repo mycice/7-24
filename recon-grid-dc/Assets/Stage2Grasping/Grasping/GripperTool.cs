@@ -163,9 +163,16 @@ namespace ReconGridDC.Stage2Grasping.Grasping
         public float openCloseSpeed = 60f;
 
         [Header("Grasping")]
-        [Min(0f)] public float gaussianHeight = 0.02f;
-        [Range(0.1f, 1f)] public float gaussianWidth = 0.5f;
-        [Range(0.1f, 1f)] public float gaussianHardCoreRadius = 0.55f;
+        [Tooltip("Small bulge along the gripper frame. Keep this low; Gaussian follow strength creates the main grasp shape.")]
+        [Min(0f)] public float gaussianHeight = 0.005f;
+        [Tooltip("Normalized Gaussian sigma used by the soft transition outside the hard core.")]
+        [Range(0.05f, 1f)] public float gaussianWidth = 0.3f;
+        [Tooltip("Normalized radius that follows the gripper rigidly. Keep a small core so the grasp cannot slip.")]
+        [Range(0.1f, 1f)] public float gaussianHardCoreRadius = 0.35f;
+        [Tooltip("Normalized cutoff radius for soft Gaussian following. Particles outside it receive no grasp constraint.")]
+        [Range(0.1f, 1f)] public float gaussianInfluenceRadius = 0.65f;
+        [Tooltip("Soft transition response in 1/s. Higher values follow the gripper more strongly and produce a sharper pull.")]
+        [Min(0.1f)] public float gaussianSoftFollowRate = 14f;
         [Min(0f)] public float gaussianFormDuration = 0.15f;
         [Min(1)] public int captureRetryPhysicsSteps = 5;
 
