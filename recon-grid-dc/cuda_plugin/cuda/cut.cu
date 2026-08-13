@@ -59,6 +59,8 @@ static float3*        d_cutFPNormalF   = nullptr;  // [8*voxelCount]
 static unsigned int*  d_prevVoxelMask  = nullptr;  // [voxelCount] mask snapshot at the last cut_fp_chain (P1a EMA epoch)
 static int*           d_cutNrmAccum    = nullptr;  // [3*8*voxelCount] per-slot world cut-normal accumulator (P2 kerf)
 static unsigned int*  d_dbg            = nullptr;  // [16] [DEBUG-CUT] counters (P3): slots 0-14 zeroed each cut_fp_chain, 15 cumulative.
+__device__ CutEventMeta g_cutEventMeta;
+__device__ CutEventSummary g_cutEventSummary;
 // d_dbg slot map: 0=emaPairs 1=jump>L 2=jump>3L 3=maxDisp(f-as-u) 4=slotNew 5=epochInval 6=dangleRefs
 //                 7=giantWall 8=giantMixed 9=giantSkin 10=maxEdgeLen(f-as-u) 11=rim<3 12=pinch1
 //                 13=all6severed 14=frozenThisFrame 15=tearMarks(CUMULATIVE  - incremented during
@@ -163,7 +165,7 @@ __device__ __forceinline__ void MarkAndEmit(int e, int axis, int3 baseC, int3 ax
                                             const float3* cutRestCorner,
                                             unsigned int* voxelCutMask, const unsigned int* voxelOccupied,
                                             CutPointGpu* cutPoint, unsigned int* cutPointCounter,
-                                            int cutPointCapacity, const RotGpu* particleRot)
+                                            int cutPointCapacity, const RotGpu* particleRot, bool recordToolEvent)
 {
     bool firstCut = false, sawAnyVox = false, edgeOccupied = false;
     for (int s = 0; s < 4; s++)
@@ -191,6 +193,23 @@ __device__ __forceinline__ void MarkAndEmit(int e, int axis, int3 baseC, int3 ax
         float3 alongB = (t_ray - 1.0f) * restEdge;
         EmitCutPoint(P_hit, alongA, idA, e, ncut, toolD, cornerPos, particleRot, cutPoint, cutPointCounter, cutPointCapacity);
         EmitCutPoint(P_hit, alongB, idB, e, ncut, toolD, cornerPos, particleRot, cutPoint, cutPointCounter, cutPointCapacity);
+        unsigned int previousSequence = recordToolEvent && g_cutEventMeta.valid != 0
+            ? atomicExch(&g_cutEventSummary.sequence, g_cutEventMeta.sequence)
+            : g_cutEventMeta.sequence;
+        if (recordToolEvent && g_cutEventMeta.valid != 0 && previousSequence != g_cutEventMeta.sequence)
+        {
+            // This is deliberately after the first-cut gate: repeated sweeps and air motion cannot
+            // manufacture events. The latest edge is a compact representative for this event batch.
+            g_cutEventSummary.start[0] = g_cutEventMeta.start[0]; g_cutEventSummary.start[1] = g_cutEventMeta.start[1]; g_cutEventSummary.start[2] = g_cutEventMeta.start[2];
+            g_cutEventSummary.end[0] = g_cutEventMeta.end[0]; g_cutEventSummary.end[1] = g_cutEventMeta.end[1]; g_cutEventSummary.end[2] = g_cutEventMeta.end[2];
+            g_cutEventSummary.normal[0] = g_cutEventMeta.normal[0]; g_cutEventSummary.normal[1] = g_cutEventMeta.normal[1]; g_cutEventSummary.normal[2] = g_cutEventMeta.normal[2];
+            g_cutEventSummary.hitPoint[0] = P_hit.x; g_cutEventSummary.hitPoint[1] = P_hit.y; g_cutEventSummary.hitPoint[2] = P_hit.z;
+            g_cutEventSummary.radius = g_cutEventMeta.radius;
+            g_cutEventSummary.timestamp = g_cutEventMeta.timestamp;
+            atomicAdd(&g_cutEventSummary.eventCount, 1u);
+            g_cutEventSummary.rawCutPoints = cutPointCounter[0];
+            g_cutEventSummary.valid = 1u;
+        }
     }
 }
 
@@ -250,7 +269,7 @@ __global__ void k_DetectCutQuad(int gridEdgeCount, ToolGpu tool, float voxelL, i
 
     MarkAndEmit(e, axis, baseC, axisDir, idA, idB, t_ray, P_hit, tool.ncut, tool.d, voxelL, dims,
                 cornerPos, cutRestCorner, voxelCutMask, voxelOccupied, cutPoint, cutPointCounter, cutPointCapacity,
-                particleRot);
+                particleRot, true);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -363,7 +382,7 @@ __global__ void k_DetectCutCCD(int gridEdgeCount, float3 S, float3 E, float3 emi
         float3 nEmit = (nLen > 1e-8f) ? nHit / nLen : emitNcut;
         MarkAndEmit(e, axis, baseC, axisDir, idA, idB, t_ray, P_hit, nEmit, toolD, voxelL, dims,
                     curPos, cutRestCorner, voxelCutMask, voxelOccupied, cutPoint, cutPointCounter, cutPointCapacity,
-                    particleRot);
+                    particleRot, true);
         return;                                   // first valid crossing cuts the edge
     }
 }
@@ -431,7 +450,7 @@ __global__ void k_TearOverstretch(int gridEdgeCount, float tearStretchRatio, int
     if (dbg) atomicAdd(&dbg[15], 1u);                          // CUMULATIVE tear counter (see slot map)
     MarkAndEmit(e, axis, baseC, axisDir, idA, idB, 0.5f, P_hit, ncut, toolD, voxelL, dims,
                 cornerPos, cutRestCorner, voxelCutMask, voxelOccupied, cutPoint, cutPointCounter, cutPointCapacity,
-                particleRot);
+                particleRot, false);
 }
 
 // SeverLinks  - one thread per grid edge. For cut edges: sever structural (NbrIdx=-1 both ways) +
@@ -971,6 +990,10 @@ int cut_init(const CutInitDesc* desc, const void* conn4096, const void* gridEdge
     CK(cudaMemset(d_prevVoxelMask,   0, (size_t)vc     * sizeof(unsigned int))); // matches the zeroed cut mask
     CK(cudaMemset(d_cutNrmAccum,     0, (size_t)3*slot * sizeof(int)));
     CK(cudaMemset(d_dbg,             0, (size_t)16     * sizeof(unsigned int)));
+    CutEventMeta zeroEventMeta = {};
+    CutEventSummary zeroEventSummary = {};
+    CK(cudaMemcpyToSymbol(g_cutEventMeta, &zeroEventMeta, sizeof(zeroEventMeta)));
+    CK(cudaMemcpyToSymbol(g_cutEventSummary, &zeroEventSummary, sizeof(zeroEventSummary)));
 
     // Cache the shared dc_recon + physics pointers (stable after their init).
     c_cornerPos        = recon_corner_pos();
@@ -1095,6 +1118,18 @@ int cut_detect()
 
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -(int)e;
+}
+
+void cut_set_event_meta(const CutEventMeta* meta)
+{
+    if (!g_cut_ready || !meta) return;
+    cudaMemcpyToSymbol(g_cutEventMeta, meta, sizeof(CutEventMeta));
+}
+
+int cut_get_event_summary(CutEventSummary* out)
+{
+    if (!g_cut_ready || !out) return -1;
+    return cudaMemcpyFromSymbol(out, g_cutEventSummary, sizeof(CutEventSummary)) == cudaSuccess ? 0 : -3313;
 }
 
 // cut_ribbon_tick  - CCD pass per accepted RK45 substep. The blade segment is the CURRENT rod

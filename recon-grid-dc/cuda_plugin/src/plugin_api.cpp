@@ -125,6 +125,9 @@ LCS_API int LCS_DetectCut()
     return cut_detect();
 }
 
+LCS_API void LCS_SetCutEventMeta(const CutEventMeta* meta) { cut_set_event_meta(meta); }
+LCS_API int LCS_GetCutEventSummary(CutEventSummary* out) { return cut_get_event_summary(out); }
+
 // Recompute particle frames after severing links, then run the cut-aware DC rebuild
 // (cut-FP chain + cut walls + normals + expand).
 LCS_API int LCS_Finalize()

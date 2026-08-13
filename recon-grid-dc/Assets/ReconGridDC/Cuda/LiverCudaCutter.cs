@@ -35,6 +35,10 @@ namespace ReconGridDC.Cuda
         [Range(1, 15)] public int thicknessCutPlaneSamples = 5;
         public float cutFPInterp = 1.0f;
 
+        [Header("Stage 5.1 - Unified Cut Event")]
+        [Tooltip("Keeps a compact summary of the latest effective CUDA cut. The summary is confirmed by the existing raw cut-point counter.")]
+        public bool enableCutEventDiagnostics = true;
+
         [Header("Keyboard Control")]
         [Tooltip("Allow the keyboard to move and rotate the cutting rod. Disabled by default so the Haply TargetObject remains the sole controller.")]
         public bool enableKeyboardControl = false;
@@ -86,17 +90,39 @@ namespace ReconGridDC.Cuda
             public float aabbMinx, aabbMiny, aabbMinz, aabbMaxx, aabbMaxy, aabbMaxz;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct CutEventMeta
+        {
+            public Vector3 start, end, normal;
+            public float radius, timestamp;
+            public uint sequence, valid;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct CutEventSummary
+        {
+            public Vector3 start, end, normal, hitPoint;
+            public float radius, timestamp;
+            public uint valid, eventCount, rawCutPoints, sequence;
+        }
+
         [DllImport(DLL)] static extern int LCS_InitCut(ref CutInitDesc desc, Conn4096Interop[] conn4096, GridEdge2Interop[] gridEdges, int[] voxelOccupied, int[] cornerInside);
         [DllImport(DLL)] static extern void LCS_SetTool(ref CutToolDesc tool);
         [DllImport(DLL)] static extern int LCS_DetectCut();
+        [DllImport(DLL)] static extern void LCS_SetCutEventMeta(ref CutEventMeta meta);
+        [DllImport(DLL)] static extern int LCS_GetCutEventSummary(out CutEventSummary summary);
         [DllImport(DLL2, EntryPoint = "LCS_InitCut")] static extern int LCS2_InitCut(ref CutInitDesc desc, Conn4096Interop[] conn4096, GridEdge2Interop[] gridEdges, int[] voxelOccupied, int[] cornerInside);
         [DllImport(DLL2, EntryPoint = "LCS_SetTool")] static extern void LCS2_SetTool(ref CutToolDesc tool);
         [DllImport(DLL2, EntryPoint = "LCS_DetectCut")] static extern int LCS2_DetectCut();
+        [DllImport(DLL2, EntryPoint = "LCS_SetCutEventMeta")] static extern void LCS2_SetCutEventMeta(ref CutEventMeta meta);
+        [DllImport(DLL2, EntryPoint = "LCS_GetCutEventSummary")] static extern int LCS2_GetCutEventSummary(out CutEventSummary summary);
 
         bool SecondaryPlugin => pluginInstance == CudaPluginInstance.Secondary;
         int NativeInitCut(ref CutInitDesc d, Conn4096Interop[] c, GridEdge2Interop[] e, int[] o, int[] i) => SecondaryPlugin ? LCS2_InitCut(ref d,c,e,o,i) : LCS_InitCut(ref d,c,e,o,i);
         void NativeSetTool(ref CutToolDesc t) { if (SecondaryPlugin) LCS2_SetTool(ref t); else LCS_SetTool(ref t); }
         int NativeDetectCut() => SecondaryPlugin ? LCS2_DetectCut() : LCS_DetectCut();
+        void NativeSetCutEventMeta(ref CutEventMeta m) { if (SecondaryPlugin) LCS2_SetCutEventMeta(ref m); else LCS_SetCutEventMeta(ref m); }
+        int NativeGetCutEventSummary(out CutEventSummary s) => SecondaryPlugin ? LCS2_GetCutEventSummary(out s) : LCS_GetCutEventSummary(out s);
 
         CuttingTool _tool;
         float _voxelL;
@@ -117,7 +143,20 @@ namespace ReconGridDC.Cuda
         bool _sweptUnionSet;
         Vector3 _lastCutNormal = Vector3.up;
         Vector3 _lastCutPoint;
+        uint _cutEventSequence;
         readonly System.Collections.Generic.HashSet<int> _sweptVox = new System.Collections.Generic.HashSet<int>();
+
+        [Header("Stage 5.1 Diagnostics (runtime)")]
+        [SerializeField] string cutEventStatus = "Waiting for the first effective cut.";
+        [SerializeField] bool latestCutEventValid;
+        [SerializeField] uint cutEventCount;
+        [SerializeField] Vector3 latestCutEventStart;
+        [SerializeField] Vector3 latestCutEventEnd;
+        [SerializeField] Vector3 latestCutEventNormal = Vector3.up;
+        [SerializeField] Vector3 latestCutEventHitPoint;
+        [SerializeField] float latestCutEventToolRadius;
+        [SerializeField] float latestCutEventTimestampSeconds;
+        [SerializeField] uint latestCutEventRawCutPoints;
 
         public bool NativeReady => _nativeReady;
         public float OriginalVoxelLength => _voxelL;
@@ -129,6 +168,24 @@ namespace ReconGridDC.Cuda
         public Vector3 LastCutPoint => _lastCutPoint;
         public bool LastSweepWasValid { get; private set; }
         public string LastSweepStatus { get; private set; } = "Waiting for cutting rod movement.";
+
+        public void ObserveNativeCutEvent()
+        {
+            if (!enableCutEventDiagnostics) return;
+            CutEventSummary summary;
+            if (NativeGetCutEventSummary(out summary) != 0) return;
+            latestCutEventValid = summary.valid != 0;
+            cutEventCount = summary.eventCount;
+            latestCutEventStart = summary.start;
+            latestCutEventEnd = summary.end;
+            latestCutEventNormal = summary.normal;
+            latestCutEventHitPoint = summary.hitPoint;
+            latestCutEventToolRadius = summary.radius;
+            latestCutEventTimestampSeconds = summary.timestamp;
+            latestCutEventRawCutPoints = summary.rawCutPoints;
+            if (latestCutEventValid)
+                cutEventStatus = "Effective cut confirmed by CUDA first-cut event; only the compact summary was read back.";
+        }
 
         public int InitializeNative(BackgroundGrid grid, int3 dims, float voxelL, float3 origin, float3 gridCenter,
             int triCapacity, float tearStretchRatio, Vector3 anchorAxis)
@@ -490,6 +547,18 @@ namespace ReconGridDC.Cuda
                 NativeDetectCut();
                 return false;
             }
+
+            var eventMeta = new CutEventMeta
+            {
+                start = t.S,
+                end = t.E,
+                normal = t.NCut,
+                radius = 0.5f * t.D,
+                timestamp = Time.time,
+                sequence = ++_cutEventSequence,
+                valid = 1
+            };
+            NativeSetCutEventMeta(ref eventMeta);
 
             float radius = 0.5f * t.D;
             int samples = Mathf.Clamp(thicknessCutPlaneSamples, 1, 15);

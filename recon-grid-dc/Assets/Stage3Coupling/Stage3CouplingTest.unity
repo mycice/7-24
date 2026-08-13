@@ -545,6 +545,8 @@ MonoBehaviour:
   cuttingRodActivityPadding: 0.5
   activeHoldFrames: 2
   enablePerFrameCutDebug: 0
+  enableCutEventDiagnostics: 1
+  cutEventDiagnosticIntervalSeconds: 0.25
   showSurfaceMembrane: 0
   surfaceMembraneShader: {fileID: 0}
   surfaceMembraneColor: {r: 1, g: 0.97, b: 0.72, a: 0.05}
@@ -643,6 +645,7 @@ MonoBehaviour:
   cutWithRodThicknessVolume: 1
   thicknessCutPlaneSamples: 5
   cutFPInterp: 1
+  enableCutEventDiagnostics: 1
   enableKeyboardControl: 1
   keyboardMoveSpeed: 1
   keyboardRotationSpeed: 10
@@ -657,6 +660,16 @@ MonoBehaviour:
   pitchUpKey: 273
   pitchDownKey: 274
   pluginInstance: 0
+  cutEventStatus: Waiting for the first effective cut.
+  latestCutEventValid: 0
+  cutEventCount: 0
+  latestCutEventStart: {x: 0, y: 0, z: 0}
+  latestCutEventEnd: {x: 0, y: 0, z: 0}
+  latestCutEventNormal: {x: 0, y: 1, z: 0}
+  latestCutEventHitPoint: {x: 0, y: 0, z: 0}
+  latestCutEventToolRadius: 0
+  latestCutEventTimestampSeconds: 0
+  latestCutEventRawCutPoints: 0
 --- !u!23 &1842413908
 MeshRenderer:
   m_ObjectHideFlags: 0
@@ -853,7 +866,7 @@ MonoBehaviour:
   youngsModulus: 3000
   poissonsRatio: 0.257
   damping: 0.044
-  enableGravity: 0
+  enableGravity: 1
   gravityY: -9.81
   groundY: -3
   showGroundPlane: 1

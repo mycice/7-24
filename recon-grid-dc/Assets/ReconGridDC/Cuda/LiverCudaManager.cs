@@ -128,6 +128,9 @@ namespace ReconGridDC.Cuda
         [Header("Cut Diagnostics")]
         [Tooltip("Reads CUDA cut-debug counters every frame. Enable only while diagnosing cutting artifacts because this can synchronize CUDA with the CPU and reduce frame rate.")]
         public bool enablePerFrameCutDebug;
+        [Tooltip("Reads the fixed-size Stage 5.1 CUDA cut-event summary. This never scans or reads Grid, Tet, corner, or triangle arrays.")]
+        public bool enableCutEventDiagnostics = true;
+        [Min(0.05f)] public float cutEventDiagnosticIntervalSeconds = 0.25f;
 
         [Header("Surface membrane visualization")]
         [Tooltip("Draw a thin translucent layer on the live reconstructed outer surface. This is visualization only and does not change physics or collision behavior.")]
@@ -563,6 +566,7 @@ namespace ReconGridDC.Cuda
         int[]     diagComp;         // union-find parent [cc]
         float     diagInitMeanY = float.NaN;
         float     _nextAutomaticDiagnosticTime;
+        float     _nextCutEventDiagnosticTime;
         bool      _shutdownComplete;
         bool      _nativeRuntimeStarted;
         string _hudCoverage = "";
@@ -775,6 +779,11 @@ namespace ReconGridDC.Cuda
             // default and never participate in the normal rendering or cutting path.
             if (enablePerFrameCutDebug)
                 PollCutDebug();
+            if (enableCutEventDiagnostics && Time.unscaledTime >= _nextCutEventDiagnosticTime)
+            {
+                _nextCutEventDiagnosticTime = Time.unscaledTime + Mathf.Max(0.05f, cutEventDiagnosticIntervalSeconds);
+                if (_cutter != null) _cutter.ObserveNativeCutEvent();
+            }
             if (enableAutomaticFullStateDiagnostics && Time.unscaledTime >= _nextAutomaticDiagnosticTime)
             {
                 _nextAutomaticDiagnosticTime = Time.unscaledTime + Mathf.Max(0.25f, automaticDiagnosticIntervalSeconds);

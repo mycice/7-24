@@ -37,6 +37,23 @@ struct CutToolDesc
     float aabbMin[3], aabbMax[3];
 };
 
+// Compact Stage 5.1 event metadata/summary. These APIs are separate from CutToolDesc so the
+// existing cutter ABI remains unchanged. The summary is cumulative and stores the latest newly
+// marked cut edge; all fields are GPU-resident until explicitly queried.
+struct CutEventMeta
+{
+    float start[3], end[3], normal[3];
+    float radius, timestamp;
+    unsigned int sequence, valid;
+};
+
+struct CutEventSummary
+{
+    float start[3], end[3], normal[3], hitPoint[3];
+    float radius, timestamp;
+    unsigned int valid, eventCount, rawCutPoints, sequence;
+};
+
 // Allocate cut buffers, upload Conn4096 + gridEdges + voxelOccupied, zero the cumulative buffers, cache the
 // shared dc_recon/physics pointers, and hand the cut buffers to dc_recon. Returns 0 on success.
 //   conn4096      : Conn4096Gpu[4096]            (passed as void*)
@@ -65,6 +82,12 @@ int cut_set_gravity_stabilization(int enabled, float gravityX, float gravityY, f
 // current particle frame. Call once per C# rod substep (rod moved, tissue frozen). Uses the tool
 // set by cut_set_tool. Returns 0 on success.
 int  cut_detect();
+
+// Submit metadata for the next tool sweep. Does not perform a cut or alter topology.
+void cut_set_event_meta(const CutEventMeta* meta);
+
+// Read only the compact latest-event summary; no Grid/Tet/triangle scan is performed.
+int cut_get_event_summary(CutEventSummary* out);
 
 // CCD tick (Stage 6)  - called by physics_step after every accepted RK45 substep (tissue moved, rod
 // fixed): continuous collision of each MOVING deformed edge against the STATIC blade segment
