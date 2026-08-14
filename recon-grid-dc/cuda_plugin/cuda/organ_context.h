@@ -157,6 +157,25 @@ struct OrganContextTetToGridStats
     int lastError;
 };
 
+// Stage 5.2 fixed-size diagnostic snapshot. Candidate marker arrays remain device-resident.
+struct OrganContextCutToTetStats
+{
+    int enabled;
+    int classificationValid;
+    unsigned int processedEventSequence;
+    unsigned int classificationCount;
+    int positiveSideTetCount;
+    int negativeSideTetCount;
+    int straddlingTetCount;
+    int candidateTetCount;
+    int candidateEdgeConstraintCount;
+    int candidateSharedFaceCount;
+    int candidateSurfaceFaceCount;
+    float lastClassificationMilliseconds;
+    float totalClassificationMilliseconds;
+    int lastError;
+};
+
 int organ_context_create(uint32_t* outHandle);
 int organ_context_destroy(uint32_t handle);
 int organ_context_initialize(uint32_t handle,
@@ -190,3 +209,6 @@ int organ_context_tet_to_grid_configure(uint32_t handle, const OrganContextTetTo
                                         const float* alignedRestCorners3, const unsigned char* activeMask);
 int organ_context_tet_to_grid_update(uint32_t handle, int applyLocalDeformation);
 int organ_context_tet_to_grid_get_stats(uint32_t handle, OrganContextTetToGridStats* outStats);
+int organ_context_cut_to_tet_set_enabled(uint32_t handle, int enabled);
+int organ_context_cut_to_tet_classify_latest_all();
+int organ_context_cut_to_tet_get_stats(uint32_t handle, OrganContextCutToTetStats* outStats);

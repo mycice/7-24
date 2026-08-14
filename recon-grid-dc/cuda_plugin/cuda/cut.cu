@@ -1132,6 +1132,13 @@ int cut_get_event_summary(CutEventSummary* out)
     return cudaMemcpyFromSymbol(out, g_cutEventSummary, sizeof(CutEventSummary)) == cudaSuccess ? 0 : -3313;
 }
 
+int cut_copy_event_summary_to_device(CutEventSummary* deviceOut)
+{
+    if (!g_cut_ready || !deviceOut) return -1;
+    return cudaMemcpyFromSymbol(deviceOut, g_cutEventSummary, sizeof(CutEventSummary), 0,
+                                cudaMemcpyDeviceToDevice) == cudaSuccess ? 0 : -3314;
+}
+
 // cut_ribbon_tick  - CCD pass per accepted RK45 substep. The blade segment is the CURRENT rod
 // [S=t2v2, E=t1v2] (rod is frozen during the physics phase); prev corner snapshot rolls after
 // every pass so each tick covers exactly one tissue sub-interval (linear endpoint motion).

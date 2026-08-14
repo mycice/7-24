@@ -89,6 +89,10 @@ void cut_set_event_meta(const CutEventMeta* meta);
 // Read only the compact latest-event summary; no Grid/Tet/triangle scan is performed.
 int cut_get_event_summary(CutEventSummary* out);
 
+// Copy the compact event summary directly into another CUDA allocation. This is used by
+// Cut-to-Tet classification without staging the event through Unity or host arrays.
+int cut_copy_event_summary_to_device(CutEventSummary* deviceOut);
+
 // CCD tick (Stage 6)  - called by physics_step after every accepted RK45 substep (tissue moved, rod
 // fixed): continuous collision of each MOVING deformed edge against the STATIC blade segment
 // (coplanarity is quadratic in tick-time; exact space-time crossing  - no tunneling, no inverse map).

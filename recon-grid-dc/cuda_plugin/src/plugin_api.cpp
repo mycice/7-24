@@ -127,6 +127,12 @@ LCS_API int LCS_DetectCut()
 
 LCS_API void LCS_SetCutEventMeta(const CutEventMeta* meta) { cut_set_event_meta(meta); }
 LCS_API int LCS_GetCutEventSummary(CutEventSummary* out) { return cut_get_event_summary(out); }
+LCS_API void LCS_ClassifyLatestCutToTet()
+{
+    // Stage 5.2 is a candidate-marking side path. Errors stay in per-context diagnostics
+    // and never alter the established visual cutting return path.
+    organ_context_cut_to_tet_classify_latest_all();
+}
 
 // Recompute particle frames after severing links, then run the cut-aware DC rebuild
 // (cut-FP chain + cut walls + normals + expand).
@@ -212,6 +218,14 @@ LCS_API int LCS_OrganTetToGridUpdate(uint32_t handle, int applyLocalDeformation)
 LCS_API int LCS_OrganTetToGridGetStats(uint32_t handle, OrganContextTetToGridStats* outStats)
 {
     return organ_context_tet_to_grid_get_stats(handle, outStats);
+}
+LCS_API int LCS_OrganCutToTetSetEnabled(uint32_t handle, int enabled)
+{
+    return organ_context_cut_to_tet_set_enabled(handle, enabled);
+}
+LCS_API int LCS_OrganCutToTetGetStats(uint32_t handle, OrganContextCutToTetStats* outStats)
+{
+    return organ_context_cut_to_tet_get_stats(handle, outStats);
 }
 
 LCS_API int LCS_DirectSurfaceSetBuffers(void* outerPositionBuffer, void* outerNormalBuffer, void* outerAuxBuffer,

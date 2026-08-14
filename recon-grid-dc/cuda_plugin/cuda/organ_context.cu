@@ -1,6 +1,7 @@
 // organ_context.cu - per-organ GPU-resident data and phase-2 tetrahedral XPBD.
 #include "organ_context.h"
 #include "dc_recon.h"
+#include "cut.h"
 
 #include <cuda_runtime.h>
 #include <unordered_map>
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <cfloat>
 #include <vector>
+#include <algorithm>
 
 namespace
 {
@@ -71,9 +73,21 @@ namespace
         unsigned char* gridActiveMask = nullptr;
         float3* currentCentroid = nullptr;
         OrganContextTetToGridStats tetToGridStats{};
+        int4* internalFaces = nullptr;
+        int internalFaceCount = 0;
+        CutEventSummary* cutEventSummary = nullptr;
+        unsigned int* cutToTetCounters = nullptr;
+        unsigned int* candidateTetSequence = nullptr;
+        unsigned int* candidateEdgeSequence = nullptr;
+        unsigned int* candidateSharedFaceSequence = nullptr;
+        unsigned int* candidateSurfaceFaceSequence = nullptr;
+        OrganContextCutToTetStats cutToTetStats{};
+        unsigned int reportedClassificationCount = 0;
         float3 tetRestCentroid = make_float3(0, 0, 0);
         cudaEvent_t tetToGridStart = nullptr;
         cudaEvent_t tetToGridEnd = nullptr;
+        cudaEvent_t cutToTetStart = nullptr;
+        cudaEvent_t cutToTetEnd = nullptr;
         cudaEvent_t toolStart = nullptr;
         cudaEvent_t toolEnd = nullptr;
         cudaEvent_t uploadStart = nullptr;
@@ -95,10 +109,14 @@ namespace
             cudaFree(graspWeights); cudaFree(toolCounters);
             cudaFree(hostTetByCorner); cudaFree(barycentricWeights); cudaFree(alignedRestCorners);
             cudaFree(gridActiveMask); cudaFree(currentCentroid);
+            cudaFree(internalFaces); cudaFree(cutEventSummary); cudaFree(cutToTetCounters);
+            cudaFree(candidateTetSequence); cudaFree(candidateEdgeSequence);
+            cudaFree(candidateSharedFaceSequence); cudaFree(candidateSurfaceFaceSequence);
             cudaEventDestroy(uploadStart); cudaEventDestroy(uploadEnd);
             cudaEventDestroy(kernelStart); cudaEventDestroy(kernelEnd);
             cudaEventDestroy(toolStart); cudaEventDestroy(toolEnd);
             cudaEventDestroy(tetToGridStart); cudaEventDestroy(tetToGridEnd);
+            cudaEventDestroy(cutToTetStart); cudaEventDestroy(cutToTetEnd);
         }
     };
 
@@ -659,6 +677,146 @@ namespace
         if (error==cudaSuccess) return true;
         context.stats.lastError=ORGAN_CONTEXT_CUDA_FAILURE; return false;
     }
+
+    struct FaceKey
+    {
+        int a, b, c;
+        bool operator==(const FaceKey& other) const { return a==other.a && b==other.b && c==other.c; }
+    };
+
+    struct FaceKeyHash
+    {
+        size_t operator()(const FaceKey& key) const
+        {
+            size_t h=static_cast<size_t>(key.a)*73856093u;
+            h^=static_cast<size_t>(key.b)*19349663u;
+            h^=static_cast<size_t>(key.c)*83492791u;
+            return h;
+        }
+    };
+
+    std::vector<int4> BuildInternalFaces(const int* tetIds, int tetCount)
+    {
+        struct FaceRecord { int4 vertices; int count; };
+        std::unordered_map<FaceKey,FaceRecord,FaceKeyHash> faces;
+        constexpr int corners[4][3]={{0,1,2},{0,1,3},{0,2,3},{1,2,3}};
+        for (int t=0;t<tetCount;++t)
+        {
+            for (int f=0;f<4;++f)
+            {
+                int ids[3]={tetIds[t*4+corners[f][0]],tetIds[t*4+corners[f][1]],tetIds[t*4+corners[f][2]]};
+                std::sort(ids,ids+3);
+                FaceKey key{ids[0],ids[1],ids[2]};
+                auto it=faces.find(key);
+                if (it==faces.end()) faces.emplace(key,FaceRecord{make_int4(ids[0],ids[1],ids[2],0),1});
+                else ++it->second.count;
+            }
+        }
+        std::vector<int4> result;
+        result.reserve(faces.size()/2);
+        for (const auto& entry:faces) if (entry.second.count>1) result.push_back(entry.second.vertices);
+        return result;
+    }
+
+    __device__ __forceinline__ bool NearFiniteCut(float3 point, const CutEventSummary& event)
+    {
+        const float3 start=make_float3(event.start[0],event.start[1],event.start[2]);
+        const float3 end=make_float3(event.end[0],event.end[1],event.end[2]);
+        const float3 segment=Sub(end,start);
+        const float lengthSquared=Dot(segment,segment);
+        const float u=lengthSquared>1e-12f?fminf(1.0f,fmaxf(0.0f,Dot(Sub(point,start),segment)/lengthSquared)):0.0f;
+        const float3 closest=Add(start,Mul(segment,u));
+        const float extent=fmaxf(event.radius*2.0f,1e-4f);
+        return Dot(Sub(point,closest),Sub(point,closest))<=extent*extent;
+    }
+
+    __global__ void PrepareCutToTetKernel(const CutEventSummary* event, unsigned int* counters)
+    {
+        if (blockIdx.x || threadIdx.x) return;
+        counters[0]=0;
+        if (!event->valid || event->sequence==0 || event->sequence==counters[8]) return;
+        for (int i=1;i<=7;++i) counters[i]=0;
+        counters[8]=event->sequence;
+        counters[9]+=1;
+        counters[10]=1;
+        counters[0]=1;
+    }
+
+    __global__ void ClassifyTetsKernel(const float3* positions, const int* tetIds, const int* active,
+                                       int count, const CutEventSummary* event, unsigned int* flags,
+                                       unsigned int* counters)
+    {
+        const int t=blockIdx.x*blockDim.x+threadIdx.x;
+        if (t>=count || !counters[0]) return;
+        if (!active[t]) { flags[t]=0; return; }
+        const float3 n0=make_float3(event->normal[0],event->normal[1],event->normal[2]);
+        const float nLen=sqrtf(Dot(n0,n0));
+        if (nLen<1e-8f) { flags[t]=0; return; }
+        const float3 n=Mul(n0,1.0f/nLen);
+        const float3 origin=make_float3(event->hitPoint[0],event->hitPoint[1],event->hitPoint[2]);
+        float minD=FLT_MAX,maxD=-FLT_MAX;
+        float3 center=make_float3(0,0,0);
+        bool near=false;
+        for (int k=0;k<4;++k)
+        {
+            const float3 p=positions[tetIds[t*4+k]];
+            const float d=Dot(Sub(p,origin),n);
+            minD=fminf(minD,d); maxD=fmaxf(maxD,d); center=Add(center,Mul(p,0.25f));
+            near=near||NearFiniteCut(p,*event);
+        }
+        if (minD>0.0f) atomicAdd(&counters[1],1u);
+        else if (maxD<0.0f) atomicAdd(&counters[2],1u);
+        else atomicAdd(&counters[3],1u);
+        const bool candidate=minD<=event->radius && maxD>=-event->radius && (near||NearFiniteCut(center,*event));
+        flags[t]=candidate?event->sequence:0u;
+        if (candidate) atomicAdd(&counters[4],1u);
+    }
+
+    __device__ __forceinline__ bool PrimitiveCrossesCut(const float3* positions, const int* ids, int vertexCount,
+                                                         const CutEventSummary& event)
+    {
+        const float3 n0=make_float3(event.normal[0],event.normal[1],event.normal[2]);
+        const float nLen=sqrtf(Dot(n0,n0));
+        if (nLen<1e-8f) return false;
+        const float3 n=Mul(n0,1.0f/nLen);
+        const float3 origin=make_float3(event.hitPoint[0],event.hitPoint[1],event.hitPoint[2]);
+        float minD=FLT_MAX,maxD=-FLT_MAX;
+        float3 center=make_float3(0,0,0);
+        bool near=false;
+        for (int i=0;i<vertexCount;++i)
+        {
+            const float3 p=positions[ids[i]];
+            const float d=Dot(Sub(p,origin),n);
+            minD=fminf(minD,d); maxD=fmaxf(maxD,d);
+            center=Add(center,Mul(p,1.0f/vertexCount));
+            near=near||NearFiniteCut(p,event);
+        }
+        return minD<=event.radius && maxD>=-event.radius && (near||NearFiniteCut(center,event));
+    }
+
+    __global__ void ClassifyEdgesKernel(const float3* positions, const int* edges, int count,
+                                        const CutEventSummary* event, unsigned int* flags,
+                                        unsigned int* counters)
+    {
+        const int i=blockIdx.x*blockDim.x+threadIdx.x;
+        if (i>=count || !counters[0]) return;
+        const int ids[2]={edges[i*2],edges[i*2+1]};
+        const bool candidate=PrimitiveCrossesCut(positions,ids,2,*event);
+        flags[i]=candidate?event->sequence:0u;
+        if (candidate) atomicAdd(&counters[5],1u);
+    }
+
+    __global__ void ClassifyFacesKernel(const float3* positions, const int* faces, int stride, int count,
+                                        const CutEventSummary* event, unsigned int* flags,
+                                        unsigned int* counters, int counterIndex)
+    {
+        const int i=blockIdx.x*blockDim.x+threadIdx.x;
+        if (i>=count || !counters[0]) return;
+        const int ids[3]={faces[i*stride],faces[i*stride+1],faces[i*stride+2]};
+        const bool candidate=PrimitiveCrossesCut(positions,ids,3,*event);
+        flags[i]=candidate?event->sequence:0u;
+        if (candidate) atomicAdd(&counters[counterIndex],1u);
+    }
 }
 
 int organ_context_create(uint32_t* outHandle)
@@ -670,7 +828,8 @@ int organ_context_create(uint32_t* outHandle)
     if (cudaEventCreate(&context->uploadStart)!=cudaSuccess || cudaEventCreate(&context->uploadEnd)!=cudaSuccess ||
         cudaEventCreate(&context->kernelStart)!=cudaSuccess || cudaEventCreate(&context->kernelEnd)!=cudaSuccess ||
         cudaEventCreate(&context->toolStart)!=cudaSuccess || cudaEventCreate(&context->toolEnd)!=cudaSuccess ||
-        cudaEventCreate(&context->tetToGridStart)!=cudaSuccess || cudaEventCreate(&context->tetToGridEnd)!=cudaSuccess)
+        cudaEventCreate(&context->tetToGridStart)!=cudaSuccess || cudaEventCreate(&context->tetToGridEnd)!=cudaSuccess ||
+        cudaEventCreate(&context->cutToTetStart)!=cudaSuccess || cudaEventCreate(&context->cutToTetEnd)!=cudaSuccess)
         return ORGAN_CONTEXT_CUDA_FAILURE;
     g_contexts.emplace(handle,std::move(context)); *outHandle=handle; return ORGAN_CONTEXT_OK;
 }
@@ -693,13 +852,16 @@ int organ_context_initialize(uint32_t handle, const OrganContextInitDesc* desc,
     if ((desc->surfaceTriangleCount>0 && !surfaceTriangleIds3) || (desc->edgeConstraintCount>0 && (!edgeConstraintIds2 || !edgeRestLengths))) return ORGAN_CONTEXT_INVALID_ARGUMENT;
     c->stats.particleCount=desc->particleCount; c->stats.tetCount=desc->tetCount;
     c->stats.surfaceTriangleCount=desc->surfaceTriangleCount; c->stats.edgeConstraintCount=desc->edgeConstraintCount;
+    std::vector<int4> internalFaces=BuildInternalFaces(tetIds4,desc->tetCount);
+    c->internalFaceCount=static_cast<int>(internalFaces.size());
     cudaEventRecord(c->uploadStart); float material[4]={desc->density,desc->youngsModulus,desc->poissonsRatio,desc->damping};
     bool ok=Upload(c->restPositions,restPositions3,size_t(desc->particleCount)*3,*c) &&
             Upload(c->tetIds,tetIds4,size_t(desc->tetCount)*4,*c) && Upload(c->inverseMass,inverseMass,desc->particleCount,*c) &&
             Upload(c->restVolumes,restVolumes,desc->tetCount,*c) && Upload(c->tetActive,tetActive,desc->tetCount,*c) &&
             Upload(c->surfaceTriangles,surfaceTriangleIds3,size_t(desc->surfaceTriangleCount)*3,*c) &&
             Upload(c->edgeIds,edgeConstraintIds2,size_t(desc->edgeConstraintCount)*2,*c) &&
-            Upload(c->edgeRestLengths,edgeRestLengths,desc->edgeConstraintCount,*c) && Upload(c->material,material,4,*c);
+            Upload(c->edgeRestLengths,edgeRestLengths,desc->edgeConstraintCount,*c) && Upload(c->material,material,4,*c) &&
+            Upload(c->internalFaces,internalFaces.data(),internalFaces.size(),*c);
     cudaEventRecord(c->uploadEnd); cudaEventSynchronize(c->uploadEnd); cudaEventElapsedTime(&c->stats.uploadMilliseconds,c->uploadStart,c->uploadEnd);
     if (!ok) return ORGAN_CONTEXT_CUDA_FAILURE;
     unsigned long long* sink=nullptr; if (!Check(cudaMalloc(&sink,sizeof(unsigned long long)),*c) || !Check(cudaMemset(sink,0,sizeof(unsigned long long)),*c)) return ORGAN_CONTEXT_CUDA_FAILURE;
@@ -731,6 +893,11 @@ int organ_context_xpbd_initialize(uint32_t handle, const float* initialPositions
             Allocate(c->toolCapsules,12,*c) && Allocate(c->graspMask,c->stats.particleCount,*c) &&
             Allocate(c->graspFrameCoordinates,c->stats.particleCount,*c) && Allocate(c->graspWeights,c->stats.particleCount,*c) &&
             Allocate(c->toolCounters,7,*c) &&
+            Allocate(c->cutEventSummary,1,*c) && Allocate(c->cutToTetCounters,11,*c) &&
+            Allocate(c->candidateTetSequence,c->stats.tetCount,*c) &&
+            Allocate(c->candidateEdgeSequence,c->stats.edgeConstraintCount,*c) &&
+            Allocate(c->candidateSharedFaceSequence,c->internalFaceCount,*c) &&
+            Allocate(c->candidateSurfaceFaceSequence,c->stats.surfaceTriangleCount,*c) &&
             Upload(c->edgeColorOffsets,edgeColorOffsets,edgeColorCount,*c,true) && Upload(c->edgeColorCounts,edgeColorCounts,edgeColorCount,*c,true) && Upload(c->edgeColorFlat,edgeColorFlat,edgeFlatCount,*c,true) &&
             Upload(c->tetColorOffsets,tetColorOffsets,tetColorCount,*c,true) && Upload(c->tetColorCounts,tetColorCounts,tetColorCount,*c,true) && Upload(c->tetColorFlat,tetColorFlat,tetFlatCount,*c,true) &&
             Upload(c->surfaceColorOffsets,surfaceColorOffsets,surfaceColorCount,*c,true) && Upload(c->surfaceColorCounts,surfaceColorCounts,surfaceColorCount,*c,true) && Upload(c->surfaceColorFlat,surfaceColorFlat,surfaceFlatCount,*c,true);
@@ -738,7 +905,13 @@ int organ_context_xpbd_initialize(uint32_t handle, const float* initialPositions
         !Check(cudaMemcpy(c->previousPositions,initialPositions3,sizeof(float3)*size_t(c->stats.particleCount),cudaMemcpyHostToDevice),*c) ||
         !Check(cudaMemset(c->velocities,0,sizeof(float3)*size_t(c->stats.particleCount)),*c) ||
         !Check(cudaMemset(c->graspMask,0,c->stats.particleCount),*c) ||
-        !Check(cudaMemset(c->toolCounters,0,sizeof(unsigned int)*7),*c)) return ORGAN_CONTEXT_CUDA_FAILURE;
+        !Check(cudaMemset(c->toolCounters,0,sizeof(unsigned int)*7),*c) ||
+        !Check(cudaMemset(c->cutEventSummary,0,sizeof(CutEventSummary)),*c) ||
+        !Check(cudaMemset(c->cutToTetCounters,0,sizeof(unsigned int)*11),*c) ||
+        !Check(cudaMemset(c->candidateTetSequence,0,sizeof(unsigned int)*size_t(c->stats.tetCount)),*c) ||
+        (c->stats.edgeConstraintCount>0 && !Check(cudaMemset(c->candidateEdgeSequence,0,sizeof(unsigned int)*size_t(c->stats.edgeConstraintCount)),*c)) ||
+        (c->internalFaceCount>0 && !Check(cudaMemset(c->candidateSharedFaceSequence,0,sizeof(unsigned int)*size_t(c->internalFaceCount)),*c)) ||
+        (c->stats.surfaceTriangleCount>0 && !Check(cudaMemset(c->candidateSurfaceFaceSequence,0,sizeof(unsigned int)*size_t(c->stats.surfaceTriangleCount)),*c))) return ORGAN_CONTEXT_CUDA_FAILURE;
     PrepareTetRestKernel<<<(c->stats.tetCount+kThreads-1)/kThreads,kThreads>>>(reinterpret_cast<float3*>(c->restPositions),c->tetIds,c->tetActive,c->stats.tetCount,c->invRestRows);
     if (!Check(cudaDeviceSynchronize(),*c)) return ORGAN_CONTEXT_CUDA_FAILURE;
     c->hostEdgeColorOffsets.assign(edgeColorOffsets, edgeColorOffsets + edgeColorCount);
@@ -933,6 +1106,91 @@ int organ_context_tet_to_grid_get_stats(uint32_t handle, OrganContextTetToGridSt
     if (!outStats) return ORGAN_CONTEXT_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> lock(g_contextMutex); CudaOrganContext* c=FindContext(handle);
     if (!c) return ORGAN_CONTEXT_INVALID_HANDLE; *outStats=c->tetToGridStats; return ORGAN_CONTEXT_OK;
+}
+
+int organ_context_cut_to_tet_set_enabled(uint32_t handle, int enabled)
+{
+    std::lock_guard<std::mutex> lock(g_contextMutex); CudaOrganContext* c=FindContext(handle);
+    if (!c) return ORGAN_CONTEXT_INVALID_HANDLE;
+    if (!c->xpbdInitialized) return ORGAN_CONTEXT_NOT_INITIALIZED;
+    c->cutToTetStats.enabled=enabled?1:0;
+    c->cutToTetStats.lastError=0;
+    return ORGAN_CONTEXT_OK;
+}
+
+int organ_context_cut_to_tet_classify_latest_all()
+{
+    std::lock_guard<std::mutex> lock(g_contextMutex);
+    int overallResult=ORGAN_CONTEXT_OK;
+    for (auto& entry:g_contexts)
+    {
+        CudaOrganContext& c=*entry.second;
+        if (!c.xpbdInitialized || !c.cutToTetStats.enabled) continue;
+        int copyResult=cut_copy_event_summary_to_device(c.cutEventSummary);
+        if (copyResult!=0) { c.cutToTetStats.lastError=copyResult; overallResult=copyResult; continue; }
+        cudaEventRecord(c.cutToTetStart);
+        PrepareCutToTetKernel<<<1,1>>>(c.cutEventSummary,c.cutToTetCounters);
+        ClassifyTetsKernel<<<(c.stats.tetCount+kThreads-1)/kThreads,kThreads>>>(
+            c.positions,c.tetIds,c.tetActive,c.stats.tetCount,c.cutEventSummary,
+            c.candidateTetSequence,c.cutToTetCounters);
+        if (c.stats.edgeConstraintCount>0)
+            ClassifyEdgesKernel<<<(c.stats.edgeConstraintCount+kThreads-1)/kThreads,kThreads>>>(
+                c.positions,c.edgeIds,c.stats.edgeConstraintCount,c.cutEventSummary,
+                c.candidateEdgeSequence,c.cutToTetCounters);
+        if (c.internalFaceCount>0)
+            ClassifyFacesKernel<<<(c.internalFaceCount+kThreads-1)/kThreads,kThreads>>>(
+                c.positions,reinterpret_cast<const int*>(c.internalFaces),4,c.internalFaceCount,
+                c.cutEventSummary,c.candidateSharedFaceSequence,c.cutToTetCounters,6);
+        if (c.stats.surfaceTriangleCount>0)
+            ClassifyFacesKernel<<<(c.stats.surfaceTriangleCount+kThreads-1)/kThreads,kThreads>>>(
+                c.positions,c.surfaceTriangles,3,c.stats.surfaceTriangleCount,
+                c.cutEventSummary,c.candidateSurfaceFaceSequence,c.cutToTetCounters,7);
+        cudaEventRecord(c.cutToTetEnd);
+        if (!Check(cudaPeekAtLastError(),c))
+        {
+            c.cutToTetStats.lastError=ORGAN_CONTEXT_CUDA_FAILURE;
+            overallResult=ORGAN_CONTEXT_CUDA_FAILURE;
+            continue;
+        }
+        c.cutToTetStats.lastError=0;
+    }
+    return overallResult;
+}
+
+int organ_context_cut_to_tet_get_stats(uint32_t handle, OrganContextCutToTetStats* outStats)
+{
+    if (!outStats) return ORGAN_CONTEXT_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(g_contextMutex); CudaOrganContext* c=FindContext(handle);
+    if (!c) return ORGAN_CONTEXT_INVALID_HANDLE;
+    if (!c->xpbdInitialized) return ORGAN_CONTEXT_NOT_INITIALIZED;
+    unsigned int counters[11]{};
+    if (!Check(cudaMemcpy(counters,c->cutToTetCounters,sizeof(counters),cudaMemcpyDeviceToHost),*c))
+    {
+        c->cutToTetStats.lastError=ORGAN_CONTEXT_CUDA_FAILURE;
+        return ORGAN_CONTEXT_CUDA_FAILURE;
+    }
+    c->cutToTetStats.classificationValid=static_cast<int>(counters[10]);
+    c->cutToTetStats.processedEventSequence=counters[8];
+    c->cutToTetStats.classificationCount=counters[9];
+    c->cutToTetStats.positiveSideTetCount=static_cast<int>(counters[1]);
+    c->cutToTetStats.negativeSideTetCount=static_cast<int>(counters[2]);
+    c->cutToTetStats.straddlingTetCount=static_cast<int>(counters[3]);
+    c->cutToTetStats.candidateTetCount=static_cast<int>(counters[4]);
+    c->cutToTetStats.candidateEdgeConstraintCount=static_cast<int>(counters[5]);
+    c->cutToTetStats.candidateSharedFaceCount=static_cast<int>(counters[6]);
+    c->cutToTetStats.candidateSurfaceFaceCount=static_cast<int>(counters[7]);
+    if (counters[9]!=c->reportedClassificationCount && cudaEventSynchronize(c->cutToTetEnd)==cudaSuccess)
+    {
+        float elapsed=0.0f;
+        if (cudaEventElapsedTime(&elapsed,c->cutToTetStart,c->cutToTetEnd)==cudaSuccess)
+        {
+            c->cutToTetStats.lastClassificationMilliseconds=elapsed;
+            c->cutToTetStats.totalClassificationMilliseconds+=elapsed;
+        }
+        c->reportedClassificationCount=counters[9];
+    }
+    *outStats=c->cutToTetStats;
+    return ORGAN_CONTEXT_OK;
 }
 
 int organ_context_xpbd_get_positions(uint32_t handle, float* outPositions3, int particleCount)

@@ -1,3 +1,4 @@
+using System;
 using System.Runtime.InteropServices;
 using System.Reflection;
 using Unity.Mathematics;
@@ -111,11 +112,13 @@ namespace ReconGridDC.Cuda
         [DllImport(DLL)] static extern int LCS_DetectCut();
         [DllImport(DLL)] static extern void LCS_SetCutEventMeta(ref CutEventMeta meta);
         [DllImport(DLL)] static extern int LCS_GetCutEventSummary(out CutEventSummary summary);
+        [DllImport(DLL)] static extern void LCS_ClassifyLatestCutToTet();
         [DllImport(DLL2, EntryPoint = "LCS_InitCut")] static extern int LCS2_InitCut(ref CutInitDesc desc, Conn4096Interop[] conn4096, GridEdge2Interop[] gridEdges, int[] voxelOccupied, int[] cornerInside);
         [DllImport(DLL2, EntryPoint = "LCS_SetTool")] static extern void LCS2_SetTool(ref CutToolDesc tool);
         [DllImport(DLL2, EntryPoint = "LCS_DetectCut")] static extern int LCS2_DetectCut();
         [DllImport(DLL2, EntryPoint = "LCS_SetCutEventMeta")] static extern void LCS2_SetCutEventMeta(ref CutEventMeta meta);
         [DllImport(DLL2, EntryPoint = "LCS_GetCutEventSummary")] static extern int LCS2_GetCutEventSummary(out CutEventSummary summary);
+        [DllImport(DLL2, EntryPoint = "LCS_ClassifyLatestCutToTet")] static extern void LCS2_ClassifyLatestCutToTet();
 
         bool SecondaryPlugin => pluginInstance == CudaPluginInstance.Secondary;
         int NativeInitCut(ref CutInitDesc d, Conn4096Interop[] c, GridEdge2Interop[] e, int[] o, int[] i) => SecondaryPlugin ? LCS2_InitCut(ref d,c,e,o,i) : LCS_InitCut(ref d,c,e,o,i);
@@ -123,6 +126,19 @@ namespace ReconGridDC.Cuda
         int NativeDetectCut() => SecondaryPlugin ? LCS2_DetectCut() : LCS_DetectCut();
         void NativeSetCutEventMeta(ref CutEventMeta m) { if (SecondaryPlugin) LCS2_SetCutEventMeta(ref m); else LCS_SetCutEventMeta(ref m); }
         int NativeGetCutEventSummary(out CutEventSummary s) => SecondaryPlugin ? LCS2_GetCutEventSummary(out s) : LCS_GetCutEventSummary(out s);
+        bool _cutToTetApiAvailable = true;
+        void NativeClassifyLatestCutToTet()
+        {
+            if (!_cutToTetApiAvailable) return;
+            try
+            {
+                if (SecondaryPlugin) LCS2_ClassifyLatestCutToTet(); else LCS_ClassifyLatestCutToTet();
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _cutToTetApiAvailable = false;
+            }
+        }
 
         CuttingTool _tool;
         float _voxelL;
@@ -585,6 +601,7 @@ namespace ReconGridDC.Cuda
 
             NativeSetTool(ref centerTool);
             NativeDetectCut();
+            NativeClassifyLatestCutToTet();
             return true;
         }
 

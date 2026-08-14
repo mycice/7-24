@@ -155,6 +155,18 @@ namespace ReconGridDC.Stage1TetPhysics
             public int lastError;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct OrganContextCutToTetStatsNative
+        {
+            public int enabled, classificationValid;
+            public uint processedEventSequence, classificationCount;
+            public int positiveSideTetCount, negativeSideTetCount, straddlingTetCount;
+            public int candidateTetCount, candidateEdgeConstraintCount;
+            public int candidateSharedFaceCount, candidateSurfaceFaceCount;
+            public float lastClassificationMilliseconds, totalClassificationMilliseconds;
+            public int lastError;
+        }
+
         [DllImport(Dll)] static extern int LCS_OrganCreate(out uint handle);
         [DllImport(Dll)] static extern int LCS_OrganDestroy(uint handle);
         [DllImport(Dll)] static extern int LCS_OrganInitialize(
@@ -181,6 +193,8 @@ namespace ReconGridDC.Stage1TetPhysics
             float[] alignedRestCorners3, byte[] activeMask);
         [DllImport(Dll)] static extern int LCS_OrganTetToGridUpdate(uint handle, int applyLocalDeformation);
         [DllImport(Dll)] static extern int LCS_OrganTetToGridGetStats(uint handle, out OrganContextTetToGridStatsNative stats);
+        [DllImport(Dll)] static extern int LCS_OrganCutToTetSetEnabled(uint handle, int enabled);
+        [DllImport(Dll)] static extern int LCS_OrganCutToTetGetStats(uint handle, out OrganContextCutToTetStatsNative stats);
 
         [DllImport(Dll2, EntryPoint="LCS_OrganCreate")] static extern int LCS2_OrganCreate(out uint handle);
         [DllImport(Dll2, EntryPoint="LCS_OrganDestroy")] static extern int LCS2_OrganDestroy(uint handle);
@@ -195,6 +209,8 @@ namespace ReconGridDC.Stage1TetPhysics
         [DllImport(Dll2, EntryPoint="LCS_OrganTetToGridConfigure")] static extern int LCS2_OrganTetToGridConfigure(uint handle, ref OrganContextTetToGridDescNative desc, int[] hostTetByCorner, float[] weights, float[] corners, byte[] mask);
         [DllImport(Dll2, EntryPoint="LCS_OrganTetToGridUpdate")] static extern int LCS2_OrganTetToGridUpdate(uint handle, int applyLocalDeformation);
         [DllImport(Dll2, EntryPoint="LCS_OrganTetToGridGetStats")] static extern int LCS2_OrganTetToGridGetStats(uint handle, out OrganContextTetToGridStatsNative stats);
+        [DllImport(Dll2, EntryPoint="LCS_OrganCutToTetSetEnabled")] static extern int LCS2_OrganCutToTetSetEnabled(uint handle, int enabled);
+        [DllImport(Dll2, EntryPoint="LCS_OrganCutToTetGetStats")] static extern int LCS2_OrganCutToTetGetStats(uint handle, out OrganContextCutToTetStatsNative stats);
 
         bool SecondaryPlugin => pluginInstance == CudaPluginInstance.Secondary;
         int NativeOrganCreate(out uint h) { return SecondaryPlugin ? LCS2_OrganCreate(out h) : LCS_OrganCreate(out h); }
@@ -210,6 +226,8 @@ namespace ReconGridDC.Stage1TetPhysics
         int NativeTetToGridConfigure(uint h,ref OrganContextTetToGridDescNative d,int[] t,float[] w,float[] c,byte[] m) => SecondaryPlugin ? LCS2_OrganTetToGridConfigure(h,ref d,t,w,c,m) : LCS_OrganTetToGridConfigure(h,ref d,t,w,c,m);
         int NativeTetToGridUpdate(uint h,int a) => SecondaryPlugin ? LCS2_OrganTetToGridUpdate(h,a) : LCS_OrganTetToGridUpdate(h,a);
         int NativeTetToGridGetStats(uint h,out OrganContextTetToGridStatsNative s) { return SecondaryPlugin ? LCS2_OrganTetToGridGetStats(h,out s) : LCS_OrganTetToGridGetStats(h,out s); }
+        int NativeCutToTetSetEnabled(uint h,int e) => SecondaryPlugin ? LCS2_OrganCutToTetSetEnabled(h,e) : LCS_OrganCutToTetSetEnabled(h,e);
+        int NativeCutToTetGetStats(uint h,out OrganContextCutToTetStatsNative s) { return SecondaryPlugin ? LCS2_OrganCutToTetGetStats(h,out s) : LCS_OrganCutToTetGetStats(h,out s); }
 
         [Header("CUDA Migration Phase 1")]
         [Tooltip("Creates an isolated native CUDA organ context and uploads immutable tetrahedral data once. It does not drive XPBD, gripper contact, Tet-to-Grid, cutting, or rendering.")]
@@ -239,6 +257,10 @@ namespace ReconGridDC.Stage1TetPhysics
         [Header("CUDA Migration Phase 4 - Tet To Grid")]
         [Tooltip("Uploads the already-built Stage 3 host-tet/barycentric embedding once and evaluates it on CUDA every fixed step. This removes the full tet-position readback and full grid-position upload from the CUDA driver path.")]
         public bool enableCudaTetToGrid = true;
+
+        [Header("Stage 5.2 - Cut To Tet Classification")]
+        [Tooltip("Classifies each new unified GPU cut event against current tetrahedra and constraints. This only writes candidate markers; it never changes topology or disables constraints.")]
+        public bool enableCutToTetClassification = true;
 
         [Header("Diagnostics (runtime)")]
         [SerializeField] uint contextHandle;
@@ -303,6 +325,21 @@ namespace ReconGridDC.Stage1TetPhysics
         [SerializeField] float cudaTetToGridTotalMilliseconds;
         [SerializeField] int cudaTetToGridLastError;
         [SerializeField] bool gpuResidentTetToGridFrameActive;
+        [Header("Cut To Tet Diagnostics (runtime)")]
+        [SerializeField] bool cutToTetClassificationValid;
+        [SerializeField] string cutToTetStatus = "Waiting for CUDA XPBD and the stage-5.2 native API.";
+        [SerializeField] uint cutToTetProcessedEventSequence;
+        [SerializeField] uint cutToTetClassificationCount;
+        [SerializeField] int cutToTetPositiveSideTets;
+        [SerializeField] int cutToTetNegativeSideTets;
+        [SerializeField] int cutToTetStraddlingTets;
+        [SerializeField] int cutToTetCandidateTets;
+        [SerializeField] int cutToTetCandidateEdgeConstraints;
+        [SerializeField] int cutToTetCandidateSharedFaces;
+        [SerializeField] int cutToTetCandidateSurfaceFaces;
+        [SerializeField] float cutToTetLastMilliseconds;
+        [SerializeField] float cutToTetTotalMilliseconds;
+        [SerializeField] int cutToTetLastError;
         [Header("Adaptive CUDA XPBD (runtime)")]
         [SerializeField] int cudaXpbdEffectiveStepInterval = 1;
         [SerializeField] int cudaXpbdSkippedFixedSteps;
@@ -321,6 +358,9 @@ namespace ReconGridDC.Stage1TetPhysics
         LiverCudaManager _gpuWorkScheduler;
         int _idleCudaXpbdStepInterval = 3;
         int _idleCudaXpbdFixedStepCounter;
+        bool _cutToTetNativeConfigured;
+        bool _cutToTetConfiguredValue;
+        bool _cutToTetApiAvailable = true;
 
         public bool IsCudaDriverActive =>
             contextReady && cudaXpbdReady && enableCudaXpbd &&
@@ -429,13 +469,19 @@ namespace ReconGridDC.Stage1TetPhysics
 
         void Update()
         {
-            if (!contextReady || !sampleNativeStats || Time.unscaledTime < _nextStatsSampleTime)
+            if (!contextReady)
+                return;
+
+            ConfigureCutToTetIfNeeded();
+            if (!sampleNativeStats || Time.unscaledTime < _nextStatsSampleTime)
                 return;
 
             _nextStatsSampleTime = Time.unscaledTime + Mathf.Max(0.1f, statsSampleIntervalSeconds);
             ReadStats(false);
             if (cudaTetToGridReady)
                 ReadTetToGridStats();
+            if (_cutToTetNativeConfigured && enableCutToTetClassification)
+                ReadCutToTetStats();
             if (IsCudaToolContactDriverActive && Time.unscaledTime >= _nextToolStatsSampleTime)
             {
                 _nextToolStatsSampleTime = Time.unscaledTime + Mathf.Max(0.1f, statsSampleIntervalSeconds);
@@ -506,6 +552,7 @@ namespace ReconGridDC.Stage1TetPhysics
                 contextReady = true;
                 CacheOrganRestBounds(data);
                 InitializeCudaXpbd(data, edgeIds);
+                ConfigureCutToTetIfNeeded();
                 status = cudaXpbdReady
                     ? "Static and CUDA XPBD data uploaded. Unity XPBD remains the active runtime driver unless CUDA Driver Isolated is selected."
                     : "Static tetrahedral data uploaded. Legacy Unity XPBD remains the active runtime driver.";
@@ -569,6 +616,7 @@ namespace ReconGridDC.Stage1TetPhysics
             contextHandle = 0;
             contextReady = false;
             cudaXpbdReady = false;
+            _cutToTetNativeConfigured = false;
         }
 
         void InitializeCudaXpbd(TetMeshData data, int[] edgeIds)
@@ -609,6 +657,64 @@ namespace ReconGridDC.Stage1TetPhysics
                 cudaXpbdStatus = $"CUDA XPBD setup failed: {exception.Message}";
                 Debug.LogError($"[CudaOrganContext] {cudaXpbdStatus}", this);
             }
+        }
+
+        void ConfigureCutToTetIfNeeded()
+        {
+            if (!_cutToTetApiAvailable || !contextReady || !cudaXpbdReady ||
+                (_cutToTetNativeConfigured && _cutToTetConfiguredValue == enableCutToTetClassification))
+                return;
+            try
+            {
+                lastNativeError = NativeCutToTetSetEnabled(contextHandle, enableCutToTetClassification ? 1 : 0);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                cutToTetStatus = "The deployed CUDA plugin predates the stage-5.2 Cut-to-Tet API.";
+                _cutToTetNativeConfigured = false;
+                _cutToTetApiAvailable = false;
+                return;
+            }
+            if (lastNativeError != 0)
+            {
+                cutToTetLastError = lastNativeError;
+                cutToTetStatus = $"LCS_OrganCutToTetSetEnabled failed ({lastNativeError}). Existing simulation is unchanged.";
+                return;
+            }
+            _cutToTetNativeConfigured = true;
+            _cutToTetConfiguredValue = enableCutToTetClassification;
+            cutToTetStatus = enableCutToTetClassification
+                ? "Enabled: waiting for a new valid unified cut event. Candidate markers remain GPU-resident."
+                : "Disabled: no Cut-to-Tet classification is dispatched; physics and visual cutting are unchanged.";
+        }
+
+        void ReadCutToTetStats()
+        {
+            OrganContextCutToTetStatsNative stats;
+            try { lastNativeError = NativeCutToTetGetStats(contextHandle, out stats); }
+            catch (EntryPointNotFoundException) { return; }
+            if (lastNativeError != 0)
+            {
+                cutToTetLastError = lastNativeError;
+                cutToTetStatus = $"LCS_OrganCutToTetGetStats failed ({lastNativeError}).";
+                return;
+            }
+            cutToTetClassificationValid = stats.classificationValid != 0;
+            cutToTetProcessedEventSequence = stats.processedEventSequence;
+            cutToTetClassificationCount = stats.classificationCount;
+            cutToTetPositiveSideTets = stats.positiveSideTetCount;
+            cutToTetNegativeSideTets = stats.negativeSideTetCount;
+            cutToTetStraddlingTets = stats.straddlingTetCount;
+            cutToTetCandidateTets = stats.candidateTetCount;
+            cutToTetCandidateEdgeConstraints = stats.candidateEdgeConstraintCount;
+            cutToTetCandidateSharedFaces = stats.candidateSharedFaceCount;
+            cutToTetCandidateSurfaceFaces = stats.candidateSurfaceFaceCount;
+            cutToTetLastMilliseconds = stats.lastClassificationMilliseconds;
+            cutToTetTotalMilliseconds = stats.totalClassificationMilliseconds;
+            cutToTetLastError = stats.lastError;
+            cutToTetStatus = cutToTetClassificationValid
+                ? "Latest valid cut event classified on GPU. No constraints or topology were modified."
+                : "Enabled: waiting for a new valid unified cut event.";
         }
 
         public void StepCudaXpbd(float dt)
