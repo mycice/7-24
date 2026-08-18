@@ -12,6 +12,8 @@
 #include <cfloat>
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <unordered_set>
 
 namespace
 {
@@ -82,6 +84,7 @@ namespace
         unsigned int* candidateSharedFaceSequence = nullptr;
         unsigned int* candidateSurfaceFaceSequence = nullptr;
         OrganContextCutToTetStats cutToTetStats{};
+        OrganContextTetFractureStats fractureStats{};
         unsigned int reportedClassificationCount = 0;
         float3 tetRestCentroid = make_float3(0, 0, 0);
         cudaEvent_t tetToGridStart = nullptr;
@@ -718,6 +721,335 @@ namespace
         return result;
     }
 
+    struct HostColorGroups
+    {
+        std::vector<int> offsets;
+        std::vector<int> counts;
+        std::vector<int> flat;
+    };
+
+    HostColorGroups BuildColorGroups(const std::vector<int>& ids, int elementCount,
+                                     int stride, int particleCount)
+    {
+        HostColorGroups result;
+        if (elementCount <= 0 || stride <= 0 || particleCount <= 0) return result;
+        std::vector<std::vector<int>> incident(static_cast<size_t>(particleCount));
+        for (int element=0;element<elementCount;++element)
+            for (int corner=0;corner<stride;++corner)
+                incident[ids[size_t(element)*stride+corner]].push_back(element);
+        std::vector<int> colors(static_cast<size_t>(elementCount),-1);
+        int maxColor=-1;
+        for (int element=0;element<elementCount;++element)
+        {
+            std::unordered_set<int> used;
+            for (int corner=0;corner<stride;++corner)
+                for (int neighbour:incident[ids[size_t(element)*stride+corner]])
+                    if (colors[neighbour]>=0) used.insert(colors[neighbour]);
+            int color=0; while (used.count(color)) ++color;
+            colors[element]=color; maxColor=std::max(maxColor,color);
+        }
+        result.offsets.resize(static_cast<size_t>(maxColor+1));
+        result.counts.resize(static_cast<size_t>(maxColor+1));
+        for (int color=0;color<=maxColor;++color)
+        {
+            result.offsets[color]=static_cast<int>(result.flat.size());
+            for (int element=0;element<elementCount;++element)
+                if (colors[element]==color) result.flat.push_back(element);
+            result.counts[color]=static_cast<int>(result.flat.size())-result.offsets[color];
+        }
+        return result;
+    }
+
+    struct FaceOwnerRecord
+    {
+        int oriented[3]{};
+        int count=0;
+    };
+
+    void BuildFaces(const std::vector<int>& tetIds, int tetCount,
+                    std::vector<int>& surface, std::vector<int4>& internal)
+    {
+        std::unordered_map<FaceKey,FaceOwnerRecord,FaceKeyHash> faces;
+        constexpr int corners[4][3]={{0,2,1},{0,1,3},{0,3,2},{1,2,3}};
+        for (int tet=0;tet<tetCount;++tet)
+            for (int face=0;face<4;++face)
+            {
+                int oriented[3]={tetIds[size_t(tet)*4+corners[face][0]],
+                                 tetIds[size_t(tet)*4+corners[face][1]],
+                                 tetIds[size_t(tet)*4+corners[face][2]]};
+                int sorted[3]={oriented[0],oriented[1],oriented[2]};
+                std::sort(sorted,sorted+3);
+                FaceKey key{sorted[0],sorted[1],sorted[2]};
+                auto it=faces.find(key);
+                if (it==faces.end())
+                {
+                    FaceOwnerRecord record;
+                    std::copy(oriented,oriented+3,record.oriented);
+                    record.count=1;
+                    faces.emplace(key,record);
+                }
+                else ++it->second.count;
+            }
+        surface.clear(); internal.clear();
+        for (const auto& entry:faces)
+        {
+            const FaceOwnerRecord& record=entry.second;
+            if (record.count==1)
+                surface.insert(surface.end(),record.oriented,record.oriented+3);
+            else if (record.count==2)
+                internal.push_back(make_int4(entry.first.a,entry.first.b,entry.first.c,0));
+        }
+    }
+
+    void BuildUniqueEdges(const std::vector<int>& tetIds, int tetCount,
+                          const std::vector<float3>& rest, std::vector<int>& edges,
+                          std::vector<float>& lengths)
+    {
+        constexpr int pairs[6][2]={{0,1},{0,2},{0,3},{1,2},{1,3},{2,3}};
+        std::unordered_set<uint64_t> seen;
+        edges.clear(); lengths.clear();
+        for (int tet=0;tet<tetCount;++tet)
+            for (int pair=0;pair<6;++pair)
+            {
+                int a=tetIds[size_t(tet)*4+pairs[pair][0]];
+                int b=tetIds[size_t(tet)*4+pairs[pair][1]];
+                if (a>b) std::swap(a,b);
+                uint64_t key=(uint64_t(uint32_t(a))<<32)|uint32_t(b);
+                if (!seen.insert(key).second) continue;
+                edges.push_back(a); edges.push_back(b);
+                float3 delta=Sub(rest[a],rest[b]);
+                lengths.push_back(std::sqrt(Dot(delta,delta)));
+            }
+    }
+
+    template <typename T>
+    bool AllocateAndUploadRaw(T*& destination, const std::vector<T>& source)
+    {
+        destination=nullptr;
+        if (source.empty()) return true;
+        const size_t bytes=sizeof(T)*source.size();
+        return cudaMalloc(&destination,bytes)==cudaSuccess &&
+               cudaMemcpy(destination,source.data(),bytes,cudaMemcpyHostToDevice)==cudaSuccess;
+    }
+
+    bool AllocateAndUploadFloat3AsFloat(float*& destination, const std::vector<float3>& source)
+    {
+        destination=nullptr;
+        if (source.empty()) return true;
+        const size_t bytes=sizeof(float3)*source.size();
+        return cudaMalloc(&destination,bytes)==cudaSuccess &&
+               cudaMemcpy(destination,source.data(),bytes,cudaMemcpyHostToDevice)==cudaSuccess;
+    }
+
+    bool AllocateZeroedSequence(unsigned int*& destination, size_t count)
+    {
+        destination=nullptr;
+        if (count==0) return true;
+        const size_t bytes=sizeof(unsigned int)*count;
+        return cudaMalloc(&destination,bytes)==cudaSuccess && cudaMemset(destination,0,bytes)==cudaSuccess;
+    }
+
+    template <typename T>
+    void FreeAndReplace(T*& destination, T*& replacement)
+    {
+        cudaFree(destination); destination=replacement; replacement=nullptr;
+    }
+
+    bool ApplyTetFracture(CudaOrganContext& c, const CutEventSummary& event,
+                          const unsigned int* counters)
+    {
+        c.fractureStats.processedEventSequence=event.sequence;
+        if (c.fractureStats.applied)
+        {
+            c.fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_ALREADY_APPLIED;
+            return false;
+        }
+        if (!c.fractureStats.runtimeCompatible || !c.tetToGridStats.configured)
+        {
+            c.fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_RUNTIME_PATH;
+            return false;
+        }
+        if (!event.valid || event.rawCutPoints<4 || counters[1]==0 || counters[2]==0 || counters[4]==0 ||
+            counters[6]==0 || counters[7]<2)
+        {
+            c.fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_NOT_FULLY_PENETRATING;
+            return false;
+        }
+
+        const auto start=std::chrono::high_resolution_clock::now();
+        const int oldParticleCount=c.stats.particleCount;
+        const int tetCount=c.stats.tetCount;
+        std::vector<float3> rest(oldParticleCount), positions(oldParticleCount), previous(oldParticleCount), velocities(oldParticleCount);
+        std::vector<float> inverseMass(oldParticleCount), restVolumes(tetCount), graspWeights(oldParticleCount);
+        std::vector<unsigned char> graspMask(oldParticleCount);
+        std::vector<float3> graspFrame(oldParticleCount);
+        std::vector<int> tetIds(size_t(tetCount)*4), tetActive(tetCount);
+        if (cudaMemcpy(rest.data(),c.restPositions,sizeof(float3)*size_t(oldParticleCount),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+            cudaMemcpy(positions.data(),c.positions,sizeof(float3)*size_t(oldParticleCount),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+            cudaMemcpy(previous.data(),c.previousPositions,sizeof(float3)*size_t(oldParticleCount),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+            cudaMemcpy(velocities.data(),c.velocities,sizeof(float3)*size_t(oldParticleCount),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+            cudaMemcpy(inverseMass.data(),c.inverseMass,sizeof(float)*size_t(oldParticleCount),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+            cudaMemcpy(restVolumes.data(),c.restVolumes,sizeof(float)*size_t(tetCount),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+            cudaMemcpy(tetIds.data(),c.tetIds,sizeof(int)*tetIds.size(),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+            cudaMemcpy(tetActive.data(),c.tetActive,sizeof(int)*size_t(tetCount),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+            cudaMemcpy(graspMask.data(),c.graspMask,sizeof(unsigned char)*size_t(oldParticleCount),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+            cudaMemcpy(graspFrame.data(),c.graspFrameCoordinates,sizeof(float3)*size_t(oldParticleCount),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+            cudaMemcpy(graspWeights.data(),c.graspWeights,sizeof(float)*size_t(oldParticleCount),cudaMemcpyDeviceToHost)!=cudaSuccess)
+        {
+            c.fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_TOPOLOGY_REBUILD;
+            c.fractureStats.lastError=ORGAN_CONTEXT_CUDA_FAILURE;
+            return false;
+        }
+
+        const float3 n0=make_float3(event.normal[0],event.normal[1],event.normal[2]);
+        const float nLength=std::sqrt(Dot(n0,n0));
+        if (nLength<1e-8f)
+        {
+            c.fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_NOT_FULLY_PENETRATING;
+            return false;
+        }
+        const float3 normal=Mul(n0,1.0f/nLength);
+        const float3 origin=make_float3(event.hitPoint[0],event.hitPoint[1],event.hitPoint[2]);
+        std::vector<unsigned char> tetPositive(tetCount,0), usedPositive(oldParticleCount,0), usedNegative(oldParticleCount,0);
+        std::vector<float> positiveVolume(oldParticleCount,0.0f), negativeVolume(oldParticleCount,0.0f);
+        for (int tet=0;tet<tetCount;++tet)
+        {
+            if (!tetActive[tet]) continue;
+            float3 center=make_float3(0,0,0);
+            for (int corner=0;corner<4;++corner) center=Add(center,Mul(positions[tetIds[size_t(tet)*4+corner]],0.25f));
+            const bool positive=Dot(Sub(center,origin),normal)>=0.0f;
+            tetPositive[tet]=positive?1:0;
+            const float volume=std::max(std::fabs(restVolumes[tet]),1e-12f);
+            for (int corner=0;corner<4;++corner)
+            {
+                const int vertex=tetIds[size_t(tet)*4+corner];
+                if (positive) { usedPositive[vertex]=1; positiveVolume[vertex]+=volume; }
+                else { usedNegative[vertex]=1; negativeVolume[vertex]+=volume; }
+            }
+        }
+
+        std::vector<int> duplicate(oldParticleCount,-1);
+        for (int vertex=0;vertex<oldParticleCount;++vertex)
+            if (usedPositive[vertex] && usedNegative[vertex])
+            {
+                duplicate[vertex]=static_cast<int>(rest.size());
+                rest.push_back(rest[vertex]); positions.push_back(positions[vertex]);
+                previous.push_back(previous[vertex]); velocities.push_back(velocities[vertex]);
+                inverseMass.push_back(inverseMass[vertex]); graspMask.push_back(graspMask[vertex]);
+                graspFrame.push_back(graspFrame[vertex]); graspWeights.push_back(graspWeights[vertex]);
+            }
+        const int duplicateCount=static_cast<int>(rest.size())-oldParticleCount;
+        if (duplicateCount<=0)
+        {
+            c.fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_NO_SHARED_NODES;
+            return false;
+        }
+
+        const float halfGap=std::max(c.fractureStats.initialGap,0.0f)*0.5f;
+        for (int vertex=0;vertex<oldParticleCount;++vertex)
+        {
+            const int copy=duplicate[vertex]; if (copy<0) continue;
+            positions[vertex]=Sub(positions[vertex],Mul(normal,halfGap));
+            previous[vertex]=Sub(previous[vertex],Mul(normal,halfGap));
+            positions[copy]=Add(positions[copy],Mul(normal,halfGap));
+            previous[copy]=Add(previous[copy],Mul(normal,halfGap));
+            if (inverseMass[vertex]>0.0f)
+            {
+                const float originalMass=1.0f/inverseMass[vertex];
+                const float total=positiveVolume[vertex]+negativeVolume[vertex];
+                const float positiveFraction=total>1e-12f?positiveVolume[vertex]/total:0.5f;
+                inverseMass[vertex]=1.0f/std::max(originalMass*(1.0f-positiveFraction),1e-12f);
+                inverseMass[copy]=1.0f/std::max(originalMass*positiveFraction,1e-12f);
+            }
+            else inverseMass[copy]=0.0f;
+        }
+        for (int tet=0;tet<tetCount;++tet)
+            if (tetPositive[tet])
+                for (int corner=0;corner<4;++corner)
+                {
+                    int& vertex=tetIds[size_t(tet)*4+corner];
+                    if (duplicate[vertex]>=0) vertex=duplicate[vertex];
+                }
+
+        std::vector<int> edges, surface;
+        std::vector<float> edgeLengths;
+        std::vector<int4> internal;
+        BuildUniqueEdges(tetIds,tetCount,rest,edges,edgeLengths);
+        BuildFaces(tetIds,tetCount,surface,internal);
+        HostColorGroups edgeColors=BuildColorGroups(edges,static_cast<int>(edgeLengths.size()),2,static_cast<int>(rest.size()));
+        HostColorGroups tetColors=BuildColorGroups(tetIds,tetCount,4,static_cast<int>(rest.size()));
+        HostColorGroups surfaceColors=BuildColorGroups(surface,static_cast<int>(surface.size()/3),3,static_cast<int>(rest.size()));
+        if (edges.empty() || surface.empty() || edgeColors.counts.empty() || tetColors.counts.empty() || surfaceColors.counts.empty())
+        {
+            c.fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_TOPOLOGY_REBUILD;
+            return false;
+        }
+
+#define NEW_BUFFER(type,name) type* name=nullptr
+        NEW_BUFFER(float,newRest); NEW_BUFFER(int,newTetIds); NEW_BUFFER(float,newInverseMass);
+        NEW_BUFFER(int,newSurface); NEW_BUFFER(int,newEdges); NEW_BUFFER(float,newEdgeLengths);
+        NEW_BUFFER(float3,newPositions); NEW_BUFFER(float3,newPrevious); NEW_BUFFER(float3,newVelocities);
+        NEW_BUFFER(unsigned char,newGraspMask); NEW_BUFFER(float3,newGraspFrame); NEW_BUFFER(float,newGraspWeights);
+        NEW_BUFFER(int4,newInternal); NEW_BUFFER(unsigned int,newCandidateTets); NEW_BUFFER(unsigned int,newCandidateEdges);
+        NEW_BUFFER(unsigned int,newCandidateInternal); NEW_BUFFER(unsigned int,newCandidateSurface);
+        NEW_BUFFER(int,newEdgeOffsets); NEW_BUFFER(int,newEdgeCounts); NEW_BUFFER(int,newEdgeFlat);
+        NEW_BUFFER(int,newTetOffsets); NEW_BUFFER(int,newTetCounts); NEW_BUFFER(int,newTetFlat);
+        NEW_BUFFER(int,newSurfaceOffsets); NEW_BUFFER(int,newSurfaceCounts); NEW_BUFFER(int,newSurfaceFlat);
+#undef NEW_BUFFER
+        bool ok=AllocateAndUploadFloat3AsFloat(newRest,rest);
+        ok=ok && AllocateAndUploadRaw(newTetIds,tetIds) && AllocateAndUploadRaw(newInverseMass,inverseMass) &&
+           AllocateAndUploadRaw(newSurface,surface) && AllocateAndUploadRaw(newEdges,edges) && AllocateAndUploadRaw(newEdgeLengths,edgeLengths) &&
+           AllocateAndUploadRaw(newPositions,positions) && AllocateAndUploadRaw(newPrevious,previous) && AllocateAndUploadRaw(newVelocities,velocities) &&
+           AllocateAndUploadRaw(newGraspMask,graspMask) && AllocateAndUploadRaw(newGraspFrame,graspFrame) && AllocateAndUploadRaw(newGraspWeights,graspWeights) &&
+           AllocateAndUploadRaw(newInternal,internal) && AllocateAndUploadRaw(newEdgeOffsets,edgeColors.offsets) &&
+           AllocateAndUploadRaw(newEdgeCounts,edgeColors.counts) && AllocateAndUploadRaw(newEdgeFlat,edgeColors.flat) &&
+           AllocateAndUploadRaw(newTetOffsets,tetColors.offsets) && AllocateAndUploadRaw(newTetCounts,tetColors.counts) &&
+           AllocateAndUploadRaw(newTetFlat,tetColors.flat) && AllocateAndUploadRaw(newSurfaceOffsets,surfaceColors.offsets) &&
+           AllocateAndUploadRaw(newSurfaceCounts,surfaceColors.counts) && AllocateAndUploadRaw(newSurfaceFlat,surfaceColors.flat);
+        if (ok) ok=AllocateZeroedSequence(newCandidateTets,size_t(tetCount)) &&
+                           AllocateZeroedSequence(newCandidateEdges,edgeLengths.size()) &&
+                           AllocateZeroedSequence(newCandidateInternal,internal.size()) &&
+                           AllocateZeroedSequence(newCandidateSurface,surface.size()/3);
+        if (!ok)
+        {
+#define FREE_NEW(name) cudaFree(name)
+            FREE_NEW(newRest); FREE_NEW(newTetIds); FREE_NEW(newInverseMass); FREE_NEW(newSurface); FREE_NEW(newEdges); FREE_NEW(newEdgeLengths);
+            FREE_NEW(newPositions); FREE_NEW(newPrevious); FREE_NEW(newVelocities); FREE_NEW(newGraspMask); FREE_NEW(newGraspFrame); FREE_NEW(newGraspWeights);
+            FREE_NEW(newInternal); FREE_NEW(newCandidateTets); FREE_NEW(newCandidateEdges); FREE_NEW(newCandidateInternal); FREE_NEW(newCandidateSurface);
+            FREE_NEW(newEdgeOffsets); FREE_NEW(newEdgeCounts); FREE_NEW(newEdgeFlat); FREE_NEW(newTetOffsets); FREE_NEW(newTetCounts); FREE_NEW(newTetFlat);
+            FREE_NEW(newSurfaceOffsets); FREE_NEW(newSurfaceCounts); FREE_NEW(newSurfaceFlat);
+#undef FREE_NEW
+            c.fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_TOPOLOGY_REBUILD;
+            c.fractureStats.lastError=ORGAN_CONTEXT_CUDA_FAILURE;
+            return false;
+        }
+
+        FreeAndReplace(c.restPositions,newRest); FreeAndReplace(c.tetIds,newTetIds); FreeAndReplace(c.inverseMass,newInverseMass);
+        FreeAndReplace(c.surfaceTriangles,newSurface); FreeAndReplace(c.edgeIds,newEdges); FreeAndReplace(c.edgeRestLengths,newEdgeLengths);
+        FreeAndReplace(c.positions,newPositions); FreeAndReplace(c.previousPositions,newPrevious); FreeAndReplace(c.velocities,newVelocities);
+        FreeAndReplace(c.graspMask,newGraspMask); FreeAndReplace(c.graspFrameCoordinates,newGraspFrame); FreeAndReplace(c.graspWeights,newGraspWeights);
+        FreeAndReplace(c.internalFaces,newInternal); FreeAndReplace(c.candidateTetSequence,newCandidateTets);
+        FreeAndReplace(c.candidateEdgeSequence,newCandidateEdges); FreeAndReplace(c.candidateSharedFaceSequence,newCandidateInternal);
+        FreeAndReplace(c.candidateSurfaceFaceSequence,newCandidateSurface);
+        FreeAndReplace(c.edgeColorOffsets,newEdgeOffsets); FreeAndReplace(c.edgeColorCounts,newEdgeCounts); FreeAndReplace(c.edgeColorFlat,newEdgeFlat);
+        FreeAndReplace(c.tetColorOffsets,newTetOffsets); FreeAndReplace(c.tetColorCounts,newTetCounts); FreeAndReplace(c.tetColorFlat,newTetFlat);
+        FreeAndReplace(c.surfaceColorOffsets,newSurfaceOffsets); FreeAndReplace(c.surfaceColorCounts,newSurfaceCounts); FreeAndReplace(c.surfaceColorFlat,newSurfaceFlat);
+        c.hostEdgeColorOffsets=edgeColors.offsets; c.hostEdgeColorCounts=edgeColors.counts;
+        c.hostTetColorOffsets=tetColors.offsets; c.hostTetColorCounts=tetColors.counts;
+        c.hostSurfaceColorOffsets=surfaceColors.offsets; c.hostSurfaceColorCounts=surfaceColors.counts;
+        c.edgeColorCount=static_cast<int>(edgeColors.counts.size()); c.tetColorCount=static_cast<int>(tetColors.counts.size());
+        c.surfaceColorCount=static_cast<int>(surfaceColors.counts.size());
+        c.stats.particleCount=static_cast<int>(rest.size()); c.stats.edgeConstraintCount=static_cast<int>(edgeLengths.size());
+        c.stats.surfaceTriangleCount=static_cast<int>(surface.size()/3); c.internalFaceCount=static_cast<int>(internal.size());
+        c.fractureStats.applied=1; c.fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_NONE;
+        c.fractureStats.originalParticleCount=oldParticleCount; c.fractureStats.currentParticleCount=c.stats.particleCount;
+        c.fractureStats.duplicatedNodeCount=duplicateCount; c.fractureStats.rebuiltEdgeConstraintCount=c.stats.edgeConstraintCount;
+        c.fractureStats.rebuiltSurfaceTriangleCount=c.stats.surfaceTriangleCount; c.fractureStats.lastError=0;
+        const auto end=std::chrono::high_resolution_clock::now();
+        c.fractureStats.lastFractureMilliseconds=std::chrono::duration<float,std::milli>(end-start).count();
+        return true;
+    }
+
     __device__ __forceinline__ bool NearFiniteCut(float3 point, const CutEventSummary& event)
     {
         const float3 start=make_float3(event.start[0],event.start[1],event.start[2]);
@@ -851,6 +1183,8 @@ int organ_context_initialize(uint32_t handle, const OrganContextInitDesc* desc,
     if (!c) return ORGAN_CONTEXT_INVALID_HANDLE; if (c->stats.initialized) return ORGAN_CONTEXT_ALREADY_INITIALIZED;
     if ((desc->surfaceTriangleCount>0 && !surfaceTriangleIds3) || (desc->edgeConstraintCount>0 && (!edgeConstraintIds2 || !edgeRestLengths))) return ORGAN_CONTEXT_INVALID_ARGUMENT;
     c->stats.particleCount=desc->particleCount; c->stats.tetCount=desc->tetCount;
+    c->fractureStats.originalParticleCount=desc->particleCount;
+    c->fractureStats.currentParticleCount=desc->particleCount;
     c->stats.surfaceTriangleCount=desc->surfaceTriangleCount; c->stats.edgeConstraintCount=desc->edgeConstraintCount;
     std::vector<int4> internalFaces=BuildInternalFaces(tetIds4,desc->tetCount);
     c->internalFaceCount=static_cast<int>(internalFaces.size());
@@ -1083,10 +1417,12 @@ int organ_context_tet_to_grid_update(uint32_t handle, int applyLocalDeformation)
     if (!c->xpbdInitialized || !c->tetToGridStats.configured) return ORGAN_CONTEXT_NOT_INITIALIZED;
     float3* cornerPos=recon_corner_pos();
     if (!cornerPos) return ORGAN_CONTEXT_NOT_INITIALIZED;
-    const int blocks=(c->stats.particleCount+kThreads-1)/kThreads;
     cudaEventRecord(c->tetToGridStart);
     if (!Check(cudaMemset(c->currentCentroid,0,sizeof(float3)),*c)) return ORGAN_CONTEXT_CUDA_FAILURE;
-    SumCentroidKernel<<<blocks,kThreads>>>(c->positions,c->stats.particleCount,c->currentCentroid);
+    const int centroidParticleCount=c->fractureStats.applied
+        ? c->fractureStats.originalParticleCount : c->stats.particleCount;
+    const int particleBlocks=(centroidParticleCount+kThreads-1)/kThreads;
+    SumCentroidKernel<<<particleBlocks,kThreads>>>(c->positions,centroidParticleCount,c->currentCentroid);
     const int cornerBlocks=(c->tetToGridStats.cornerCount+kThreads-1)/kThreads;
     TetToGridKernel<<<cornerBlocks,kThreads>>>(c->positions,reinterpret_cast<float3*>(c->restPositions),c->tetIds,
         c->hostTetByCorner,c->barycentricWeights,c->alignedRestCorners,c->gridActiveMask,c->tetToGridStats.cornerCount,
@@ -1152,6 +1488,20 @@ int organ_context_cut_to_tet_classify_latest_all()
             overallResult=ORGAN_CONTEXT_CUDA_FAILURE;
             continue;
         }
+        if (c.fractureStats.enabled && !c.fractureStats.applied)
+        {
+            unsigned int counters[11]{};
+            CutEventSummary event{};
+            if (cudaMemcpy(counters,c.cutToTetCounters,sizeof(counters),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+                cudaMemcpy(&event,c.cutEventSummary,sizeof(event),cudaMemcpyDeviceToHost)!=cudaSuccess)
+            {
+                c.fractureStats.lastError=ORGAN_CONTEXT_CUDA_FAILURE;
+                c.fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_TOPOLOGY_REBUILD;
+                overallResult=ORGAN_CONTEXT_CUDA_FAILURE;
+            }
+            else if (counters[0] && event.sequence!=c.fractureStats.processedEventSequence)
+                ApplyTetFracture(c,event,counters);
+        }
         c.cutToTetStats.lastError=0;
     }
     return overallResult;
@@ -1190,6 +1540,34 @@ int organ_context_cut_to_tet_get_stats(uint32_t handle, OrganContextCutToTetStat
         c->reportedClassificationCount=counters[9];
     }
     *outStats=c->cutToTetStats;
+    return ORGAN_CONTEXT_OK;
+}
+
+int organ_context_tet_fracture_configure(uint32_t handle, int enabled, int runtimeCompatible,
+                                         float initialGap)
+{
+    if (!std::isfinite(initialGap) || initialGap<0.0f) return ORGAN_CONTEXT_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(g_contextMutex); CudaOrganContext* c=FindContext(handle);
+    if (!c) return ORGAN_CONTEXT_INVALID_HANDLE;
+    if (!c->xpbdInitialized) return ORGAN_CONTEXT_NOT_INITIALIZED;
+    c->fractureStats.enabled=enabled?1:0;
+    c->fractureStats.runtimeCompatible=runtimeCompatible?1:0;
+    c->fractureStats.initialGap=initialGap;
+    c->fractureStats.lastError=0;
+    if (enabled && !runtimeCompatible)
+        c->fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_RUNTIME_PATH;
+    else if (!c->fractureStats.applied)
+        c->fractureStats.rejectedReason=ORGAN_FRACTURE_REJECT_NONE;
+    return ORGAN_CONTEXT_OK;
+}
+
+int organ_context_tet_fracture_get_stats(uint32_t handle, OrganContextTetFractureStats* outStats)
+{
+    if (!outStats) return ORGAN_CONTEXT_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(g_contextMutex); CudaOrganContext* c=FindContext(handle);
+    if (!c) return ORGAN_CONTEXT_INVALID_HANDLE;
+    if (!c->xpbdInitialized) return ORGAN_CONTEXT_NOT_INITIALIZED;
+    *outStats=c->fractureStats;
     return ORGAN_CONTEXT_OK;
 }
 

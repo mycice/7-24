@@ -888,13 +888,15 @@ MonoBehaviour:
   sampleNativeStats: 1
   statsSampleIntervalSeconds: 1
   enableCudaXpbd: 1
-  cudaXpbdMode: 3
+  cudaXpbdMode: 2
   cudaConstraintIterations: 1
   comparisonIntervalSeconds: 1
   enableCudaToolContact: 1
   temporaryPublishCudaPositions: 0
   enableCudaTetToGrid: 1
   enableCutToTetClassification: 1
+  enableTetPhysicalFracture: 1
+  tetFractureInitialGap: 0.002
   contextHandle: 0
   contextReady: 0
   lastNativeError: 0
@@ -957,7 +959,7 @@ MonoBehaviour:
   cudaTetToGridTotalMilliseconds: 0
   cudaTetToGridLastError: 0
   gpuResidentTetToGridFrameActive: 0
-  cutToTetClassificationValid: 0
+  cutToTetClassificationValid: 1
   cutToTetStatus: Waiting for CUDA XPBD and the stage-5.2 native API.
   cutToTetProcessedEventSequence: 0
   cutToTetClassificationCount: 0
@@ -971,6 +973,18 @@ MonoBehaviour:
   cutToTetLastMilliseconds: 0
   cutToTetTotalMilliseconds: 0
   cutToTetLastError: 0
+  tetFractureStatus: Disabled. Existing visual cutting and Tet physics are unchanged.
+  tetFractureRuntimeCompatible: 0
+  tetFractureApplied: 0
+  tetFractureRejectedReason: 0
+  tetFractureProcessedEventSequence: 0
+  tetFractureOriginalParticles: 0
+  tetFractureCurrentParticles: 0
+  tetFractureDuplicatedNodes: 0
+  tetFractureRebuiltEdges: 0
+  tetFractureRebuiltSurfaceTriangles: 0
+  tetFractureLastMilliseconds: 0
+  tetFractureLastError: 0
   cudaXpbdEffectiveStepInterval: 1
   cudaXpbdSkippedFixedSteps: 0
   cudaXpbdAccumulatedDeltaTime: 0

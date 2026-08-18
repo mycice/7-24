@@ -176,6 +176,35 @@ struct OrganContextCutToTetStats
     int lastError;
 };
 
+enum OrganContextTetFractureRejectReason
+{
+    ORGAN_FRACTURE_REJECT_NONE = 0,
+    ORGAN_FRACTURE_REJECT_RUNTIME_PATH = 1,
+    ORGAN_FRACTURE_REJECT_ALREADY_APPLIED = 2,
+    ORGAN_FRACTURE_REJECT_NOT_FULLY_PENETRATING = 3,
+    ORGAN_FRACTURE_REJECT_NO_SHARED_NODES = 4,
+    ORGAN_FRACTURE_REJECT_TOPOLOGY_REBUILD = 5
+};
+
+// Stage 5.3 is deliberately one-shot. All large topology/state arrays remain native;
+// Unity receives only this fixed-size diagnostic snapshot.
+struct OrganContextTetFractureStats
+{
+    int enabled;
+    int runtimeCompatible;
+    int applied;
+    int rejectedReason;
+    unsigned int processedEventSequence;
+    int originalParticleCount;
+    int currentParticleCount;
+    int duplicatedNodeCount;
+    int rebuiltEdgeConstraintCount;
+    int rebuiltSurfaceTriangleCount;
+    float initialGap;
+    float lastFractureMilliseconds;
+    int lastError;
+};
+
 int organ_context_create(uint32_t* outHandle);
 int organ_context_destroy(uint32_t handle);
 int organ_context_initialize(uint32_t handle,
@@ -212,3 +241,6 @@ int organ_context_tet_to_grid_get_stats(uint32_t handle, OrganContextTetToGridSt
 int organ_context_cut_to_tet_set_enabled(uint32_t handle, int enabled);
 int organ_context_cut_to_tet_classify_latest_all();
 int organ_context_cut_to_tet_get_stats(uint32_t handle, OrganContextCutToTetStats* outStats);
+int organ_context_tet_fracture_configure(uint32_t handle, int enabled, int runtimeCompatible,
+                                         float initialGap);
+int organ_context_tet_fracture_get_stats(uint32_t handle, OrganContextTetFractureStats* outStats);

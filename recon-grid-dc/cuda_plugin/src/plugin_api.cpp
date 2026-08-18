@@ -227,6 +227,15 @@ LCS_API int LCS_OrganCutToTetGetStats(uint32_t handle, OrganContextCutToTetStats
 {
     return organ_context_cut_to_tet_get_stats(handle, outStats);
 }
+LCS_API int LCS_OrganTetFractureConfigure(uint32_t handle, int enabled, int runtimeCompatible,
+                                          float initialGap)
+{
+    return organ_context_tet_fracture_configure(handle, enabled, runtimeCompatible, initialGap);
+}
+LCS_API int LCS_OrganTetFractureGetStats(uint32_t handle, OrganContextTetFractureStats* outStats)
+{
+    return organ_context_tet_fracture_get_stats(handle, outStats);
+}
 
 LCS_API int LCS_DirectSurfaceSetBuffers(void* outerPositionBuffer, void* outerNormalBuffer, void* outerAuxBuffer,
                                         void* outerIndexBuffer, void* outerIndexCountBuffer,

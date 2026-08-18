@@ -167,6 +167,17 @@ namespace ReconGridDC.Stage1TetPhysics
             public int lastError;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct OrganContextTetFractureStatsNative
+        {
+            public int enabled, runtimeCompatible, applied, rejectedReason;
+            public uint processedEventSequence;
+            public int originalParticleCount, currentParticleCount, duplicatedNodeCount;
+            public int rebuiltEdgeConstraintCount, rebuiltSurfaceTriangleCount;
+            public float initialGap, lastFractureMilliseconds;
+            public int lastError;
+        }
+
         [DllImport(Dll)] static extern int LCS_OrganCreate(out uint handle);
         [DllImport(Dll)] static extern int LCS_OrganDestroy(uint handle);
         [DllImport(Dll)] static extern int LCS_OrganInitialize(
@@ -195,6 +206,8 @@ namespace ReconGridDC.Stage1TetPhysics
         [DllImport(Dll)] static extern int LCS_OrganTetToGridGetStats(uint handle, out OrganContextTetToGridStatsNative stats);
         [DllImport(Dll)] static extern int LCS_OrganCutToTetSetEnabled(uint handle, int enabled);
         [DllImport(Dll)] static extern int LCS_OrganCutToTetGetStats(uint handle, out OrganContextCutToTetStatsNative stats);
+        [DllImport(Dll)] static extern int LCS_OrganTetFractureConfigure(uint handle, int enabled, int runtimeCompatible, float initialGap);
+        [DllImport(Dll)] static extern int LCS_OrganTetFractureGetStats(uint handle, out OrganContextTetFractureStatsNative stats);
 
         [DllImport(Dll2, EntryPoint="LCS_OrganCreate")] static extern int LCS2_OrganCreate(out uint handle);
         [DllImport(Dll2, EntryPoint="LCS_OrganDestroy")] static extern int LCS2_OrganDestroy(uint handle);
@@ -211,6 +224,8 @@ namespace ReconGridDC.Stage1TetPhysics
         [DllImport(Dll2, EntryPoint="LCS_OrganTetToGridGetStats")] static extern int LCS2_OrganTetToGridGetStats(uint handle, out OrganContextTetToGridStatsNative stats);
         [DllImport(Dll2, EntryPoint="LCS_OrganCutToTetSetEnabled")] static extern int LCS2_OrganCutToTetSetEnabled(uint handle, int enabled);
         [DllImport(Dll2, EntryPoint="LCS_OrganCutToTetGetStats")] static extern int LCS2_OrganCutToTetGetStats(uint handle, out OrganContextCutToTetStatsNative stats);
+        [DllImport(Dll2, EntryPoint="LCS_OrganTetFractureConfigure")] static extern int LCS2_OrganTetFractureConfigure(uint handle, int enabled, int runtimeCompatible, float initialGap);
+        [DllImport(Dll2, EntryPoint="LCS_OrganTetFractureGetStats")] static extern int LCS2_OrganTetFractureGetStats(uint handle, out OrganContextTetFractureStatsNative stats);
 
         bool SecondaryPlugin => pluginInstance == CudaPluginInstance.Secondary;
         int NativeOrganCreate(out uint h) { return SecondaryPlugin ? LCS2_OrganCreate(out h) : LCS_OrganCreate(out h); }
@@ -228,6 +243,8 @@ namespace ReconGridDC.Stage1TetPhysics
         int NativeTetToGridGetStats(uint h,out OrganContextTetToGridStatsNative s) { return SecondaryPlugin ? LCS2_OrganTetToGridGetStats(h,out s) : LCS_OrganTetToGridGetStats(h,out s); }
         int NativeCutToTetSetEnabled(uint h,int e) => SecondaryPlugin ? LCS2_OrganCutToTetSetEnabled(h,e) : LCS_OrganCutToTetSetEnabled(h,e);
         int NativeCutToTetGetStats(uint h,out OrganContextCutToTetStatsNative s) { return SecondaryPlugin ? LCS2_OrganCutToTetGetStats(h,out s) : LCS_OrganCutToTetGetStats(h,out s); }
+        int NativeTetFractureConfigure(uint h,int e,int c,float g) => SecondaryPlugin ? LCS2_OrganTetFractureConfigure(h,e,c,g) : LCS_OrganTetFractureConfigure(h,e,c,g);
+        int NativeTetFractureGetStats(uint h,out OrganContextTetFractureStatsNative s) { return SecondaryPlugin ? LCS2_OrganTetFractureGetStats(h,out s) : LCS_OrganTetFractureGetStats(h,out s); }
 
         [Header("CUDA Migration Phase 1")]
         [Tooltip("Creates an isolated native CUDA organ context and uploads immutable tetrahedral data once. It does not drive XPBD, gripper contact, Tet-to-Grid, cutting, or rendering.")]
@@ -261,6 +278,12 @@ namespace ReconGridDC.Stage1TetPhysics
         [Header("Stage 5.2 - Cut To Tet Classification")]
         [Tooltip("Classifies each new unified GPU cut event against current tetrahedra and constraints. This only writes candidate markers; it never changes topology or disables constraints.")]
         public bool enableCutToTetClassification = true;
+
+        [Header("Stage 5.3 - Tet Physical Fracture Prototype")]
+        [Tooltip("One-shot, single-organ physical fracture after a fully penetrating classified cut. Default off. Requires the primary CUDA Driver Isolated GPU Tet-to-Grid path.")]
+        public bool enableTetPhysicalFracture;
+        [Min(0f)] [Tooltip("Small world-space separation applied once to duplicated cut-boundary nodes. Keep small relative to the Tet edge length.")]
+        public float tetFractureInitialGap = 0.002f;
 
         [Header("Diagnostics (runtime)")]
         [SerializeField] uint contextHandle;
@@ -340,6 +363,19 @@ namespace ReconGridDC.Stage1TetPhysics
         [SerializeField] float cutToTetLastMilliseconds;
         [SerializeField] float cutToTetTotalMilliseconds;
         [SerializeField] int cutToTetLastError;
+        [Header("Tet Physical Fracture Diagnostics (runtime)")]
+        [SerializeField] string tetFractureStatus = "Disabled. Existing visual cutting and Tet physics are unchanged.";
+        [SerializeField] bool tetFractureRuntimeCompatible;
+        [SerializeField] bool tetFractureApplied;
+        [SerializeField] int tetFractureRejectedReason;
+        [SerializeField] uint tetFractureProcessedEventSequence;
+        [SerializeField] int tetFractureOriginalParticles;
+        [SerializeField] int tetFractureCurrentParticles;
+        [SerializeField] int tetFractureDuplicatedNodes;
+        [SerializeField] int tetFractureRebuiltEdges;
+        [SerializeField] int tetFractureRebuiltSurfaceTriangles;
+        [SerializeField] float tetFractureLastMilliseconds;
+        [SerializeField] int tetFractureLastError;
         [Header("Adaptive CUDA XPBD (runtime)")]
         [SerializeField] int cudaXpbdEffectiveStepInterval = 1;
         [SerializeField] int cudaXpbdSkippedFixedSteps;
@@ -361,6 +397,11 @@ namespace ReconGridDC.Stage1TetPhysics
         bool _cutToTetNativeConfigured;
         bool _cutToTetConfiguredValue;
         bool _cutToTetApiAvailable = true;
+        bool _tetFractureNativeConfigured;
+        bool _tetFractureConfiguredEnabled;
+        bool _tetFractureConfiguredCompatible;
+        float _tetFractureConfiguredGap = -1f;
+        bool _tetFractureApiAvailable = true;
 
         public bool IsCudaDriverActive =>
             contextReady && cudaXpbdReady && enableCudaXpbd &&
@@ -473,6 +514,7 @@ namespace ReconGridDC.Stage1TetPhysics
                 return;
 
             ConfigureCutToTetIfNeeded();
+            ConfigureTetFractureIfNeeded();
             if (!sampleNativeStats || Time.unscaledTime < _nextStatsSampleTime)
                 return;
 
@@ -482,6 +524,8 @@ namespace ReconGridDC.Stage1TetPhysics
                 ReadTetToGridStats();
             if (_cutToTetNativeConfigured && enableCutToTetClassification)
                 ReadCutToTetStats();
+            if (_tetFractureNativeConfigured)
+                ReadTetFractureStats();
             if (IsCudaToolContactDriverActive && Time.unscaledTime >= _nextToolStatsSampleTime)
             {
                 _nextToolStatsSampleTime = Time.unscaledTime + Mathf.Max(0.1f, statsSampleIntervalSeconds);
@@ -553,6 +597,7 @@ namespace ReconGridDC.Stage1TetPhysics
                 CacheOrganRestBounds(data);
                 InitializeCudaXpbd(data, edgeIds);
                 ConfigureCutToTetIfNeeded();
+                ConfigureTetFractureIfNeeded();
                 status = cudaXpbdReady
                     ? "Static and CUDA XPBD data uploaded. Unity XPBD remains the active runtime driver unless CUDA Driver Isolated is selected."
                     : "Static tetrahedral data uploaded. Legacy Unity XPBD remains the active runtime driver.";
@@ -617,6 +662,7 @@ namespace ReconGridDC.Stage1TetPhysics
             contextReady = false;
             cudaXpbdReady = false;
             _cutToTetNativeConfigured = false;
+            _tetFractureNativeConfigured = false;
         }
 
         void InitializeCudaXpbd(TetMeshData data, int[] edgeIds)
@@ -715,6 +761,81 @@ namespace ReconGridDC.Stage1TetPhysics
             cutToTetStatus = cutToTetClassificationValid
                 ? "Latest valid cut event classified on GPU. No constraints or topology were modified."
                 : "Enabled: waiting for a new valid unified cut event.";
+        }
+
+        bool IsTetFractureRuntimeCompatible()
+        {
+            return pluginInstance == CudaPluginInstance.Primary &&
+                   enableCutToTetClassification &&
+                   enableCudaXpbd && cudaXpbdMode == CudaXpbdMode.CudaDriverIsolated &&
+                   enableCudaTetToGrid && cudaTetToGridReady && !temporaryPublishCudaPositions;
+        }
+
+        void ConfigureTetFractureIfNeeded()
+        {
+            if (!_tetFractureApiAvailable || !contextReady || !cudaXpbdReady)
+                return;
+            bool compatible = IsTetFractureRuntimeCompatible();
+            float gap = Mathf.Max(0f, tetFractureInitialGap);
+            if (_tetFractureNativeConfigured && _tetFractureConfiguredEnabled == enableTetPhysicalFracture &&
+                _tetFractureConfiguredCompatible == compatible && Mathf.Approximately(_tetFractureConfiguredGap, gap))
+                return;
+            try
+            {
+                lastNativeError = NativeTetFractureConfigure(contextHandle, enableTetPhysicalFracture ? 1 : 0,
+                    compatible ? 1 : 0, gap);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                tetFractureStatus = "The deployed CUDA plugin predates the stage-5.3 Tet fracture API.";
+                _tetFractureApiAvailable = false;
+                _tetFractureNativeConfigured = false;
+                return;
+            }
+            tetFractureLastError = lastNativeError;
+            if (lastNativeError != 0)
+            {
+                tetFractureStatus = $"LCS_OrganTetFractureConfigure failed ({lastNativeError}). Existing topology is unchanged.";
+                return;
+            }
+            _tetFractureNativeConfigured = true;
+            _tetFractureConfiguredEnabled = enableTetPhysicalFracture;
+            _tetFractureConfiguredCompatible = compatible;
+            _tetFractureConfiguredGap = gap;
+            tetFractureRuntimeCompatible = compatible;
+            tetFractureStatus = !enableTetPhysicalFracture
+                ? "Disabled. Existing visual cutting and Tet physics are unchanged."
+                : compatible && enableCutToTetClassification
+                    ? "Armed for the first fully penetrating classified cut. This is a one-shot prototype."
+                    : "Not armed: enable Stage 5.2 and use Primary + CUDA Driver Isolated + GPU Tet-to-Grid with temporary publish off.";
+        }
+
+        void ReadTetFractureStats()
+        {
+            OrganContextTetFractureStatsNative stats;
+            try { lastNativeError = NativeTetFractureGetStats(contextHandle, out stats); }
+            catch (EntryPointNotFoundException) { return; }
+            if (lastNativeError != 0)
+            {
+                tetFractureLastError = lastNativeError;
+                tetFractureStatus = $"LCS_OrganTetFractureGetStats failed ({lastNativeError}).";
+                return;
+            }
+            tetFractureRuntimeCompatible = stats.runtimeCompatible != 0;
+            tetFractureApplied = stats.applied != 0;
+            tetFractureRejectedReason = stats.rejectedReason;
+            tetFractureProcessedEventSequence = stats.processedEventSequence;
+            tetFractureOriginalParticles = stats.originalParticleCount;
+            tetFractureCurrentParticles = stats.currentParticleCount;
+            tetFractureDuplicatedNodes = stats.duplicatedNodeCount;
+            tetFractureRebuiltEdges = stats.rebuiltEdgeConstraintCount;
+            tetFractureRebuiltSurfaceTriangles = stats.rebuiltSurfaceTriangleCount;
+            tetFractureLastMilliseconds = stats.lastFractureMilliseconds;
+            tetFractureLastError = stats.lastError;
+            if (tetFractureApplied)
+                tetFractureStatus = "Applied once: shared nodes were duplicated and CUDA XPBD topology was rebuilt.";
+            else if (enableTetPhysicalFracture && tetFractureRejectedReason != 0)
+                tetFractureStatus = $"Latest event did not fracture (native reject reason {tetFractureRejectedReason}). Topology is unchanged.";
         }
 
         public void StepCudaXpbd(float dt)
